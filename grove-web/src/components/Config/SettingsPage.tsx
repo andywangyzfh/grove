@@ -1,38 +1,65 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Terminal,
   LayoutGrid,
+  Keyboard,
   Bell,
   Plug,
   ChevronDown,
-  Sparkles,
   Check,
   Copy,
-  AlertCircle,
-  AlertTriangle,
   Info,
   ExternalLink,
-  Package,
-  CheckCircle2,
-  XCircle,
   RefreshCw,
   Palette,
   Settings,
   Code,
   Wrench,
+  Link,
+  Plus,
+  Globe,
+  X,
+  Volume2,
+  Bot,
+  Server,
+  UserCog,
+  Package,
+  Trash2,
+  Download,
+  Share2,
+  ChevronRight,
 } from "lucide-react";
-import { Button, Combobox, AppPicker, AgentPicker, ideAppOptions, terminalAppOptions } from "../ui";
+import { Button, Combobox, AppPicker, AgentPicker, agentOptions, ideAppOptions, terminalAppOptions, CustomAgentModal, VSCodeIcon } from "../ui";
 import type { ComboboxOption } from "../ui";
-import { useTheme, themes, useTerminalTheme, terminalThemes } from "../../context";
+import { useTheme, useConfig, useBanner } from "../../context";
+import { type Theme } from "../../context/ThemeContext";
 import {
   getConfig,
   patchConfig,
+  previewHookSound,
   checkAllDependencies,
+  checkCommands,
+  listBaseAgents,
   listApplications,
+  listCustomAgents,
   type AppInfo,
+  type BaseAgent,
+  type CustomAgentServer,
+  type CustomAgentPersona,
 } from "../../api";
 import { LayoutEditor, type CustomLayoutConfig, type PaneType, type LayoutNode, createDefaultLayout, countPanes } from "./LayoutEditor";
+import { CustomAgentsModal } from "./CustomAgentsModal";
+import { MarketplaceModal } from "./MarketplaceModal";
+import { CustomThemeDialog } from "./CustomThemeDialog";
+import { InstallExtensionDialog } from "./InstallExtensionDialog";
+import {
+  setCustomAgentPersonas as setCustomAgentPersonasIconRegistry,
+  loadCustomAgentPersonas as loadCustomAgentPersonasIcon,
+} from "../../utils/agentIcon";
+import { getExtensionStatus } from "../../api/extension";
+import { formatShortcut } from "../AI/utils";
 
 interface SettingsPageProps {
   config: {
@@ -67,7 +94,7 @@ function Section({
     <div className="border border-[var(--color-border)] rounded-xl overflow-hidden">
       <motion.button
         onClick={onToggle}
-        className="w-full flex items-center gap-4 p-4 bg-[var(--color-bg-secondary)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+        className="w-full flex items-center gap-4 p-4 bg-[var(--color-bg-secondary)] hover:bg-[var(--color-bg-tertiary)] transition-colors select-none"
       >
         <div
           className="w-9 h-9 rounded-lg flex items-center justify-center"
@@ -75,7 +102,7 @@ function Section({
         >
           <Icon className="w-4 h-4" style={{ color: iconColor }} />
         </div>
-        <div className="flex-1 text-left">
+        <div className="flex-1 text-left select-none">
           <div className="font-medium text-[var(--color-text)] text-sm">{title}</div>
           <div className="text-xs text-[var(--color-text-muted)]">{description}</div>
         </div>
@@ -115,11 +142,11 @@ interface LayoutPreset {
 }
 
 const layoutPresets: LayoutPreset[] = [
-  { id: "single", name: "Single", description: "Shell only", panes: ["Shell"] },
-  { id: "agent", name: "Agent", description: "Agent only", panes: ["Agent"] },
-  { id: "agent-shell", name: "Agent + Shell", description: "60% + 40%", panes: ["Agent", "Shell"] },
-  { id: "agent-grove-shell", name: "3 Panes", description: "Left + Right split", panes: ["Agent", "Grove", "Shell"], layout: "left-right-split" },
-  { id: "grove-agent", name: "Grove + Agent", description: "40% + 60%", panes: ["Grove", "Agent"] },
+  { id: "single", name: "Single", description: "Shell only", panes: ["shell"] },
+  { id: "agent", name: "Agent", description: "Agent only", panes: ["agent"] },
+  { id: "agent-shell", name: "Agent + Shell", description: "60% + 40%", panes: ["agent", "shell"] },
+  { id: "agent-grove-shell", name: "3 Panes", description: "Left + Right split", panes: ["agent", "grove", "shell"], layout: "left-right-split" },
+  { id: "grove-agent", name: "Grove + Agent", description: "40% + 60%", panes: ["grove", "agent"] },
   { id: "custom", name: "Custom", description: "Configure your own", panes: [] },
 ];
 
@@ -133,10 +160,6 @@ const paneTypeColors: Record<PaneType | string, { bg: string; text: string }> = 
   "file-picker": { bg: "var(--color-accent)", text: "var(--color-accent)" },
   shell: { bg: "var(--color-text-muted)", text: "var(--color-text-muted)" },
   custom: { bg: "var(--color-warning)", text: "var(--color-warning)" },
-  // Legacy string panes
-  Agent: { bg: "var(--color-highlight)", text: "var(--color-highlight)" },
-  Grove: { bg: "var(--color-info)", text: "var(--color-info)" },
-  Shell: { bg: "var(--color-text-muted)", text: "var(--color-text-muted)" },
 };
 
 const paneTypeLabels: Record<PaneType, string> = {
@@ -147,20 +170,12 @@ const paneTypeLabels: Record<PaneType, string> = {
   custom: "Cmd",
 };
 
-// Notification levels
-const notificationLevels = [
-  { level: "notice", icon: Info, color: "var(--color-info)", title: "Notice" },
-  { level: "warn", icon: AlertTriangle, color: "var(--color-warning)", title: "Warning" },
-  { level: "critical", icon: AlertCircle, color: "var(--color-error)", title: "Critical" },
-];
-
 // Note: Agent options are imported from AgentPicker
 // IDE and Terminal options are imported from AppPicker
 
 // Sound options for hooks (macOS system sounds)
 const soundOptions: ComboboxOption[] = [
-  { id: "off", label: "Off", value: "" },
-  { id: "default", label: "Default", value: "default" },
+  { id: "none", label: "NONE", value: "none" },
   { id: "Basso", label: "Basso", value: "Basso" },
   { id: "Blow", label: "Blow", value: "Blow" },
   { id: "Bottle", label: "Bottle", value: "Bottle" },
@@ -194,16 +209,20 @@ interface DependencyState {
 }
 
 export function SettingsPage({ config }: SettingsPageProps) {
-  const { theme, setTheme } = useTheme();
-  const { terminalTheme, setTerminalTheme } = useTerminalTheme();
+  const { theme, mode, lightThemeId, darkThemeId, customThemes, themes, setAppearance } = useTheme();
+  const { updateAvailability, refresh: refreshGlobalConfig } = useConfig();
 
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({
-    appearance: true,
-    environment: false,
+    terminal: false,
+    chat: false,
+    appearance: false,
     devtools: false,
+    autolink: false,
     layout: false,
     hooks: false,
+    indexing: false,
     mcp: false,
+    browserControl: false,
   });
 
   // Environment state
@@ -219,9 +238,36 @@ export function SettingsPage({ config }: SettingsPageProps) {
   const [terminalCommand, setTerminalCommand] = useState("");
   const [applications, setApplications] = useState<AppInfo[]>([]);
   const [isLoadingApps, setIsLoadingApps] = useState(false);
+  // null = unknown until listApplications() resolves — prevents the IDE/Terminal
+  // pickers from briefly rendering on Windows/Linux during initial load.
+  const [serverPlatform, setServerPlatform] = useState<string | null>(null);
 
-  // Multiplexer state
-  const [multiplexer, setMultiplexer] = useState("tmux");
+  // ACP / Custom agents state
+  const [acpAgent, setAcpAgent] = useState("claude"); // Chat mode agent
+  const [customAgents, setCustomAgents] = useState<CustomAgentServer[]>([]);
+  const [showCustomAgentModal, setShowCustomAgentModal] = useState(false);
+  const [showCustomAgentsModal, setShowCustomAgentsModal] = useState(false);
+  const [showMarketplaceModal, setShowMarketplaceModal] = useState(false);
+  const [customAgentPersonas, setCustomAgentPersonas] = useState<CustomAgentPersona[]>([]);
+  const [customAgentPersonasLoading, setCustomAgentPersonasLoading] = useState(false);
+  const [baseAgents, setBaseAgents] = useState<BaseAgent[]>([]);
+  const [baseAgentsLoading, setBaseAgentsLoading] = useState(true);
+  const [chatRenderWindowLimit, setChatRenderWindowLimit] = useState(0);
+  const [chatRenderWindowTrigger, setChatRenderWindowTrigger] = useState(1500);
+  const [chatRenderWindowLimitDraft, setChatRenderWindowLimitDraft] = useState("0");
+  const [chatRenderWindowTriggerDraft, setChatRenderWindowTriggerDraft] = useState("1500");
+  // Agent command availability: command name → exists on PATH
+  const [commandAvailability, setCommandAvailability] = useState<Record<string, boolean>>({});
+
+  // Mode state
+  const [terminalMultiplexer, setTerminalMultiplexer] = useState("tmux");
+  // Web terminal backend: "multiplexer" (default) | "direct"
+  const [webTerminalMode, setWebTerminalMode] = useState("multiplexer");
+  const [workspaceLayout, setWorkspaceLayout] = useState<"flex" | "ide">("flex");
+  const [showHideWindowShortcut, setShowHideWindowShortcut] = useState("");
+  const [isRecordingWindowShortcut, setIsRecordingWindowShortcut] = useState(false);
+
+  const lastTerminalMuxRef = useRef<string>("tmux");
 
   // Layout state
   const [selectedLayout, setSelectedLayout] = useState(config.layout.default);
@@ -229,18 +275,83 @@ export function SettingsPage({ config }: SettingsPageProps) {
   const [selectedCustomLayoutId, setSelectedCustomLayoutId] = useState<string | null>(defaultCustomLayouts[0]?.id || null);
   const [customLayoutsLoaded, setCustomLayoutsLoaded] = useState(false); // Track if custom layouts were loaded from API
   const [isLayoutEditorOpen, setIsLayoutEditorOpen] = useState(false);
+  const [isCustomThemeDialogOpen, setIsCustomThemeDialogOpen] = useState(false);
+  const [isDraggingTheme, setIsDraggingTheme] = useState(false);
 
-  // Hooks state - for command generator
-  const [hookLevel, setHookLevel] = useState<"notice" | "warn" | "critical">("notice");
-  const [hookBanner, setHookBanner] = useState(true);
-  const [hookSound, setHookSound] = useState("default"); // empty = off, or sound name
-  const [hookMessage, setHookMessage] = useState("");
+  const { showBanner } = useBanner();
+
+  const [hooksResponseSoundEnabled, setHooksResponseSoundEnabled] = useState(true);
+  const [hooksResponseSound, setHooksResponseSound] = useState("Glass");
+  const [hooksPermissionSoundEnabled, setHooksPermissionSoundEnabled] = useState(true);
+  const [hooksPermissionSound, setHooksPermissionSound] = useState("Purr");
+
+  // Notifications (menubar tray + system notifications)
+  const [trayEnabled, setTrayEnabled] = useState(true);
+  const [trayShowPermission, setTrayShowPermission] = useState(true);
+  const [trayShowDone, setTrayShowDone] = useState(true);
+  const [trayShowRunning, setTrayShowRunning] = useState(true);
+  const [menubarShortcut, setMenubarShortcut] = useState("");
+  const [isRecordingMenubarShortcut, setIsRecordingMenubarShortcut] = useState(false);
+  const [systemNotifEnabled, setSystemNotifEnabled] = useState(false);
+  const [systemNotifShowPermission, setSystemNotifShowPermission] = useState(true);
+  const [systemNotifShowDone, setSystemNotifShowDone] = useState(true);
+  const [systemNotifShowRunning, setSystemNotifShowRunning] = useState(false);
 
   // MCP state
   const [copiedField, setCopiedField] = useState<string | null>(null);
 
-  // Generate hook command based on selections
-  const hookCommand = `grove hooks ${hookLevel}${hookBanner ? " --banner" : ""}${hookSound ? ` --sound ${hookSound}` : ""}${hookMessage ? ` --message "${hookMessage}"` : ""}`;
+  // AutoLink state
+  const [autoLinkPatterns, setAutoLinkPatterns] = useState<string[]>([]);
+
+  // Symbol indexing state (cmd+click navigation)
+  const [indexingEnabled, setIndexingEnabled] = useState(true);
+  const [indexingDisabledLangs, setIndexingDisabledLangs] = useState<string[]>([]);
+  const [indexingSupportedLangs, setIndexingSupportedLangs] = useState<
+    { id: string; display_name: string; extensions: string[] }[]
+  >([]);
+  const [indexingLangPickerOpen, setIndexingLangPickerOpen] = useState(false);
+  const indexingAddBtnRef = useRef<HTMLButtonElement>(null);
+  const indexingPickerRef = useRef<HTMLDivElement>(null);
+  const [indexingPickerPos, setIndexingPickerPos] = useState<{ top: number; left: number } | null>(null);
+
+  // Browser Control state
+  const [browserControlEnabled, setBrowserControlEnabled] = useState(true);
+  const [browserControlAutoGroups, setBrowserControlAutoGroups] = useState(true);
+  // Extension connection state — fetched ONCE on mount; user must refresh the
+  // Settings page after plugging in / removing the extension to see the badge
+  // update. Polling was removed (it was the source of the GET /extension/tabs
+  // every 5s in DevTools).
+  const [extensionConnected, setExtensionConnected] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    getExtensionStatus().then((c) => { if (!cancelled) setExtensionConnected(c); });
+    return () => { cancelled = true; };
+  }, []);
+  const [installDialogOpen, setInstallDialogOpen] = useState(false);
+
+  // Anchor the language picker to the trigger button. Wrapped in
+  // useCallback so the effect can call it without doing setState
+  // directly in its body (matches the Combobox pattern in src/ui).
+  const updateIndexingPickerPos = useCallback(() => {
+    const rect = indexingAddBtnRef.current?.getBoundingClientRect();
+    if (rect) setIndexingPickerPos({ top: rect.bottom + 4, left: rect.left });
+  }, []);
+
+  useEffect(() => {
+    if (!indexingLangPickerOpen) return;
+    updateIndexingPickerPos();
+    const onDocClick = (e: MouseEvent) => {
+      const target = e.target as Node;
+      // Exclude both the trigger and the portal'd picker — clicking on
+      // a picker option must NOT close before its onClick has a chance
+      // to run (mousedown fires first, would unmount the option).
+      if (indexingAddBtnRef.current?.contains(target)) return;
+      if (indexingPickerRef.current?.contains(target)) return;
+      setIndexingLangPickerOpen(false);
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [indexingLangPickerOpen, updateIndexingPickerPos]);
 
   const toggleSection = (id: string) => {
     setOpenSections((prev) => {
@@ -266,63 +377,126 @@ export function SettingsPage({ config }: SettingsPageProps) {
     setTimeout(() => setCopiedField(null), 2000);
   };
 
+  // Helper: apply config to all state — defined first so loadConfig can list it
+  // as a dependency. Kept outside try/catch so optional chaining and ternaries
+  // don't bail out the React Compiler.
+  const applyLoadedConfig = useCallback((cfg: Awaited<ReturnType<typeof getConfig>>) => {
+    const agentCmd = cfg.layout.agent_command || config.agent.command;
+    setAgentCommand(agentCmd);
+    setIdeCommand(cfg.web.ide || "");
+    setTerminalCommand(cfg.web.terminal || "");
+    setSelectedLayout(cfg.layout.default);
+
+    const mux = cfg.terminal_multiplexer || "tmux";
+    setTerminalMultiplexer(mux);
+    lastTerminalMuxRef.current = mux;
+    setWebTerminalMode(cfg.web.terminal_mode || "multiplexer");
+    setWorkspaceLayout(cfg.web.workspace_layout || "ide");
+    setShowHideWindowShortcut(cfg.web.show_hide_window_shortcut || "");
+
+    // NOTE: theme/customThemes loading is owned by ThemeContext (it fetches
+    // /api/v1/config on mount + focus). Calling setAppearance here would echo
+    // the values back through patchConfig and trigger a redundant Radio
+    // ThemeChanged broadcast on every Settings-page mount.
+
+    // Load custom layouts
+    if (cfg.layout.custom_layouts) {
+      let parsed: unknown = null;
+      let parseFailed = false;
+      try {
+        parsed = JSON.parse(cfg.layout.custom_layouts);
+      } catch {
+        parseFailed = true;
+      }
+      if (parseFailed) {
+        console.error("Failed to parse custom layouts");
+      } else if (Array.isArray(parsed) && parsed.length > 0) {
+        // Check if it's an array (Web format) vs object (TUI format)
+        const layouts = parsed as CustomLayoutConfig[];
+        setCustomLayouts(layouts);
+        setCustomLayoutsLoaded(true); // Mark as loaded from Web format
+        // Use saved selected_custom_id or fallback to first layout
+        const savedId = cfg.layout.selected_custom_id;
+        if (savedId && layouts.some(l => l.id === savedId)) {
+          setSelectedCustomLayoutId(savedId);
+        } else {
+          setSelectedCustomLayoutId(layouts[0].id);
+        }
+      }
+      // If it's TUI format (object), keep the default customLayouts
+      // customLayoutsLoaded stays false, so we won't overwrite TUI data
+    } else {
+      // No existing custom layouts, mark as loaded so we can save new ones
+      setCustomLayoutsLoaded(true);
+    }
+
+    // Load AutoLink config
+    setAutoLinkPatterns(cfg.auto_link.patterns);
+
+    // Load ACP config
+    const acp = cfg.acp;
+    if (acp?.agent_command) {
+      setAcpAgent(acp.agent_command);
+    }
+    if (acp?.custom_agents) {
+      setCustomAgents(acp.custom_agents);
+    }
+    const renderWindowLimit = acp?.render_window_limit ?? 0;
+    const renderWindowTrigger = acp?.render_window_trigger ?? 1500;
+    setChatRenderWindowLimit(renderWindowLimit);
+    setChatRenderWindowTrigger(renderWindowTrigger);
+    setChatRenderWindowLimitDraft(String(renderWindowLimit));
+    setChatRenderWindowTriggerDraft(String(renderWindowTrigger));
+
+    if (cfg.hooks) {
+      setHooksResponseSoundEnabled(cfg.hooks.response_sound_enabled);
+      setHooksResponseSound(cfg.hooks.response_sound || "Glass");
+      setHooksPermissionSoundEnabled(cfg.hooks.permission_sound_enabled);
+      setHooksPermissionSound(cfg.hooks.permission_sound || "Purr");
+    }
+
+    if (cfg.notifications) {
+      setTrayEnabled(cfg.notifications.tray_enabled);
+      setTrayShowPermission(cfg.notifications.tray_show_permission);
+      setTrayShowDone(cfg.notifications.tray_show_done);
+      setTrayShowRunning(cfg.notifications.tray_show_running);
+      setMenubarShortcut(cfg.notifications.menubar_shortcut || "");
+      setSystemNotifEnabled(cfg.notifications.notification_enabled);
+      setSystemNotifShowPermission(cfg.notifications.notification_show_permission);
+      setSystemNotifShowDone(cfg.notifications.notification_show_done);
+      setSystemNotifShowRunning(cfg.notifications.notification_show_running);
+    }
+
+    if (cfg.indexing) {
+      setIndexingEnabled(cfg.indexing.enabled);
+      setIndexingDisabledLangs(cfg.indexing.disabled_languages ?? []);
+      setIndexingSupportedLangs(cfg.indexing.supported_languages ?? []);
+    }
+
+    if (cfg.browser_control) {
+      setBrowserControlEnabled(cfg.browser_control.enabled ?? true);
+      setBrowserControlAutoGroups(cfg.browser_control.auto_groups ?? true);
+    }
+
+    setIsLoaded(true);
+  }, [config.agent.command]);
+
   // Load config from API
   const loadConfig = useCallback(async () => {
+    let cfg: Awaited<ReturnType<typeof getConfig>> | null = null;
     try {
-      const cfg = await getConfig();
-      setAgentCommand(cfg.layout.agent_command || config.agent.command);
-      setIdeCommand(cfg.web.ide || "");
-      setTerminalCommand(cfg.web.terminal || "");
-      setSelectedLayout(cfg.layout.default);
-      setMultiplexer(cfg.multiplexer || "tmux");
-
-      // Load theme - sync with context
-      // API stores theme id (e.g., "dark", "tokyo-night")
-      if (cfg.theme.name && cfg.theme.name.toLowerCase() !== "auto") {
-        // Try to match by id (lowercase, with dash)
-        const themeId = cfg.theme.name.toLowerCase().replace(/\s+/g, "-");
-        setTheme(themeId);
-      }
-
-      // Load terminal theme - sync with context
-      if (cfg.web.terminal_theme) {
-        setTerminalTheme(cfg.web.terminal_theme);
-      }
-
-      // Load custom layouts
-      if (cfg.layout.custom_layouts) {
-        try {
-          const parsed = JSON.parse(cfg.layout.custom_layouts);
-          // Check if it's an array (Web format) vs object (TUI format)
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            const layouts = parsed as CustomLayoutConfig[];
-            setCustomLayouts(layouts);
-            setCustomLayoutsLoaded(true); // Mark as loaded from Web format
-            // Use saved selected_custom_id or fallback to first layout
-            const savedId = cfg.layout.selected_custom_id;
-            if (savedId && layouts.some(l => l.id === savedId)) {
-              setSelectedCustomLayoutId(savedId);
-            } else {
-              setSelectedCustomLayoutId(layouts[0].id);
-            }
-          }
-          // If it's TUI format (object), keep the default customLayouts
-          // customLayoutsLoaded stays false, so we won't overwrite TUI data
-        } catch {
-          console.log("Failed to parse custom layouts");
-        }
-      } else {
-        // No existing custom layouts, mark as loaded so we can save new ones
-        setCustomLayoutsLoaded(true);
-      }
-
-      setIsLoaded(true);
+      cfg = await getConfig();
     } catch {
-      // API not available, use props config
-      console.log("Config API not available, using local config");
-      setIsLoaded(true);
+      cfg = null;
     }
-  }, [config.agent.command, setTheme, setTerminalTheme]);
+    if (!cfg) {
+      // API not available, use props config
+      console.warn("Config API not available, using local config");
+      setIsLoaded(true);
+      return;
+    }
+    applyLoadedConfig(cfg);
+  }, [applyLoadedConfig]);
 
   // Check dependencies via API
   const checkDependencies = useCallback(async () => {
@@ -343,20 +517,14 @@ export function SettingsPage({ config }: SettingsPageProps) {
       return newStates;
     });
 
+    let response: Awaited<ReturnType<typeof checkAllDependencies>> | null = null;
+    let failed = false;
     try {
-      const response = await checkAllDependencies();
-      const newStates: Record<string, DependencyState> = {};
-
-      for (const dep of response.dependencies) {
-        newStates[dep.name] = {
-          status: dep.installed ? "installed" : "not_installed",
-          version: dep.version || undefined,
-          installCommand: dep.install_command,
-        };
-      }
-
-      setDepStates(newStates);
+      response = await checkAllDependencies();
     } catch {
+      failed = true;
+    }
+    if (failed || !response) {
       // API not available, show error state
       setDepStates((prev) => {
         const newStates: Record<string, DependencyState> = {};
@@ -365,52 +533,265 @@ export function SettingsPage({ config }: SettingsPageProps) {
         }
         return newStates;
       });
-    } finally {
-      setIsChecking(false);
+    } else {
+      const newStates: Record<string, DependencyState> = {};
+      for (const dep of response.dependencies) {
+        const status: "installed" | "not_installed" = dep.installed ? "installed" : "not_installed";
+        const version = dep.version ? dep.version : undefined;
+        newStates[dep.name] = {
+          status,
+          version,
+          installCommand: dep.install_command,
+        };
+      }
+      setDepStates(newStates);
     }
+    setIsChecking(false);
+  }, []);
+
+  // Check agent command availability
+  const checkAgentCommands = useCallback(async () => {
+    const cmds = new Set<string>();
+    for (const opt of agentOptions) {
+      if (opt.terminalCheck) cmds.add(opt.terminalCheck);
+    }
+    try {
+      const results = await checkCommands([...cmds]);
+      setCommandAvailability(results);
+    } catch {
+      // API not available, assume all available
+    }
+  }, []);
+
+  const loadBaseAgents = useCallback(async () => {
+    setBaseAgentsLoading(true);
+    try {
+      const agents = await listBaseAgents();
+      setBaseAgents(agents);
+    } catch {
+      // Fall back to static list so the UI stays functional when the backend is unavailable.
+      // Mark all as available (fail-open) — the user will get an error when they actually try to use one.
+      setBaseAgents(
+        agentOptions
+          .filter((opt) => opt.acpCheck)
+          .map((opt) => ({
+            id: opt.id,
+            display_name: opt.label,
+            icon_id: opt.id,
+            available: true,
+          })),
+      );
+    }
+    setBaseAgentsLoading(false);
   }, []);
 
   // Save config to API (called automatically)
   // Note: themeId parameter allows immediate save with new theme value
-  const saveConfig = useCallback(async (overrideThemeId?: string) => {
+  const saveConfig = useCallback(async () => {
     if (!isLoaded) return; // Don't save during initial load
 
+    const layoutAgentCommand = agentCommand ? agentCommand : undefined;
+    const layoutExtras = customLayoutsLoaded
+      ? {
+          custom_layouts: JSON.stringify(customLayouts),
+          selected_custom_id: selectedCustomLayoutId ? selectedCustomLayoutId : undefined,
+        }
+      : {};
+    const webIde = ideCommand ? ideCommand : undefined;
+    const webTerminal = terminalCommand ? terminalCommand : undefined;
+    const acpAgentCommand = acpAgent ? acpAgent : undefined;
+    let renderWindowTrigger: number;
+    if (chatRenderWindowLimit > 0) {
+      renderWindowTrigger = Math.max(chatRenderWindowTrigger, chatRenderWindowLimit + 1);
+    } else if (chatRenderWindowTrigger) {
+      renderWindowTrigger = chatRenderWindowTrigger;
+    } else {
+      renderWindowTrigger = 1500;
+    }
+    const patch = {
+      layout: {
+        default: selectedLayout,
+        // 仅当 Terminal 启用时保存 agent_command
+        agent_command: layoutAgentCommand,
+        // Only save custom layouts if they were loaded/created in Web format
+        // This prevents overwriting TUI's custom layout format
+        ...layoutExtras,
+      },
+      web: {
+        ide: webIde,
+        terminal: webTerminal,
+        terminal_mode: webTerminalMode,
+        workspace_layout: workspaceLayout,
+        show_hide_window_shortcut: showHideWindowShortcut,
+      },
+      terminal_multiplexer: terminalMultiplexer,
+      acp: {
+        agent_command: acpAgentCommand,
+        render_window_limit: chatRenderWindowLimit,
+        render_window_trigger: renderWindowTrigger,
+      },
+      auto_link: {
+        patterns: autoLinkPatterns,
+      },
+      hooks: {
+        response_sound_enabled: hooksResponseSoundEnabled,
+        response_sound: hooksResponseSound,
+        permission_sound_enabled: hooksPermissionSoundEnabled,
+        permission_sound: hooksPermissionSound,
+      },
+      notifications: {
+        tray_enabled: trayEnabled,
+        tray_show_permission: trayShowPermission,
+        tray_show_done: trayShowDone,
+        tray_show_running: trayShowRunning,
+        notification_enabled: systemNotifEnabled,
+        notification_show_permission: systemNotifShowPermission,
+        notification_show_done: systemNotifShowDone,
+        notification_show_running: systemNotifShowRunning,
+        menubar_shortcut: menubarShortcut,
+      },
+      indexing: {
+        enabled: indexingEnabled,
+        disabled_languages: indexingDisabledLangs,
+      },
+      browser_control: {
+        enabled: browserControlEnabled,
+        auto_groups: browserControlAutoGroups,
+      },
+    };
     try {
-      await patchConfig({
-        theme: {
-          name: overrideThemeId || theme.id,
-        },
-        layout: {
-          default: selectedLayout,
-          agent_command: agentCommand || undefined,
-          // Only save custom layouts if they were loaded/created in Web format
-          // This prevents overwriting TUI's custom layout format
-          ...(customLayoutsLoaded ? {
-            custom_layouts: JSON.stringify(customLayouts),
-            selected_custom_id: selectedCustomLayoutId || undefined,
-          } : {}),
-        },
-        web: {
-          ide: ideCommand || undefined,
-          terminal: terminalCommand || undefined,
-        },
-        multiplexer,
-      });
+      await patchConfig(patch);
+      // Refresh the global config cache so other pages see the changes immediately
+      await refreshGlobalConfig();
     } catch {
       console.error("Failed to save config");
     }
-  }, [isLoaded, theme.id, selectedLayout, agentCommand, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, multiplexer]);
+  }, [isLoaded, selectedLayout, agentCommand, acpAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, refreshGlobalConfig]);
 
   // Handle theme change with immediate save
-  const handleThemeChange = useCallback((newThemeId: string) => {
-    setTheme(newThemeId);
-    // Save immediately with the new theme ID to avoid stale closure issues
-    if (isLoaded) {
-      patchConfig({
-        theme: { name: newThemeId },
-      }).catch(() => console.error("Failed to save theme"));
+  const handleModeChange = useCallback((newMode: "auto" | "light" | "dark") => {
+    setAppearance({ mode: newMode });
+  }, [setAppearance]);
+
+  const handleLightThemeChange = useCallback((id: string) => {
+    setAppearance({ lightThemeId: id });
+  }, [setAppearance]);
+
+  const handleDarkThemeChange = useCallback((id: string) => {
+    setAppearance({ darkThemeId: id });
+  }, [setAppearance]);
+
+  const handleSaveCustomTheme = useCallback((newTheme: Theme) => {
+    setAppearance({ customThemes: [...customThemes, newTheme] });
+  }, [customThemes, setAppearance]);
+
+  const processThemeData = useCallback((text: string) => {
+    try {
+      const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== 'object') throw new Error("Theme file is not a JSON object.");
+      if (!parsed.name || typeof parsed.name !== 'string') throw new Error("Missing 'name'.");
+      if (typeof parsed.isLight !== 'boolean') throw new Error("Missing 'isLight' boolean.");
+      const c = parsed.colors;
+      if (!c || typeof c !== 'object' || Array.isArray(c)) throw new Error("Missing 'colors' object.");
+      // Validate the 12 required color tokens are present and look like CSS colors.
+      // Anything that slips through here propagates to style.setProperty("--color-X", undefined)
+      // which silently sets the var to the string "undefined" and breaks the UI.
+      const requiredColors: (keyof Theme["colors"])[] = [
+        "bg", "bgSecondary", "bgTertiary", "border", "text", "textMuted",
+        "highlight", "accent", "success", "warning", "error", "info",
+      ];
+      // Browser CSS.supports parses the value the same way it'd parse it in a
+      // stylesheet — rejects "rgb(/*x*/)" and friends that the previous loose
+      // regex accepted. Also reject var(...) refs: those are accepted by
+      // CSS.supports but, when assigned to a --color-X var, create a self-
+      // referential cycle that silently breaks the palette.
+      const isValidColor = (v: string): boolean => {
+        // Reject var() anywhere (also blocks `/* */ var(--x)` since regex
+        // doesn't anchor to start). var() references would silently create
+        // a self-referential cycle when assigned to --color-X.
+        if (/var\s*\(/i.test(v)) return false;
+        // Reject CSS-wide keywords that CSS.supports accepts but are
+        // meaningless / fragile as concrete color values for our palette.
+        if (/^(inherit|currentcolor|transparent|initial|unset|revert|revert-layer)$/i.test(v)) return false;
+        if (typeof CSS !== 'undefined' && typeof CSS.supports === 'function') {
+          return CSS.supports("color", v);
+        }
+        return /^(#[0-9a-f]{3,8}|rgb[a]?\([\d\s,./%]+\)|hsl[a]?\([\d\s,./%deg]+\)|oklch\([\d\s,./%]+\)|[a-z]+)$/i.test(v);
+      };
+      for (const key of requiredColors) {
+        const v = (c as Record<string, unknown>)[key];
+        if (typeof v !== 'string' || !isValidColor(v.trim())) {
+          throw new Error(`Invalid color value for '${key}'.`);
+        }
+      }
+      // accentPalette is consumed via spread into newTheme; if user supplies
+      // a non-array or non-string entries, downstream consumers (getProjectStyle
+      // etc.) silently default away. Validate before propagating.
+      if (parsed.accentPalette !== undefined) {
+        if (!Array.isArray(parsed.accentPalette) || parsed.accentPalette.length === 0) {
+          throw new Error("'accentPalette' must be a non-empty array.");
+        }
+        for (const entry of parsed.accentPalette) {
+          if (typeof entry !== 'string' || !isValidColor(entry.trim())) {
+            throw new Error("'accentPalette' contains an invalid color.");
+          }
+        }
+      }
+      const newTheme: Theme = {
+        ...parsed,
+        id: (typeof crypto !== "undefined" && "randomUUID" in crypto)
+          ? `custom-${crypto.randomUUID()}`
+          : `custom-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+        isCustom: true
+      };
+      setAppearance({ customThemes: [...customThemes, newTheme] });
+      showBanner(`Theme "${newTheme.name}" imported successfully!`, "success");
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      showBanner(`Import failed: ${message}`, "error");
     }
-  }, [setTheme, isLoaded]);
+  }, [customThemes, setAppearance, showBanner]);
+
+  const handleImportFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    // Reset the input's value so picking the same file twice (e.g. after a
+    // parse error → user edits file externally → re-tries) fires onChange again.
+    const inputEl = e.target;
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (re) => {
+        const text = re.target?.result as string;
+        processThemeData(text);
+        inputEl.value = "";
+      };
+      reader.onerror = () => { inputEl.value = ""; };
+      reader.readAsText(file);
+    } else {
+      inputEl.value = "";
+    }
+  };
+
+  const handleExportTheme = useCallback((themeToExport: Theme) => {
+    const { id: _id, isCustom: _isCustom, ...rest } = themeToExport;
+    void _id;
+    void _isCustom;
+    const json = JSON.stringify(rest, null, 2);
+    
+    try {
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${themeToExport.name.replace(/\s+/g, "_").toLowerCase()}.grovetheme`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showBanner(`Theme "${themeToExport.name}" exported to file!`, "success");
+    } catch (err) {
+      showBanner(`Download failed: ${err}`, "error");
+    }
+  }, [showBanner]);
 
   // Auto-save when any config value changes (debounced)
   useEffect(() => {
@@ -421,43 +802,277 @@ export function SettingsPage({ config }: SettingsPageProps) {
     }, 500); // 500ms debounce
 
     return () => clearTimeout(timer);
-  }, [theme.id, selectedLayout, agentCommand, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, multiplexer, isLoaded, saveConfig]);
+  }, [selectedLayout, agentCommand, acpAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, isLoaded, saveConfig]);
+
+  useEffect(() => {
+    if (!isRecordingWindowShortcut) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (event.key === "Escape") {
+        setIsRecordingWindowShortcut(false);
+        return;
+      }
+
+      const shortcut = formatShortcut(event);
+      if (!shortcut) return;
+      setShowHideWindowShortcut(shortcut);
+      setIsRecordingWindowShortcut(false);
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [isRecordingWindowShortcut]);
+
+  useEffect(() => {
+    if (!isRecordingMenubarShortcut) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (event.key === "Escape") {
+        setIsRecordingMenubarShortcut(false);
+        return;
+      }
+
+      const shortcut = formatShortcut(event);
+      if (!shortcut) return;
+      setMenubarShortcut(shortcut);
+      setIsRecordingMenubarShortcut(false);
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [isRecordingMenubarShortcut]);
 
   // Load applications list
   const loadApplications = useCallback(async () => {
     setIsLoadingApps(true);
     try {
-      const apps = await listApplications();
+      const { apps, platform } = await listApplications();
       setApplications(apps);
+      setServerPlatform(platform);
     } catch {
       console.error("Failed to load applications");
-    } finally {
-      setIsLoadingApps(false);
     }
+    setIsLoadingApps(false);
+  }, []);
+
+  const loadCustomAgentPersonas = useCallback(async () => {
+    setCustomAgentPersonasLoading(true);
+    try {
+      // Centralized loader — collapses concurrent fetches and ensures the
+      // most-recent result is the only one written into the icon registry.
+      const list = await loadCustomAgentPersonasIcon(() => listCustomAgents());
+      setCustomAgentPersonas(list);
+    } catch (err) {
+      console.error("Failed to load custom agents:", err);
+    }
+    setCustomAgentPersonasLoading(false);
   }, []);
 
   // Initial load
   useEffect(() => {
-    loadConfig();
-    checkDependencies();
-    loadApplications();
-  }, [loadConfig, checkDependencies, loadApplications]);
+    void (async () => {
+      await Promise.all([
+        loadConfig(),
+        checkDependencies(),
+        loadApplications(),
+        checkAgentCommands(),
+        loadBaseAgents(),
+        loadCustomAgentPersonas(),
+      ]);
+    })();
+  }, [loadConfig, checkDependencies, loadApplications, checkAgentCommands, loadBaseAgents, loadCustomAgentPersonas]);
 
-  const getStatusIcon = (status: DependencyStatusType) => {
-    switch (status) {
-      case "checking":
-        return <RefreshCw className="w-4 h-4 text-[var(--color-text-muted)] animate-spin" />;
-      case "installed":
-        return <CheckCircle2 className="w-4 h-4 text-[var(--color-success)]" />;
-      case "not_installed":
-        return <XCircle className="w-4 h-4 text-[var(--color-warning)]" />;
-      case "error":
-        return <AlertCircle className="w-4 h-4 text-[var(--color-error)]" />;
+  // Terminal availability
+  const tmuxInstalled = depStates["tmux"]?.status === "installed";
+  const zellijInstalled = depStates["zellij"]?.status === "installed";
+  const hasMultiplexer = tmuxInstalled || zellijInstalled;
+  const canUseTerminal = webTerminalMode === "direct" || hasMultiplexer;
+
+  // (enable states are auto-synced from dependency availability below)
+
+  // Auto-correct on first load:
+  // 1. If multiplexer mode but no multiplexer installed → fallback to direct
+  // 2. If selected multiplexer not installed but other is → switch
+  //
+  // Uses the documented "Adjusting state on prop change" pattern (gated on a
+  // one-shot state flag) so the corrective setState runs during render rather
+  // than inside an effect.
+  // https://react.dev/reference/react/useState#storing-information-from-previous-renders
+  const [defaultsApplied, setDefaultsApplied] = useState(false);
+  if (
+    !defaultsApplied &&
+    isLoaded &&
+    !isChecking &&
+    Object.keys(depStates).length > 0
+  ) {
+    setDefaultsApplied(true);
+    if (webTerminalMode === "multiplexer" && !hasMultiplexer) {
+      // No multiplexer available → fallback to direct
+      setWebTerminalMode("direct");
+    } else if (webTerminalMode === "multiplexer") {
+      // Auto-correct multiplexer selection (the ref mirror is kept in sync
+      // by the effect below that watches `terminalMultiplexer`).
+      if (terminalMultiplexer === "tmux" && !tmuxInstalled && zellijInstalled) {
+        setTerminalMultiplexer("zellij");
+      } else if (terminalMultiplexer === "zellij" && !zellijInstalled && tmuxInstalled) {
+        setTerminalMultiplexer("tmux");
+      }
     }
-  };
+  }
+  // Keep `lastTerminalMuxRef` in sync with the latest selected multiplexer.
+  // Writing the ref in an effect avoids the react-hooks/refs render-time
+  // mutation flag while still letting the explicit ref-setters elsewhere
+  // (e.g. on user-driven dropdown change) take precedence within a single
+  // render — the effect just confirms the post-render value.
+  useEffect(() => {
+    lastTerminalMuxRef.current = terminalMultiplexer || "tmux";
+  }, [terminalMultiplexer]);
 
-  const depKeys = Object.keys(depStates);
-  const installedCount = depKeys.filter((k) => depStates[k]?.status === "installed").length;
+  // Filter and mark agent options based on mode + command availability
+  const hasAvailability = Object.keys(commandAvailability).length > 0;
+  const baseAgentStatusById = useMemo(() => {
+    const map = new Map<string, BaseAgent>();
+    for (const agent of baseAgents) {
+      map.set(agent.id, agent);
+    }
+    return map;
+  }, [baseAgents]);
+
+  // Terminal Agent 选项（检测 terminalCheck 命令）
+  const terminalAgentOptions = useMemo(() => agentOptions.map(a => {
+    if (!hasAvailability) return a;
+    const cmd = a.terminalCheck;
+    if (cmd && commandAvailability[cmd] === false) {
+      return { ...a, disabled: true, disabledReason: `${cmd} not found — install to enable` };
+    }
+    return a;
+  }), [commandAvailability, hasAvailability]);
+
+  // Chat Agent 选项：ACP base agent availability comes from backend.
+  const chatAgentOptions = useMemo(() => {
+    // Only surface available agents — the Marketplace modal is the place to
+    // see/install everything else. Hiding unavailable ones from the picker
+    // gets rid of the long list of `<agent> not found — install to enable`
+    // rows that used to fill the dropdown and let users pick something
+    // grove couldn't actually launch.
+    return baseAgents
+      .filter((base) => base.available)
+      .map((base) => {
+        const local = agentOptions.find(
+          (a) => a.value === base.id || a.id === base.id,
+        );
+        const option = local ?? {
+          id: base.id,
+          label: base.display_name,
+          value: base.id,
+        };
+        return { ...option, label: base.display_name, value: base.id };
+      });
+  }, [baseAgents]);
+
+  // Feature availability (auto-derived from dependencies)
+  const isTerminalAvailable = canUseTerminal;
+  const isChatAvailable = chatAgentOptions.length > 0 || customAgents.length > 0;
+
+  // Sync availability to ConfigContext for Task panel components
+  useEffect(() => {
+    if (Object.keys(depStates).length > 0) {
+      updateAvailability(isTerminalAvailable);
+    }
+  }, [depStates, commandAvailability, isTerminalAvailable, updateAvailability]);
+
+  // Auto-correct agent selection: pick first available, or clear if none available
+  useEffect(() => {
+    if (!isLoaded) return;
+    const hasTerminalAvailability = Object.keys(commandAvailability).length > 0;
+
+    // Compute corrections synchronously, but apply them after a microtask so
+    // the setStates aren't synchronous within the effect body.
+    let nextAgentCommand: string | undefined;
+    if (hasTerminalAvailability && agentCommand) {
+      const currentAgent = agentOptions.find(a => a.id === agentCommand);
+      const cmd = currentAgent?.terminalCheck;
+      if (cmd && commandAvailability[cmd] === false) {
+        const firstAvailable = terminalAgentOptions.find(a => !a.disabled);
+        nextAgentCommand = firstAvailable?.id ?? "";
+      }
+    }
+
+    let nextAcpAgent: string | undefined;
+    if (baseAgents.length > 0 && acpAgent) {
+      const currentBaseAgent = baseAgentStatusById.get(acpAgent);
+      if (currentBaseAgent && !currentBaseAgent.available) {
+        const firstAvailable = chatAgentOptions.find(a => !a.disabled);
+        nextAcpAgent = firstAvailable?.value ?? "";
+      }
+    }
+
+    if (nextAgentCommand !== undefined || nextAcpAgent !== undefined) {
+      void Promise.resolve().then(() => {
+        if (nextAgentCommand !== undefined) setAgentCommand(nextAgentCommand);
+        if (nextAcpAgent !== undefined) setAcpAgent(nextAcpAgent);
+      });
+    }
+  }, [isLoaded, commandAvailability, agentCommand, acpAgent, terminalAgentOptions, chatAgentOptions, baseAgentStatusById, baseAgents.length]);
+
+  const suggestedChatRenderWindowTrigger = useCallback((limit: number) => {
+    return Math.max(limit + 1, Math.ceil(limit * 1.5));
+  }, []);
+
+  const commitChatRenderWindowLimit = useCallback((value: string) => {
+    const parsed = Number(value);
+    const nextLimit = Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
+    setChatRenderWindowLimit(nextLimit);
+    setChatRenderWindowLimitDraft(String(nextLimit));
+    if (nextLimit > 0) {
+      setChatRenderWindowTrigger((current) =>
+        current > nextLimit ? current : suggestedChatRenderWindowTrigger(nextLimit),
+      );
+      setChatRenderWindowTriggerDraft((current) => {
+        const currentNumber = Number(current);
+        const nextTrigger =
+          Number.isFinite(currentNumber) && currentNumber > nextLimit
+            ? Math.floor(currentNumber)
+            : suggestedChatRenderWindowTrigger(nextLimit);
+        return String(nextTrigger);
+      });
+    }
+  }, [suggestedChatRenderWindowTrigger]);
+
+  const commitChatRenderWindowTrigger = useCallback((value: string) => {
+    const parsed = Number(value);
+    const nextTrigger = Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
+    const normalizedTrigger =
+      chatRenderWindowLimit > 0
+        ? Math.max(nextTrigger, chatRenderWindowLimit + 1)
+        : nextTrigger || 1500;
+    setChatRenderWindowTrigger(normalizedTrigger);
+    setChatRenderWindowTriggerDraft(String(normalizedTrigger));
+  }, [chatRenderWindowLimit]);
+
+  const setChatRenderWindowMode = useCallback((mode: "unlimited" | "custom") => {
+    if (mode === "unlimited") {
+      setChatRenderWindowLimit(0);
+      setChatRenderWindowLimitDraft("0");
+      return;
+    }
+    setChatRenderWindowLimit((current) => {
+      const next = current > 0 ? current : 1000;
+      setChatRenderWindowLimitDraft(String(next));
+      return next;
+    });
+    setChatRenderWindowTrigger((current) => {
+      const next = current > 1000 ? current : 1500;
+      setChatRenderWindowTriggerDraft(String(next));
+      return next;
+    });
+  }, []);
 
   const claudeCodeConfig = JSON.stringify(
     {
@@ -486,6 +1101,113 @@ env_vars = [
   "GROVE_PROJECT"
 ]`;
 
+  const isTauriGui = !!((window as Window & {
+    __TAURI__?: unknown;
+    __TAURI_INTERNALS__?: unknown;
+  }).__TAURI__ || (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
+  const menubarShortcutConflict =
+    !!menubarShortcut && menubarShortcut === showHideWindowShortcut;
+  const menubarShortcutControl = isTauriGui ? (
+    <div>
+      <div className="flex items-center gap-2 mb-3 select-none">
+        <Keyboard className="w-4 h-4 text-[var(--color-warning)]" />
+        <span className="text-sm font-medium text-[var(--color-text)]">
+          Show or Hide Menu bar
+        </span>
+      </div>
+      <div className="flex items-center gap-2">
+        <div
+          className={`flex h-10 min-w-0 flex-1 items-center rounded-lg border bg-[var(--color-bg-secondary)] px-3 text-sm text-[var(--color-text)] ${
+            menubarShortcutConflict
+              ? "border-[var(--color-error)]/60"
+              : "border-[var(--color-border)]"
+          }`}
+        >
+          {isRecordingMenubarShortcut ? (
+            <span className="text-[var(--color-warning)]">Press shortcut...</span>
+          ) : menubarShortcut ? (
+            menubarShortcut
+          ) : (
+            <span className="text-[var(--color-text-muted)]">Not set</span>
+          )}
+        </div>
+        {menubarShortcut && (
+          <button
+            type="button"
+            onClick={() => {
+              setMenubarShortcut("");
+              setIsRecordingMenubarShortcut(false);
+            }}
+            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] text-[var(--color-text-muted)] transition-colors hover:border-[var(--color-error)]/60 hover:text-[var(--color-error)]"
+            title="Clear shortcut"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => setIsRecordingMenubarShortcut((value) => !value)}
+          className={`inline-flex h-10 shrink-0 items-center justify-center rounded-lg border px-3 text-xs font-medium transition-colors ${
+            isRecordingMenubarShortcut
+              ? "border-[var(--color-warning)] bg-[var(--color-warning)]/10 text-[var(--color-warning)]"
+              : "border-[var(--color-border)] bg-[var(--color-bg-secondary)] text-[var(--color-text)] hover:border-[var(--color-warning)]/50"
+          }`}
+        >
+          {isRecordingMenubarShortcut ? "Cancel" : "Record"}
+        </button>
+      </div>
+      {menubarShortcutConflict ? (
+        <div className="mt-2 text-[11px] text-[var(--color-error)]">
+          This shortcut is already bound to the main window. Pick a different
+          combination — the menubar binding will not register until you do.
+        </div>
+      ) : null}
+    </div>
+  ) : null;
+  const windowShortcutControl = isTauriGui ? (
+    <div>
+      <div className="flex items-center gap-2 mb-3 select-none">
+        <Keyboard className="w-4 h-4 text-[var(--color-highlight)]" />
+        <span className="text-sm font-medium text-[var(--color-text)]">Show or Hide Window</span>
+      </div>
+      <div className="flex items-center gap-2">
+        <div className="flex h-10 min-w-0 flex-1 items-center rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 text-sm text-[var(--color-text)]">
+          {isRecordingWindowShortcut ? (
+            <span className="text-[var(--color-highlight)]">Press shortcut...</span>
+          ) : showHideWindowShortcut ? (
+            showHideWindowShortcut
+          ) : (
+            <span className="text-[var(--color-text-muted)]">Not set</span>
+          )}
+        </div>
+        {showHideWindowShortcut && (
+          <button
+            type="button"
+            onClick={() => {
+              setShowHideWindowShortcut("");
+              setIsRecordingWindowShortcut(false);
+            }}
+            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] text-[var(--color-text-muted)] transition-colors hover:border-[var(--color-error)]/60 hover:text-[var(--color-error)]"
+            title="Clear shortcut"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => setIsRecordingWindowShortcut((value) => !value)}
+          className={`inline-flex h-10 shrink-0 items-center justify-center rounded-lg border px-3 text-xs font-medium transition-colors ${
+            isRecordingWindowShortcut
+              ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/10 text-[var(--color-highlight)]"
+              : "border-[var(--color-border)] bg-[var(--color-bg-secondary)] text-[var(--color-text)] hover:border-[var(--color-highlight)]/50"
+          }`}
+        >
+          {isRecordingWindowShortcut ? "Cancel" : "Record"}
+        </button>
+      </div>
+    </div>
+  ) : null;
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 20 }}
@@ -493,7 +1215,7 @@ env_vars = [
       transition={{ duration: 0.3 }}
     >
       {/* Compact Header */}
-      <div className="flex items-center gap-3 mb-6">
+      <div className="flex items-center gap-3 mb-6 select-none">
         <div className="w-10 h-10 rounded-xl bg-[var(--color-highlight)]/10 flex items-center justify-center">
           <Settings className="w-5 h-5 text-[var(--color-highlight)]" />
         </div>
@@ -504,638 +1226,1272 @@ env_vars = [
       </div>
 
       <div className="space-y-3">
+        {/* Agent Section */}
+        <Section
+          id="chat"
+          title="Agent"
+          description={isChatAvailable ? "Ready" : "Need Setup"}
+          icon={Bot}
+          iconColor={isChatAvailable ? "#a855f7" : "var(--color-warning)"}
+          isOpen={openSections.chat}
+          onToggle={() => toggleSection("chat")}
+        >
+          <div className="space-y-5">
+            {/* Default Coding Agent */}
+            <div>
+              <div className="text-xs font-medium text-[var(--color-text-muted)] mb-2 uppercase tracking-wider select-none">Default Coding Agent</div>
+              {baseAgentsLoading ? (
+                <div className="h-10 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 flex items-center text-sm text-[var(--color-text-muted)]">
+                  Loading agents...
+                </div>
+              ) : (
+                <AgentPicker
+                  value={acpAgent}
+                  onChange={setAcpAgent}
+                  options={chatAgentOptions}
+                  allowCustom={false}
+                  placeholder="Select agent..."
+                  customAgents={customAgents}
+                />
+              )}
+            </div>
+
+            {/* Hub entry list — full-width rows so an odd entry count never
+                leaves a lonely card stranded in a 2-column grid. Each row is
+                Settings-style: icon, label/subtitle, optional count chip,
+                right chevron. The legacy per-agent launch-mode toggle has
+                moved into the Marketplace modal's per-agent config sheet. */}
+            <div className="divide-y divide-[var(--color-border)] rounded-lg border border-[var(--color-border)] overflow-hidden">
+              <HubRow
+                icon={<Package className="w-4 h-4 text-[var(--color-highlight)]" />}
+                iconBg="var(--color-highlight)"
+                label="Agent Marketplace"
+                subtitle="Browse, install, and configure ACP agents"
+                onClick={() => setShowMarketplaceModal(true)}
+              />
+              <HubRow
+                icon={<UserCog className="w-4 h-4 text-[var(--color-highlight)]" />}
+                iconBg="var(--color-highlight)"
+                label="Custom Agents"
+                subtitle="Personas with preset model & system prompt"
+                count={customAgentPersonas.length}
+                onClick={() => setShowCustomAgentsModal(true)}
+              />
+              <HubRow
+                icon={<Server className="w-4 h-4 text-[var(--color-info)]" />}
+                iconBg="var(--color-info)"
+                label="Custom Agent Servers"
+                subtitle="For private or self-hosted ACP deploys"
+                count={customAgents.length}
+                onClick={() => setShowCustomAgentModal(true)}
+              />
+            </div>
+
+            {/* Chat render window */}
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs font-medium text-[var(--color-text-muted)] uppercase tracking-wider select-none">Chat Render Window</div>
+                  <div className="mt-0.5 text-xs text-[var(--color-text-muted)]">
+                    {chatRenderWindowLimit > 0
+                      ? `Keep latest ${chatRenderWindowLimit.toLocaleString()} messages`
+                      : "Keep the full conversation in view"}
+                  </div>
+                </div>
+                <div className="inline-flex rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setChatRenderWindowMode("unlimited")}
+                    className={`rounded px-3 py-1.5 text-xs font-medium transition-colors ${
+                      chatRenderWindowLimit === 0
+                        ? "bg-[var(--color-highlight)] text-white"
+                        : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                    }`}
+                  >
+                    Unlimited
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setChatRenderWindowMode("custom")}
+                    className={`rounded px-3 py-1.5 text-xs font-medium transition-colors ${
+                      chatRenderWindowLimit > 0
+                        ? "bg-[var(--color-highlight)] text-white"
+                        : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                    }`}
+                  >
+                    Custom
+                  </button>
+                </div>
+              </div>
+              {chatRenderWindowLimit > 0 && (
+                <div className="flex flex-wrap items-center gap-2 text-sm text-[var(--color-text-muted)]">
+                  <span>Prune at</span>
+                  <label className="inline-flex items-center">
+                    <input
+                      type="number"
+                      min={1}
+                      step={100}
+                      value={chatRenderWindowLimitDraft}
+                      onChange={(e) => setChatRenderWindowLimitDraft(e.target.value)}
+                      onBlur={() => commitChatRenderWindowLimit(chatRenderWindowLimitDraft)}
+                      className="h-8 w-24 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 text-sm text-[var(--color-text)] outline-none focus:border-[var(--color-highlight)]"
+                      aria-label="Chat render window view size limit"
+                    />
+                  </label>
+                  <span>messages when view reaches</span>
+                  <label className="inline-flex items-center">
+                    <input
+                      type="number"
+                      min={chatRenderWindowLimit + 1}
+                      step={100}
+                      value={chatRenderWindowTriggerDraft}
+                      onChange={(e) => setChatRenderWindowTriggerDraft(e.target.value)}
+                      onBlur={() => commitChatRenderWindowTrigger(chatRenderWindowTriggerDraft)}
+                      className="h-8 w-24 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 text-sm text-[var(--color-text)] outline-none focus:border-[var(--color-highlight)]"
+                      aria-label="Chat render window prune trigger size"
+                    />
+                  </label>
+                  <span>messages.</span>
+                </div>
+              )}
+              <p className="text-xs leading-relaxed text-[var(--color-text-muted)]">
+                Custom hides older UI messages after a turn completes. Full chat history remains saved.
+              </p>
+            </div>
+          </div>
+        </Section>
+
+        {/* Terminal Section */}
+        <Section
+          id="terminal"
+          title="Terminal"
+          description={
+            !isTerminalAvailable ? "Need Setup"
+              : webTerminalMode === "direct" ? "Direct"
+              : `${dependencyInfo[terminalMultiplexer]?.name || terminalMultiplexer}`
+          }
+          icon={Terminal}
+          iconColor={isTerminalAvailable ? "#0ea5e9" : "var(--color-warning)"}
+          isOpen={openSections.terminal}
+          onToggle={() => toggleSection("terminal")}
+        >
+          <div className="space-y-5">
+            {/* Terminal — two-panel selector */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-xs font-medium text-[var(--color-text-muted)] uppercase tracking-wider select-none">Terminal</div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => { checkDependencies(); checkAgentCommands(); }}
+                  disabled={isChecking}
+                  className="!p-1 !h-auto"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isChecking ? "animate-spin" : ""}`} />
+                </Button>
+              </div>
+              <div className="flex gap-2">
+                {/* Direct card */}
+                <motion.div
+                  layout
+                  onClick={() => setWebTerminalMode("direct")}
+                  className={`rounded-lg border cursor-pointer transition-colors overflow-hidden ${
+                    webTerminalMode === "direct"
+                      ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/5"
+                      : "border-[var(--color-border)] bg-[var(--color-bg-secondary)] hover:border-[var(--color-highlight)]/50"
+                  }`}
+                  style={{ flex: webTerminalMode === "direct" ? 3 : 2 }}
+                  transition={{ duration: 0.25, ease: "easeInOut" }}
+                >
+                  <div className="px-3 py-2.5">
+                    <div className="flex items-center gap-2">
+                      <div className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                        webTerminalMode === "direct" ? "bg-[var(--color-highlight)]" : "bg-[var(--color-border)]"
+                      }`} />
+                      <span className="text-sm font-medium text-[var(--color-text)]">Direct</span>
+                    </div>
+                    <AnimatePresence>
+                      {webTerminalMode === "direct" && (
+                        <motion.p
+                          initial={{ opacity: 0, height: 0 }}
+                          animate={{ opacity: 1, height: "auto" }}
+                          exit={{ opacity: 0, height: 0 }}
+                          transition={{ duration: 0.2 }}
+                          className="text-[11px] text-[var(--color-text-muted)] mt-1.5 ml-4 select-none"
+                        >
+                          Independent terminal instances, no session persistence
+                        </motion.p>
+                      )}
+                    </AnimatePresence>
+                  </div>
+                </motion.div>
+
+                {/* Multiplexer card */}
+                <motion.div
+                  layout
+                  onClick={() => {
+                    if (webTerminalMode !== "multiplexer" && hasMultiplexer) {
+                      setWebTerminalMode("multiplexer");
+                    }
+                  }}
+                  className={`rounded-lg border overflow-hidden transition-colors ${
+                    hasMultiplexer ? "cursor-pointer" : "opacity-50 cursor-not-allowed"
+                  } ${
+                    webTerminalMode === "multiplexer"
+                      ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/5"
+                      : `border-[var(--color-border)] bg-[var(--color-bg-secondary)] ${hasMultiplexer ? "hover:border-[var(--color-highlight)]/50" : ""}`
+                  }`}
+                  style={{ flex: webTerminalMode === "multiplexer" ? 3 : 2 }}
+                  transition={{ duration: 0.25, ease: "easeInOut" }}
+                >
+                  <div className="px-3 py-2.5">
+                    <div className="flex items-center gap-2">
+                      <div className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                        webTerminalMode === "multiplexer" ? "bg-[var(--color-highlight)]" : "bg-[var(--color-border)]"
+                      }`} />
+                      <span className="text-sm font-medium text-[var(--color-text)]">Multiplexer</span>
+                    </div>
+                    <AnimatePresence>
+                      {webTerminalMode === "multiplexer" && (
+                        <motion.div
+                          initial={{ opacity: 0, height: 0 }}
+                          animate={{ opacity: 1, height: "auto" }}
+                          exit={{ opacity: 0, height: 0 }}
+                          transition={{ duration: 0.2 }}
+                          className="mt-2 ml-0.5 space-y-1"
+                        >
+                          {(["tmux", "zellij"] as const).map((mux) => {
+                            const state = depStates[mux];
+                            const isInstalled = state?.status === "installed";
+                            const isMuxActive = terminalMultiplexer === mux && isInstalled;
+
+                            return (
+                              <div
+                                key={mux}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (isInstalled) {
+                                    setTerminalMultiplexer(mux);
+                                    lastTerminalMuxRef.current = mux;
+                                  }
+                                }}
+                                className={`flex items-center justify-between px-2.5 py-1.5 rounded-md transition-all ${
+                                  isInstalled ? "cursor-pointer" : ""
+                                } ${
+                                  isMuxActive
+                                    ? "bg-[var(--color-highlight)]/10"
+                                    : isInstalled
+                                      ? "hover:bg-[var(--color-bg-tertiary)]"
+                                      : "opacity-50"
+                                }`}
+                              >
+                                <div className="flex items-center gap-2">
+                                  <div className={`w-1.5 h-1.5 rounded-full ${
+                                    isMuxActive ? "bg-[var(--color-highlight)]"
+                                      : isInstalled ? "bg-[var(--color-success)]"
+                                      : "bg-[var(--color-text-muted)]"
+                                  }`} />
+                                  <span className={`text-xs ${isMuxActive ? "font-medium text-[var(--color-text)]" : "text-[var(--color-text-muted)]"}`}>
+                                    {dependencyInfo[mux]?.name || mux}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                  {isInstalled && state?.version && state.version !== "installed" && (
+                                    <span className="text-[10px] text-[var(--color-text-muted)]">v{state.version}</span>
+                                  )}
+                                  {!isInstalled && state?.status !== "checking" && state?.installCommand && (
+                                    <button
+                                      onClick={(e) => { e.stopPropagation(); handleCopy(`install-${mux}`, state.installCommand); }}
+                                      className="text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
+                                      title={state.installCommand}
+                                    >
+                                      {copiedField === `install-${mux}` ? (
+                                        <Check className="w-3 h-3 text-[var(--color-success)]" />
+                                      ) : (
+                                        <Copy className="w-3 h-3" />
+                                      )}
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+                </motion.div>
+              </div>
+            </div>
+
+            {/* Terminal Coding Agent (only for multiplexer mode) */}
+            {webTerminalMode === "multiplexer" && (
+              <div>
+                <div className="text-xs font-medium text-[var(--color-text-muted)] mb-2 uppercase tracking-wider select-none">Terminal Coding Agent</div>
+                <AgentPicker
+                  value={agentCommand}
+                  onChange={setAgentCommand}
+                  options={terminalAgentOptions}
+                  allowCustom={true}
+                  placeholder="Select agent..."
+                />
+              </div>
+            )}
+          </div>
+        </Section>
+
+        {/* Browser Control Section */}
+        <Section
+          id="browserControl"
+          title="Browser Control"
+          description="AI browser automation with dynamic Chrome Companion extension"
+          icon={Globe}
+          iconColor="#10b981"
+          isOpen={openSections.browserControl}
+          onToggle={() => toggleSection("browserControl")}
+        >
+          <div className="space-y-6">
+            {/* AI Browser Action settings — Allow toggle + Sandbox + Tab Groups
+                form one logical group: master switch and its two sub-modes.
+                Sandbox / Tab Groups rows gray out when the master is off; the
+                master row stays interactive. */}
+            <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] divide-y divide-[var(--color-border)]">
+              {/* Master toggle */}
+              <div className="flex items-center justify-between p-4">
+                <div>
+                  <span className="text-sm font-semibold text-[var(--color-text)] select-none block">
+                    Allow AI Browser Action
+                  </span>
+                  <span className="text-xs text-[var(--color-text-muted)] select-none">
+                    Grant AI agents permission to open, read, and interact with web pages inside your active Chrome browser.
+                  </span>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={browserControlEnabled}
+                    onChange={(e) => setBrowserControlEnabled(e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-9 h-5 bg-[var(--color-border)] peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[var(--color-highlight)]"></div>
+                </label>
+              </div>
+
+              {/* Tab Groups Organizer */}
+              <div className={`flex items-center justify-between p-4 ${!browserControlEnabled ? 'opacity-50 pointer-events-none' : ''}`}>
+                <div>
+                  <span className="text-sm font-semibold text-[var(--color-text)] select-none block">
+                    Tab Groups Organizer
+                  </span>
+                  <span className="text-xs text-[var(--color-text-muted)] select-none">
+                    Automatically organize tabs opened by the AI into project-scoped Chrome Tab Groups to keep your browser neat and tidy.
+                  </span>
+                </div>
+                <label className={`relative inline-flex items-center select-none ${browserControlEnabled ? 'cursor-pointer' : 'cursor-not-allowed'}`}>
+                  <input
+                    type="checkbox"
+                    checked={browserControlAutoGroups}
+                    disabled={!browserControlEnabled}
+                    onChange={(e) => setBrowserControlAutoGroups(e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-9 h-5 bg-[var(--color-border)] peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[var(--color-highlight)] peer-disabled:opacity-50"></div>
+                </label>
+              </div>
+            </div>
+
+            {/* Chrome Companion — independent capability: a runtime status card
+                + install entry point, unrelated to the AI Browser Action group. */}
+            <div className="p-4 bg-[var(--color-bg-secondary)] rounded-xl border border-[var(--color-border)] space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <span className="text-sm font-semibold text-[var(--color-text)] select-none block">
+                    Chrome Companion (Extension)
+                  </span>
+                  <span className="text-xs text-[var(--color-text-muted)] select-none">
+                    Control active browser sessions via the companion extension, inheriting all SSO login states, cookies, and active forms.
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 px-3 py-1 bg-[var(--color-bg-tertiary)] rounded-full border border-[var(--color-border)]">
+                  <div
+                    className={`w-2 h-2 rounded-full ${extensionConnected ? 'animate-pulse' : ''}`}
+                    style={{
+                      background: `var(--color-${extensionConnected ? 'success' : 'error'})`,
+                      boxShadow: `0 0 8px color-mix(in srgb, var(--color-${extensionConnected ? 'success' : 'error'}) 50%, transparent)`,
+                    }}
+                  />
+                  <span className="text-xs font-medium text-[var(--color-text)] select-none">
+                    {extensionConnected ? 'Connected' : 'Disconnected'}
+                  </span>
+                </div>
+              </div>
+              <div className="flex items-center justify-between text-xs pt-2 border-t border-[var(--color-border)]">
+                <span className="text-[var(--color-text-muted)] select-none">
+                  {extensionConnected
+                    ? "Companion is installed and connected."
+                    : "Not installed? The bundled installer walks you through it — pick a folder and Grove handles the rest."}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setInstallDialogOpen(true)}
+                  className="flex items-center gap-1 text-[var(--color-highlight)] hover:underline"
+                >
+                  {extensionConnected ? "Reinstall" : "Install Companion"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </Section>
+
         {/* Appearance Section */}
         <Section
           id="appearance"
           title="Appearance"
-          description={`Theme: ${theme.name}`}
+          description={`Mode: ${mode === "auto" ? "Auto" : mode === "light" ? "Light" : "Dark"} | Theme: ${theme.name}`}
           icon={Palette}
-          iconColor="var(--color-highlight)"
+          iconColor="#ec4899"
           isOpen={openSections.appearance}
           onToggle={() => toggleSection("appearance")}
         >
-          <div className="space-y-3">
-            <div className="text-sm font-medium text-[var(--color-text-muted)] mb-2">Select Theme</div>
-            <div className="grid grid-cols-4 gap-2">
-              {themes.map((t) => {
-                const isAuto = t.id === "auto";
-                // For Auto theme, show half dark / half light preview
-                const darkTheme = themes.find((th) => th.id === "dark");
-                const lightTheme = themes.find((th) => th.id === "light");
-
-                return (
-                  <motion.button
-                    key={t.id}
-                    whileHover={{ scale: 1.02 }}
-                    whileTap={{ scale: 0.98 }}
-                    onClick={() => handleThemeChange(t.id)}
-                    className={`relative p-3 rounded-lg border text-center transition-all
-                      ${theme.id === t.id
-                        ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/10"
-                        : "border-[var(--color-border)] hover:border-[var(--color-text-muted)] bg-[var(--color-bg-secondary)]"
-                      }`}
+          <div className="space-y-8">
+            {/* Mode Selection & Action Header */}
+            <div 
+              onDragOver={(e) => { e.preventDefault(); setIsDraggingTheme(true); }}
+              onDragLeave={() => setIsDraggingTheme(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setIsDraggingTheme(false);
+                const file = e.dataTransfer.files?.[0];
+                if (file) {
+                  const reader = new FileReader();
+                  reader.onload = (re) => processThemeData(re.target?.result as string);
+                  reader.readAsText(file);
+                }
+              }}
+              className={`flex flex-col gap-4 transition-all ${isDraggingTheme ? 'p-4 rounded-xl border-2 border-dashed border-[var(--color-highlight)] bg-[var(--color-highlight)]/5' : ''}`}
+            >
+              <div className="flex items-center justify-between">
+                <div className="text-xs font-bold text-[var(--color-text-muted)] uppercase tracking-wider select-none">
+                  {isDraggingTheme ? "Drop file to import theme" : "Appearance Mode"}
+                </div>
+                <div className="flex items-center gap-2">
+                  <input 
+                    type="file" 
+                    id="theme-import-input" 
+                    className="hidden" 
+                    accept=".grovetheme,.json" 
+                    onChange={handleImportFile} 
+                  />
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => document.getElementById('theme-import-input')?.click()}
                   >
-                    {theme.id === t.id && (
-                      <div className="absolute top-1.5 right-1.5 w-4 h-4 rounded-full bg-[var(--color-highlight)] flex items-center justify-center">
-                        <Check className="w-2.5 h-2.5 text-white" />
-                      </div>
-                    )}
-                    {/* Color Preview */}
-                    <div className="flex gap-1 mb-2 justify-center">
-                      {isAuto ? (
-                        // Auto theme: show half dark / half light
-                        <>
-                          <div className="w-3 h-3 rounded-full overflow-hidden flex">
-                            <div className="w-1.5 h-3" style={{ backgroundColor: darkTheme?.colors.highlight }} />
-                            <div className="w-1.5 h-3" style={{ backgroundColor: lightTheme?.colors.highlight }} />
-                          </div>
-                          <div className="w-3 h-3 rounded-full overflow-hidden flex">
-                            <div className="w-1.5 h-3" style={{ backgroundColor: darkTheme?.colors.accent }} />
-                            <div className="w-1.5 h-3" style={{ backgroundColor: lightTheme?.colors.accent }} />
-                          </div>
-                          <div className="w-3 h-3 rounded-full overflow-hidden flex">
-                            <div className="w-1.5 h-3" style={{ backgroundColor: darkTheme?.colors.info }} />
-                            <div className="w-1.5 h-3" style={{ backgroundColor: lightTheme?.colors.info }} />
-                          </div>
-                        </>
-                      ) : (
-                        <>
-                          <div className="w-3 h-3 rounded-full" style={{ backgroundColor: t.colors.highlight }} />
-                          <div className="w-3 h-3 rounded-full" style={{ backgroundColor: t.colors.accent }} />
-                          <div className="w-3 h-3 rounded-full" style={{ backgroundColor: t.colors.info }} />
-                        </>
-                      )}
-                    </div>
-                    <div className="text-xs font-medium text-[var(--color-text)]">{t.name}</div>
-                  </motion.button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Terminal Color Scheme */}
-          <div className="space-y-3 mt-6 pt-6 border-t border-[var(--color-border)]">
-            <div className="text-sm font-medium text-[var(--color-text-muted)] mb-2">Terminal Color Scheme</div>
-            <div className="grid grid-cols-5 gap-2">
-              {terminalThemes.map((tt) => {
-                const isSelected = terminalTheme.id === tt.id;
-                const previewColors = [tt.colors.red, tt.colors.green, tt.colors.yellow, tt.colors.blue, tt.colors.magenta, tt.colors.cyan];
-
-                return (
-                  <motion.button
-                    key={tt.id}
-                    whileHover={{ scale: 1.02 }}
-                    whileTap={{ scale: 0.98 }}
-                    onClick={() => setTerminalTheme(tt.id)}
-                    className={`relative p-3 rounded-lg border text-center transition-all
-                      ${isSelected
-                        ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/10"
-                        : "border-[var(--color-border)] hover:border-[var(--color-text-muted)] bg-[var(--color-bg-secondary)]"
-                      }`}
+                    <Download className="w-3.5 h-3.5 mr-1.5" /> Import
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setIsCustomThemeDialogOpen(true)}
                   >
-                    {isSelected && (
-                      <div className="absolute top-1.5 right-1.5 w-4 h-4 rounded-full bg-[var(--color-highlight)] flex items-center justify-center">
-                        <Check className="w-2.5 h-2.5 text-white" />
-                      </div>
-                    )}
-                    {/* Mini color bar preview */}
-                    <div
-                      className="flex gap-0 mb-2 rounded overflow-hidden h-4"
-                      style={{ backgroundColor: tt.colors.background }}
-                    >
-                      {previewColors.map((color, i) => (
-                        <div
-                          key={i}
-                          className="flex-1 h-full"
-                          style={{ backgroundColor: color }}
-                        />
-                      ))}
-                    </div>
-                    <div className="text-[11px] font-medium text-[var(--color-text)] truncate">{tt.name}</div>
-                  </motion.button>
-                );
-              })}
-            </div>
-          </div>
-        </Section>
-
-        {/* Environment Section */}
-        <Section
-          id="environment"
-          title="Environment"
-          description={`${installedCount}/${depKeys.length || 4} dependencies installed`}
-          icon={Package}
-          iconColor="var(--color-accent)"
-          isOpen={openSections.environment}
-          onToggle={() => toggleSection("environment")}
-        >
-          <div className="space-y-4">
-            {/* Status Summary */}
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                {installedCount === (depKeys.length || 4) ? (
-                  <>
-                    <CheckCircle2 className="w-5 h-5 text-[var(--color-success)]" />
-                    <span className="text-sm text-[var(--color-success)]">All dependencies installed</span>
-                  </>
-                ) : (
-                  <>
-                    <AlertTriangle className="w-5 h-5 text-[var(--color-warning)]" />
-                    <span className="text-sm text-[var(--color-warning)]">Some dependencies are missing</span>
-                  </>
-                )}
+                    <Plus className="w-3.5 h-3.5 mr-1.5" /> Create
+                  </Button>
+                </div>
               </div>
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={checkDependencies}
-                disabled={isChecking}
-              >
-                <RefreshCw className={`w-4 h-4 mr-2 ${isChecking ? "animate-spin" : ""}`} />
-                {isChecking ? "Checking..." : "Refresh"}
-              </Button>
+              <div className="flex p-1 bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl max-w-sm">
+                {(["auto", "light", "dark"] as const).map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => handleModeChange(m)}
+                    className={`flex-1 py-1.5 text-xs font-semibold uppercase tracking-wider rounded-lg transition-all
+                      ${mode === m 
+                        ? "bg-[var(--color-bg)] text-[var(--color-text)] shadow-sm border border-[var(--color-border)]" 
+                        : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]"}`}
+                  >
+                    {m}
+                  </button>
+                ))}
+              </div>
             </div>
 
-            {/* Dependency row renderer */}
-            {(() => {
-              const allDeps = depKeys.length > 0 ? depKeys : ["git", "tmux", "zellij", "fzf"];
-              const baseDeps = allDeps.filter((d) => d !== "tmux" && d !== "zellij");
-              const muxDeps = allDeps.filter((d) => d === "tmux" || d === "zellij");
-
-              const renderDepRow = (depName: string) => {
-                const state = depStates[depName] || { status: "checking" as DependencyStatusType, installCommand: "" };
-                const info = dependencyInfo[depName] || { name: depName, description: "" };
-                const isInstalled = state.status === "installed";
-                const isMux = depName === "tmux" || depName === "zellij";
-                // 只有在已安装时才显示为 Active
-                const isMuxActive = isMux && multiplexer === depName && isInstalled;
-                const canSwitchMux = isMux && isInstalled && !isMuxActive;
-
-                return (
-                  <motion.div
-                    key={depName}
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    whileHover={canSwitchMux ? { scale: 1.01 } : {}}
-                    whileTap={canSwitchMux ? { scale: 0.98 } : {}}
-                    onClick={() => { if (canSwitchMux) setMultiplexer(depName); }}
-                    className={`flex items-center justify-between p-3 rounded-lg border transition-all duration-200
-                      ${canSwitchMux ? "cursor-pointer hover:border-[var(--color-highlight)]/50" : ""}
-                      ${isMuxActive
-                        ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/5"
-                        : isInstalled
-                          ? "bg-[var(--color-bg-secondary)] border-[var(--color-border)]"
-                          : "bg-[var(--color-warning)]/5 border-[var(--color-warning)]/20"
-                      }`}
-                  >
-                    <div className="flex items-center gap-3">
-                      {getStatusIcon(state.status)}
-                      <div>
-                        <div className="font-medium text-sm text-[var(--color-text)]">
-                          {info.name}
-                          {isMuxActive && (
-                            <motion.span
-                              initial={{ opacity: 0, scale: 0.8 }}
-                              animate={{ opacity: 1, scale: 1 }}
-                              className="ml-2 text-xs font-normal text-[var(--color-highlight)]"
-                            >Active</motion.span>
-                          )}
+            {/* Light Themes */}
+            {(mode === "auto" || mode === "light") && (
+              <div className="space-y-4">
+                <div className="text-xs font-bold text-[var(--color-text-muted)] uppercase tracking-wider">
+                  {mode === "auto" ? "Preferred Light Theme" : "Light Themes"}
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+                  {themes.filter(t => t.isLight).map((t) => (
+                    <motion.button
+                      key={t.id}
+                      whileHover={{ scale: 1.02 }}
+                      whileTap={{ scale: 0.98 }}
+                      onClick={() => handleLightThemeChange(t.id)}
+                      className={`relative p-3 rounded-lg border text-center transition-all group
+                        ${lightThemeId === t.id
+                          ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/10"
+                          : "border-[var(--color-border)] hover:border-[var(--color-text-muted)] bg-[var(--color-bg-secondary)]"
+                        }`}
+                    >
+                      {lightThemeId === t.id && (
+                        <div className="absolute top-1.5 right-1.5 w-4 h-4 rounded-full bg-[var(--color-highlight)] flex items-center justify-center">
+                          <Check className="w-2.5 h-2.5 text-white" />
                         </div>
-                        <div className="text-xs text-[var(--color-text-muted)]">{info.description}</div>
+                      )}
+                      <div className="flex gap-1 mb-2 justify-center">
+                        <div className="w-3 h-3 rounded-full" style={{ backgroundColor: t.colors.highlight }} />
+                        <div className="w-3 h-3 rounded-full" style={{ backgroundColor: t.colors.accent }} />
+                        <div className="w-3 h-3 rounded-full" style={{ backgroundColor: t.colors.info }} />
                       </div>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      {canSwitchMux && (
-                        <span className="text-xs text-[var(--color-text-muted)]">Use</span>
-                      )}
-
-                      {isInstalled && state.version && (
-                        <span className="text-xs text-[var(--color-success)]">v{state.version}</span>
-                      )}
-
-                      {!isInstalled && state.status !== "checking" && state.installCommand && (
-                        <div title={`Copy: ${state.installCommand}`} onClick={(e) => e.stopPropagation()}>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => handleCopy(`install-${depName}`, state.installCommand)}
+                      <div className="text-xs font-medium text-[var(--color-text)] truncate">{t.name}</div>
+                      {t.isCustom && (
+                        <div className="absolute top-1 right-1 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleExportTheme(t);
+                            }}
+                            title="Export Theme"
+                            className="p-1 text-[var(--color-text-muted)] hover:text-[var(--color-highlight)] bg-[var(--color-bg)]/80 backdrop-blur rounded-md border border-[var(--color-border)] shadow-sm"
                           >
-                            {copiedField === `install-${depName}` ? (
-                              <Check className="w-4 h-4 text-[var(--color-success)]" />
-                            ) : (
-                              <Copy className="w-4 h-4" />
-                            )}
-                          </Button>
+                            <Share2 className="w-3 h-3" />
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const newCustoms = customThemes.filter((ct: Theme) => ct.id !== t.id);
+                              const nextLightThemeId = lightThemeId === t.id ? "light" : lightThemeId;
+                              setAppearance({ customThemes: newCustoms, lightThemeId: nextLightThemeId });
+                            }}
+                            title="Delete Theme"
+                            className="p-1 text-[var(--color-text-muted)] hover:text-[var(--color-error)] bg-[var(--color-bg)]/80 backdrop-blur rounded-md border border-[var(--color-border)] shadow-sm"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
                         </div>
                       )}
+                    </motion.button>
+                  ))}
+                </div>
+              </div>
+            )}
 
-                      {isInstalled && info.docsUrl && (
-                        <a
-                          href={info.docsUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          onClick={(e) => e.stopPropagation()}
-                          className="text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
-                        >
-                          <ExternalLink className="w-4 h-4" />
-                        </a>
+            {/* Dark Themes */}
+            {(mode === "auto" || mode === "dark") && (
+              <div>
+                <div className="text-sm font-medium text-[var(--color-text-muted)] mb-3 select-none">
+                  {mode === "auto" ? "Preferred Dark Theme" : "Dark Themes"}
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+                  {themes.filter(t => !t.isLight).map((t) => (
+                    <motion.button
+                      key={t.id}
+                      whileHover={{ scale: 1.02 }}
+                      whileTap={{ scale: 0.98 }}
+                      onClick={() => handleDarkThemeChange(t.id)}
+                      className={`relative p-3 rounded-lg border text-center transition-all group
+                        ${darkThemeId === t.id
+                          ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/10"
+                          : "border-[var(--color-border)] hover:border-[var(--color-text-muted)] bg-[var(--color-bg-secondary)]"
+                        }`}
+                    >
+                      {darkThemeId === t.id && (
+                        <div className="absolute top-1.5 right-1.5 w-4 h-4 rounded-full bg-[var(--color-highlight)] flex items-center justify-center">
+                          <Check className="w-2.5 h-2.5 text-white" />
+                        </div>
                       )}
-                    </div>
-                  </motion.div>
-                );
-              };
-
-              return (
-                <>
-                  {/* Base Dependencies */}
-                  <div className="space-y-2">
-                    {baseDeps.map(renderDepRow)}
-                  </div>
-
-                  {/* Multiplexer Divider + Section */}
-                  <div className="flex items-center gap-3 mt-4 mb-2">
-                    <div className="flex-1 h-px bg-[var(--color-border)]" />
-                    <span className="text-xs font-medium text-[var(--color-text-muted)] uppercase tracking-wider">Multiplexer</span>
-                    <div className="flex-1 h-px bg-[var(--color-border)]" />
-                  </div>
-                  <div className="space-y-2">
-                    {muxDeps.map(renderDepRow)}
-                  </div>
-                </>
-              );
-            })()}
+                      <div className="flex gap-1 mb-2 justify-center">
+                        <div className="w-3 h-3 rounded-full" style={{ backgroundColor: t.colors.highlight }} />
+                        <div className="w-3 h-3 rounded-full" style={{ backgroundColor: t.colors.accent }} />
+                        <div className="w-3 h-3 rounded-full" style={{ backgroundColor: t.colors.info }} />
+                      </div>
+                      <div className="text-xs font-medium text-[var(--color-text)] truncate">{t.name}</div>
+                      {t.isCustom && (
+                        <div className="absolute top-1.5 right-1.5 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleExportTheme(t);
+                            }}
+                            title="Export Theme"
+                            className="p-1 text-[var(--color-text-muted)] hover:text-[var(--color-highlight)] bg-[var(--color-bg)]/80 backdrop-blur rounded-md border border-[var(--color-border)] shadow-sm"
+                          >
+                            <Share2 className="w-3 h-3" />
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const newCustoms = customThemes.filter((ct: Theme) => ct.id !== t.id);
+                              const nextDarkThemeId = darkThemeId === t.id ? "dark" : darkThemeId;
+                              setAppearance({ customThemes: newCustoms, darkThemeId: nextDarkThemeId });
+                            }}
+                            title="Delete Theme"
+                            className="p-1 text-[var(--color-text-muted)] hover:text-[var(--color-error)] bg-[var(--color-bg)]/80 backdrop-blur rounded-md border border-[var(--color-border)] shadow-sm"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
+                      )}
+                    </motion.button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         </Section>
 
-        {/* Development Tools Section (NEW - merged Agent + IDE + Terminal) */}
+        {/* General Section (IDE + Terminal App) */}
         <Section
           id="devtools"
-          title="Development Tools"
-          description="Configure your coding agent, IDE, and terminal"
+          title="General"
+          description="Default IDE and terminal application"
           icon={Wrench}
-          iconColor="var(--color-highlight)"
+          iconColor="#64748b"
           isOpen={openSections.devtools}
           onToggle={() => toggleSection("devtools")}
         >
           <div className="space-y-6">
-            {/* Coding Agent */}
-            <div>
-              <div className="flex items-center gap-2 mb-3">
-                <Sparkles className="w-4 h-4 text-[var(--color-warning)]" />
-                <span className="text-sm font-medium text-[var(--color-text)]">Coding Agent</span>
+            {serverPlatform === null ? (
+              <div className="flex items-center gap-3 p-4 rounded-lg bg-[var(--color-bg-secondary)] border border-[var(--color-border)]">
+                <p className="text-sm text-[var(--color-text-muted)]">Detecting platform...</p>
               </div>
-              <AgentPicker
-                value={agentCommand}
-                onChange={setAgentCommand}
-                placeholder="Select agent..."
-                customPlaceholder="Enter agent command (e.g., claude --yolo)"
-              />
-            </div>
+            ) : serverPlatform !== "macos" ? (
+              <div className="flex items-center gap-3 p-4 rounded-lg bg-[var(--color-bg-secondary)] border border-[var(--color-border)]">
+                <Info className="w-5 h-5 text-[var(--color-text-muted)] shrink-0" />
+                <p className="text-sm text-[var(--color-text-muted)]">
+                  IDE and terminal application detection is not yet supported on {
+                    serverPlatform === "windows" ? "Windows"
+                    : serverPlatform === "linux" ? "Linux"
+                    : serverPlatform
+                  }.
+                </p>
+              </div>
+            ) : (
+              <>
+                {/* Default IDE */}
+                <div>
+                  <div className="flex items-center gap-2 mb-3 select-none">
+                    <Code className="w-4 h-4 text-[var(--color-info)]" />
+                    <span className="text-sm font-medium text-[var(--color-text)]">Default IDE</span>
+                  </div>
+                  <AppPicker
+                    options={ideAppOptions}
+                    value={ideCommand}
+                    onChange={setIdeCommand}
+                    placeholder="Select IDE..."
+                    applications={applications}
+                    isLoadingApps={isLoadingApps}
+                    appFilter={(app) =>
+                      // Filter for common IDEs/editors
+                      /code|studio|idea|storm|rider|cursor|zed|sublime|atom|vim|emacs|nova|bbedit|textmate|xcode/i.test(app.name) ||
+                      /com\.(microsoft|jetbrains|apple|sublimehq|github)/i.test(app.bundle_id || "")
+                    }
+                  />
+                </div>
 
-            {/* Default IDE */}
-            <div>
-              <div className="flex items-center gap-2 mb-3">
-                <Code className="w-4 h-4 text-[var(--color-info)]" />
-                <span className="text-sm font-medium text-[var(--color-text)]">Default IDE</span>
-              </div>
-              <AppPicker
-                options={ideAppOptions}
-                value={ideCommand}
-                onChange={setIdeCommand}
-                placeholder="Select IDE..."
-                applications={applications}
-                isLoadingApps={isLoadingApps}
-                appFilter={(app) =>
-                  // Filter for common IDEs/editors
-                  /code|studio|idea|storm|rider|cursor|zed|sublime|atom|vim|emacs|nova|bbedit|textmate|xcode/i.test(app.name) ||
-                  /com\.(microsoft|jetbrains|apple|sublimehq|github)/i.test(app.bundle_id || "")
-                }
-              />
-            </div>
+                {/* Default Terminal */}
+                <div>
+                  <div className="flex items-center gap-2 mb-3 select-none">
+                    <Terminal className="w-4 h-4 text-[var(--color-accent)]" />
+                    <span className="text-sm font-medium text-[var(--color-text)]">Default Terminal</span>
+                  </div>
+                  <AppPicker
+                    options={terminalAppOptions}
+                    value={terminalCommand}
+                    onChange={setTerminalCommand}
+                    placeholder="System Default"
+                    applications={applications}
+                    isLoadingApps={isLoadingApps}
+                    appFilter={(app) =>
+                      // Filter for terminals
+                      /terminal|iterm|warp|ghostty|kitty|alacritty|hyper|konsole|tilix|wezterm|cmux/i.test(app.name) ||
+                      /com\.(apple\.Terminal|googlecode\.iterm|warp|kovidgoyal|wez|feh)|io\.github\.mlfwka/i.test(app.bundle_id || "")
+                    }
+                  />
+                </div>
+              </>
+            )}
 
-            {/* Default Terminal */}
+            {windowShortcutControl}
+
+            {/* Workspace Layout */}
             <div>
-              <div className="flex items-center gap-2 mb-3">
-                <Terminal className="w-4 h-4 text-[var(--color-accent)]" />
-                <span className="text-sm font-medium text-[var(--color-text)]">Default Terminal</span>
+              <div className="flex items-center gap-2 mb-3 select-none">
+                <LayoutGrid className="w-4 h-4 text-[var(--color-warning)]" />
+                <span className="text-sm font-medium text-[var(--color-text)]">Workspace Layout</span>
               </div>
-              <AppPicker
-                options={terminalAppOptions}
-                value={terminalCommand}
-                onChange={setTerminalCommand}
-                placeholder="System Default"
-                applications={applications}
-                isLoadingApps={isLoadingApps}
-                appFilter={(app) =>
-                  // Filter for terminals
-                  /terminal|iterm|warp|kitty|alacritty|hyper|konsole|tilix/i.test(app.name) ||
-                  /com\.(apple\.Terminal|googlecode\.iterm|warp|kovidgoyal)/i.test(app.bundle_id || "")
-                }
-              />
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  onClick={() => setWorkspaceLayout("flex")}
+                  className={`p-3 rounded-lg border text-left transition-all ${
+                    workspaceLayout === "flex"
+                      ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/10"
+                      : "border-[var(--color-border)] bg-[var(--color-bg-secondary)] hover:border-[var(--color-highlight)]/50"
+                  }`}
+                >
+                  <div className="text-xs font-medium text-[var(--color-text)] mb-1">Free Layout</div>
+                  <div className="text-[11px] text-[var(--color-text-muted)]">Drag and arrange panels freely</div>
+                </button>
+                <button
+                  onClick={() => setWorkspaceLayout("ide")}
+                  className={`p-3 rounded-lg border text-left transition-all ${
+                    workspaceLayout === "ide"
+                      ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/10"
+                      : "border-[var(--color-border)] bg-[var(--color-bg-secondary)] hover:border-[var(--color-highlight)]/50"
+                  }`}
+                >
+                  <div className="text-xs font-medium text-[var(--color-text)] mb-1">IDE Layout</div>
+                  <div className="text-[11px] text-[var(--color-text-muted)]">Fixed panels with Chat-centric view</div>
+                </button>
+              </div>
             </div>
           </div>
         </Section>
 
-        {/* Task Layout Section */}
+        {/* AutoLink Section */}
         <Section
-          id="layout"
-          title="Task Layout"
-          description="Default pane layout for new tasks"
-          icon={LayoutGrid}
-          iconColor="var(--color-info)"
-          isOpen={openSections.layout}
-          onToggle={() => toggleSection("layout")}
+          id="autolink"
+          title="AutoLink"
+          description={`${autoLinkPatterns.length} patterns configured`}
+          icon={Link}
+          iconColor="#6366f1"
+          isOpen={openSections.autolink}
+          onToggle={() => toggleSection("autolink")}
         >
-          <div className="grid grid-cols-3 gap-3">
-            {layoutPresets.map((preset) => {
-              const isCustom = preset.id === "custom";
-              const isSelected = selectedLayout === preset.id;
+          <div className="space-y-6">
+            {/* 功能说明 */}
+            <div className="p-3 bg-[var(--color-bg-secondary)] rounded-lg">
+              <p className="text-xs text-[var(--color-text-muted)] select-none">
+                Automatically create symlinks in new worktrees for gitignored files/folders.
+                Saves disk space and avoids rebuilding node_modules, IDE configs, etc.
+              </p>
+            </div>
 
-              // Render preview based on layout type
-              const renderPreview = () => {
-                if (isCustom) {
-                  // Custom layout preview based on tree structure
-                  const currentCustomLayout = customLayouts.find(l => l.id === selectedCustomLayoutId) || customLayouts[0];
+            {/* Glob 模式列表 */}
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <div className="select-none">
+                  <h4 className="text-sm font-medium text-[var(--color-text)]">Path Patterns</h4>
+                  <p className="text-xs text-[var(--color-text-muted)] mt-1">
+                    Glob patterns to match files/folders (supports *, **, ?)
+                  </p>
+                </div>
+                <Button
+                  onClick={() => setAutoLinkPatterns([...autoLinkPatterns, ""])}
+                  variant="secondary"
+                  size="sm"
+                >
+                  <Plus className="w-3 h-3 mr-1" />
+                  Add
+                </Button>
+              </div>
 
-                  if (!currentCustomLayout) {
-                    return (
-                      <div className="h-10 mb-2 bg-[var(--color-bg)] rounded border border-dashed border-[var(--color-border)] flex items-center justify-center">
-                        <span className="text-[10px] text-[var(--color-text-muted)]">Click to configure</span>
-                      </div>
-                    );
-                  }
+              {/* 模式输入列表 */}
+              <div className="space-y-2 mb-4">
+                {autoLinkPatterns.map((pattern, index) => (
+                  <div key={`${index}_${pattern}`} className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={pattern}
+                      onChange={(e) => {
+                        const newPatterns = [...autoLinkPatterns];
+                        newPatterns[index] = e.target.value;
+                        setAutoLinkPatterns(newPatterns);
+                      }}
+                      placeholder="e.g., node_modules or **/dist"
+                      className="flex-1 px-3 py-2 text-sm bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] font-mono"
+                    />
+                    <button
+                      onClick={() => {
+                        setAutoLinkPatterns(autoLinkPatterns.filter((_, i) => i !== index));
+                      }}
+                      className="p-2 text-[var(--color-text-muted)] hover:text-red-500 transition-colors"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                ))}
 
-                  // Recursive function to render LayoutNode tree
-                  const renderLayoutNode = (node: LayoutNode): React.ReactNode => {
-                    if (node.type === "pane") {
-                      const colors = paneTypeColors[node.paneType || "shell"] || paneTypeColors.shell;
+                {autoLinkPatterns.length === 0 && (
+                  <div className="text-center py-4 text-sm text-[var(--color-text-muted)] select-none">
+                    No patterns configured. Click "Add" to create one.
+                  </div>
+                )}
+              </div>
+
+              {/* 预设模板 */}
+              <div className="p-3 bg-[var(--color-bg-secondary)] rounded-lg mb-3">
+                <h5 className="text-xs font-medium text-[var(--color-text)] mb-2 select-none">
+                  Quick Add Presets
+                </h5>
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    { label: "**/node_modules", pattern: "**/node_modules" },
+                    { label: "target", pattern: "target" },
+                    { label: "build", pattern: "build" },
+                    { label: "dist", pattern: "dist" },
+                    { label: ".next", pattern: ".next" },
+                    { label: ".nuxt", pattern: ".nuxt" },
+                    { label: ".turbo", pattern: ".turbo" },
+                    { label: ".cache", pattern: ".cache" },
+                    { label: "vendor", pattern: "vendor" },
+                    { label: "**/venv", pattern: "**/venv" },
+                    { label: "**/__pycache__", pattern: "**/__pycache__" },
+                  ].map((preset) => (
+                    <button
+                      key={preset.pattern}
+                      onClick={() => {
+                        if (!autoLinkPatterns.includes(preset.pattern)) {
+                          setAutoLinkPatterns([...autoLinkPatterns, preset.pattern]);
+                        }
+                      }}
+                      disabled={autoLinkPatterns.includes(preset.pattern)}
+                      className={`px-2 py-1 text-xs rounded font-mono ${
+                        autoLinkPatterns.includes(preset.pattern)
+                          ? "bg-[var(--color-border)] text-[var(--color-text-muted)] cursor-not-allowed"
+                          : "bg-[var(--color-accent)] text-white hover:opacity-80"
+                      }`}
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Glob 语法帮助 */}
+              <div className="p-3 bg-[var(--color-bg-secondary)] rounded-lg">
+                <h5 className="text-xs font-medium text-[var(--color-text)] mb-2 select-none">Glob Syntax</h5>
+                <ul className="text-xs text-[var(--color-text-muted)] space-y-1 select-none">
+                  <li>• <code className="font-mono">*</code> matches any characters (except /)</li>
+                  <li>• <code className="font-mono">**</code> matches any path segment</li>
+                  <li>• <code className="font-mono">?</code> matches single character</li>
+                  <li>• Examples: <code className="font-mono">node_modules</code>, <code className="font-mono">**/dist</code>, <code className="font-mono">packages/*/build</code></li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </Section>
+
+        {/* Terminal Layout Section (仅当 Multiplexer 模式时显示) */}
+        {webTerminalMode === "multiplexer" && (
+          <>
+            <Section
+              id="layout"
+              title="Terminal Layout"
+              description="Default pane layout for new tasks"
+              icon={LayoutGrid}
+              iconColor="var(--color-info)"
+              isOpen={openSections.layout}
+              onToggle={() => toggleSection("layout")}
+            >
+              <div className="grid grid-cols-3 gap-3">
+                {layoutPresets.map((preset) => {
+                  const isCustom = preset.id === "custom";
+                  const isSelected = selectedLayout === preset.id;
+
+                  // Render preview based on layout type
+                  const renderPreview = () => {
+                    if (isCustom) {
+                      // Custom layout preview based on tree structure
+                      const currentCustomLayout = customLayouts.find(l => l.id === selectedCustomLayoutId) || customLayouts[0];
+
+                      if (!currentCustomLayout) {
+                        return (
+                          <div className="h-10 mb-2 bg-[var(--color-bg)] rounded border border-dashed border-[var(--color-border)] flex items-center justify-center">
+                            <span className="text-[10px] text-[var(--color-text-muted)]">Click to configure</span>
+                          </div>
+                        );
+                      }
+
+                      // Recursive function to render LayoutNode tree
+                      const renderLayoutNode = (node: LayoutNode): React.ReactNode => {
+                        if (node.type === "pane") {
+                          const colors = paneTypeColors[node.paneType || "shell"] || paneTypeColors.shell;
+                          return (
+                            <div
+                              key={node.id}
+                              className="flex-1 rounded text-[8px] flex items-center justify-center min-w-0 min-h-0"
+                              style={{ backgroundColor: `${colors.bg}20`, color: colors.text }}
+                            >
+                              {paneTypeLabels[node.paneType || "shell"] || node.paneType}
+                            </div>
+                          );
+                        }
+
+                        // Split node
+                        if (node.children) {
+                          const isHorizontal = node.direction === "horizontal";
+                          return (
+                            <div
+                              key={node.id}
+                              className={`flex ${isHorizontal ? "flex-row" : "flex-col"} gap-0.5 flex-1 min-w-0 min-h-0`}
+                            >
+                              {renderLayoutNode(node.children[0])}
+                              {renderLayoutNode(node.children[1])}
+                            </div>
+                          );
+                        }
+
+                        return null;
+                      };
+
+                      const paneCount = countPanes(currentCustomLayout.root);
+
                       return (
-                        <div
-                          key={node.id}
-                          className="flex-1 rounded text-[8px] flex items-center justify-center min-w-0 min-h-0"
-                          style={{ backgroundColor: `${colors.bg}20`, color: colors.text }}
-                        >
-                          {paneTypeLabels[node.paneType || "shell"] || node.paneType}
+                        <div className="h-10 mb-2 bg-[var(--color-bg)] rounded border border-[var(--color-border)] p-1 flex">
+                          {renderLayoutNode(currentCustomLayout.root)}
+                          {paneCount === 0 && (
+                            <span className="text-[10px] text-[var(--color-text-muted)] m-auto">Click to configure</span>
+                          )}
                         </div>
                       );
                     }
 
-                    // Split node
-                    if (node.children) {
-                      const isHorizontal = node.direction === "horizontal";
+                    // 3 Panes: Left + Right split (left one big, right two stacked)
+                    if (preset.layout === "left-right-split") {
                       return (
-                        <div
-                          key={node.id}
-                          className={`flex ${isHorizontal ? "flex-row" : "flex-col"} gap-0.5 flex-1 min-w-0 min-h-0`}
-                        >
-                          {renderLayoutNode(node.children[0])}
-                          {renderLayoutNode(node.children[1])}
-                        </div>
-                      );
-                    }
-
-                    return null;
-                  };
-
-                  const paneCount = countPanes(currentCustomLayout.root);
-
-                  return (
-                    <div className="h-10 mb-2 bg-[var(--color-bg)] rounded border border-[var(--color-border)] p-1 flex">
-                      {renderLayoutNode(currentCustomLayout.root)}
-                      {paneCount === 0 && (
-                        <span className="text-[10px] text-[var(--color-text-muted)] m-auto">Click to configure</span>
-                      )}
-                    </div>
-                  );
-                }
-
-                // 3 Panes: Left + Right split (left one big, right two stacked)
-                if (preset.layout === "left-right-split") {
-                  return (
-                    <div className="h-10 mb-2 bg-[var(--color-bg)] rounded border border-[var(--color-border)] p-1 flex gap-0.5">
-                      {/* Left pane (60%) */}
-                      <div
-                        className="w-[60%] rounded text-[8px] flex items-center justify-center"
-                        style={{
-                          backgroundColor: `${paneTypeColors[preset.panes[0]]?.bg || "var(--color-text-muted)"}20`,
-                          color: paneTypeColors[preset.panes[0]]?.text || "var(--color-text-muted)",
-                        }}
-                      >
-                        {preset.panes[0]}
-                      </div>
-                      {/* Right panes (40%, stacked) */}
-                      <div className="w-[40%] flex flex-col gap-0.5">
-                        {preset.panes.slice(1).map((pane, i) => (
+                        <div className="h-10 mb-2 bg-[var(--color-bg)] rounded border border-[var(--color-border)] p-1 flex gap-0.5">
+                          {/* Left pane (60%) */}
                           <div
-                            key={i}
-                            className="flex-1 rounded text-[8px] flex items-center justify-center"
+                            className="w-[60%] rounded text-[8px] flex items-center justify-center"
                             style={{
-                              backgroundColor: `${paneTypeColors[pane]?.bg || "var(--color-text-muted)"}20`,
-                              color: paneTypeColors[pane]?.text || "var(--color-text-muted)",
+                              backgroundColor: `${paneTypeColors[preset.panes[0]]?.bg || "var(--color-text-muted)"}20`,
+                              color: paneTypeColors[preset.panes[0]]?.text || "var(--color-text-muted)",
                             }}
                           >
-                            {pane}
+                            {paneTypeLabels[preset.panes[0] as PaneType] || preset.panes[0]}
                           </div>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                }
-
-                // Default horizontal layout
-                return (
-                  <div className="h-10 mb-2 bg-[var(--color-bg)] rounded border border-[var(--color-border)] p-1 flex gap-0.5">
-                    {preset.panes.map((pane, i) => {
-                      const colors = paneTypeColors[pane] || paneTypeColors.shell;
-                      return (
-                        <div
-                          key={i}
-                          className="flex-1 rounded text-[8px] flex items-center justify-center"
-                          style={{ backgroundColor: `${colors.bg}20`, color: colors.text }}
-                        >
-                          {pane}
+                          {/* Right panes (40%, stacked) */}
+                          <div className="w-[40%] flex flex-col gap-0.5">
+                            {preset.panes.slice(1).map((pane, i) => (
+                              <div
+                                key={i}
+                                className="flex-1 rounded text-[8px] flex items-center justify-center"
+                                style={{
+                                  backgroundColor: `${paneTypeColors[pane]?.bg || "var(--color-text-muted)"}20`,
+                                  color: paneTypeColors[pane]?.text || "var(--color-text-muted)",
+                                }}
+                              >
+                                {paneTypeLabels[pane as PaneType] || pane}
+                              </div>
+                            ))}
+                          </div>
                         </div>
                       );
-                    })}
-                  </div>
-                );
-              };
-
-              return (
-                <motion.button
-                  key={preset.id}
-                  whileHover={{ scale: 1.02 }}
-                  whileTap={{ scale: 0.98 }}
-                  onClick={() => {
-                    setSelectedLayout(preset.id);
-                    if (isCustom) {
-                      setIsLayoutEditorOpen(true);
                     }
-                  }}
-                  className={`relative p-3 rounded-lg border text-left transition-all
-                    ${
-                      isSelected
-                        ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/5"
-                        : "border-[var(--color-border)] hover:border-[var(--color-text-muted)] bg-[var(--color-bg-secondary)]"
-                    }`}
-                >
-                  {isSelected && (
-                    <div className="absolute top-2 right-2 w-4 h-4 rounded-full bg-[var(--color-highlight)] flex items-center justify-center">
-                      <Check className="w-2.5 h-2.5 text-white" />
-                    </div>
-                  )}
-                  {renderPreview()}
-                  <div className="text-xs font-medium text-[var(--color-text)]">{preset.name}</div>
-                  <div className="text-[10px] text-[var(--color-text-muted)]">
-                    {isCustom && customLayouts.length > 0
-                      ? `${customLayouts.length} layout${customLayouts.length > 1 ? "s" : ""} configured`
-                      : preset.description}
-                  </div>
-                </motion.button>
-              );
-            })}
-          </div>
 
-          {/* Edit Custom Layout Button */}
-          {selectedLayout === "custom" && (
-            <div className="mt-3 flex justify-end">
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => setIsLayoutEditorOpen(true)}
-              >
-                Edit Custom Layout
-              </Button>
-            </div>
-          )}
-        </Section>
+                    // Default horizontal layout
+                    return (
+                      <div className="h-10 mb-2 bg-[var(--color-bg)] rounded border border-[var(--color-border)] p-1 flex gap-0.5">
+                        {preset.panes.map((pane, i) => {
+                          const colors = paneTypeColors[pane] || paneTypeColors.shell;
+                          return (
+                            <div
+                              key={i}
+                              className="flex-1 rounded text-[8px] flex items-center justify-center"
+                              style={{ backgroundColor: `${colors.bg}20`, color: colors.text }}
+                            >
+                              {paneTypeLabels[pane as PaneType] || pane}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  };
 
-        {/* Layout Editor Dialog */}
-        <LayoutEditor
-          isOpen={isLayoutEditorOpen}
-          onClose={() => setIsLayoutEditorOpen(false)}
-          layouts={customLayouts}
-          onChange={(layouts) => {
-            setCustomLayouts(layouts);
-            setCustomLayoutsLoaded(true); // Mark as edited, so we can save
-          }}
-          selectedLayoutId={selectedCustomLayoutId}
-          onSelectLayout={setSelectedCustomLayoutId}
-        />
+                  return (
+                    <motion.button
+                      key={preset.id}
+                      whileHover={{ scale: 1.02 }}
+                      whileTap={{ scale: 0.98 }}
+                      onClick={() => {
+                        setSelectedLayout(preset.id);
+                        if (isCustom) {
+                          setIsLayoutEditorOpen(true);
+                        }
+                      }}
+                      className={`relative p-3 rounded-lg border text-left transition-all
+                        ${
+                          isSelected
+                            ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/5"
+                            : "border-[var(--color-border)] hover:border-[var(--color-text-muted)] bg-[var(--color-bg-secondary)]"
+                        }`}
+                    >
+                      {isSelected && (
+                        <div className="absolute top-2 right-2 w-4 h-4 rounded-full bg-[var(--color-highlight)] flex items-center justify-center">
+                          <Check className="w-2.5 h-2.5 text-white" />
+                        </div>
+                      )}
+                      {renderPreview()}
+                      <div className="text-xs font-medium text-[var(--color-text)]">{preset.name}</div>
+                      <div className="text-[10px] text-[var(--color-text-muted)] select-none">
+                        {isCustom && customLayouts.length > 0
+                          ? `${customLayouts.length} layout${customLayouts.length > 1 ? "s" : ""} configured`
+                          : preset.description}
+                      </div>
+                    </motion.button>
+                  );
+                })}
+              </div>
+
+              {/* Edit Custom Layout Button */}
+              {selectedLayout === "custom" && (
+                <div className="mt-3 flex justify-end">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setIsLayoutEditorOpen(true)}
+                  >
+                    Edit Custom Layout
+                  </Button>
+                </div>
+              )}
+            </Section>
+          </>
+        )}
 
         {/* Hooks Section */}
         <Section
           id="hooks"
-          title="Hooks"
-          description="Generate notification commands for agents"
+          title="Notification"
+          description="ACP Chat notification settings"
           icon={Bell}
           iconColor="var(--color-warning)"
           isOpen={openSections.hooks}
           onToggle={() => toggleSection("hooks")}
         >
           <div className="space-y-4">
-            {/* Level Selection */}
-            <div>
-              <div className="text-sm font-medium text-[var(--color-text-muted)] mb-2">Level</div>
-              <div className="flex gap-2">
-                {notificationLevels.map(({ level, icon: Icon, color, title }) => {
-                  const isSelected = hookLevel === level;
-                  return (
-                    <motion.button
-                      key={level}
-                      whileHover={{ scale: 1.02 }}
-                      whileTap={{ scale: 0.98 }}
-                      onClick={() => setHookLevel(level as "notice" | "warn" | "critical")}
-                      className={`flex-1 flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg border transition-all
-                        ${isSelected
-                          ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/10"
-                          : "border-[var(--color-border)] bg-[var(--color-bg-secondary)] hover:border-[var(--color-text-muted)]"
-                        }`}
-                    >
-                      <Icon className="w-4 h-4" style={{ color: isSelected ? color : "var(--color-text-muted)" }} />
-                      <span className={`text-sm ${isSelected ? "text-[var(--color-text)]" : "text-[var(--color-text-muted)]"}`}>
-                        {title}
-                      </span>
-                    </motion.button>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Banner & Sound Options */}
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <div className="text-sm font-medium text-[var(--color-text-muted)] mb-2">Banner</div>
-                <div className="flex gap-2">
-                  {[true, false].map((value) => {
-                    const isSelected = hookBanner === value;
-                    return (
-                      <motion.button
-                        key={value ? "on" : "off"}
-                        whileHover={{ scale: 1.02 }}
-                        whileTap={{ scale: 0.98 }}
-                        onClick={() => setHookBanner(value)}
-                        className={`flex-1 px-3 py-2 rounded-lg border text-sm transition-all
-                          ${isSelected
-                            ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/10 text-[var(--color-text)]"
-                            : "border-[var(--color-border)] bg-[var(--color-bg-secondary)] text-[var(--color-text-muted)] hover:border-[var(--color-text-muted)]"
-                          }`}
-                      >
-                        {value ? "On" : "Off"}
-                      </motion.button>
-                    );
-                  })}
+            {/* System Notifications card — sound + banner per event type */}
+            <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] p-4">
+              <div className="flex items-start justify-between gap-3 mb-3">
+                <div>
+                  <div className="text-sm font-semibold text-[var(--color-text)]">System Notifications</div>
+                  <div className="text-xs text-[var(--color-text-muted)] mt-0.5">Native OS banner and sounds for agent events</div>
                 </div>
+                <ToggleSwitch checked={systemNotifEnabled} onChange={setSystemNotifEnabled} />
               </div>
-              <div>
-                <div className="text-sm font-medium text-[var(--color-text-muted)] mb-2">Sound</div>
-                <Combobox
-                  options={soundOptions}
-                  value={hookSound}
-                  onChange={setHookSound}
-                  placeholder="Select sound..."
-                  allowCustom={false}
-                />
+              <AnimatePresence initial={false}>
+                {systemNotifEnabled ? (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: "auto" }}
+                    exit={{ opacity: 0, height: 0 }}
+                    transition={{ duration: 0.18 }}
+                    className="overflow-hidden"
+                  >
+                    <div className="mt-2 space-y-2.5 border-t border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] pt-3">
+                      {/* Permission required */}
+                      <div className="flex items-center gap-3">
+                        <span className="flex-shrink-0 inline-block w-2 h-2 rounded-full bg-[var(--color-warning)]" />
+                        <div className="flex-1 min-w-0">
+                          <div className="text-[13px] text-[var(--color-text)]">Permission required</div>
+                          <div className="text-[11px] text-[var(--color-text-muted)]">When the agent needs your approval for an action</div>
+                        </div>
+                        <AnimatePresence initial={false}>
+                          {systemNotifShowPermission && (
+                            <motion.div
+                              initial={{ opacity: 0, width: 0 }}
+                              animate={{ opacity: 1, width: "auto" }}
+                              exit={{ opacity: 0, width: 0 }}
+                              transition={{ duration: 0.15 }}
+                              className="overflow-hidden flex-shrink-0 flex items-center gap-1"
+                            >
+                              <div className="w-[140px]">
+                                <Combobox
+                                  options={soundOptions}
+                                  value={hooksPermissionSoundEnabled ? hooksPermissionSound : "none"}
+                                  onChange={(value) => {
+                                    if (value === "none") { setHooksPermissionSoundEnabled(false); return; }
+                                    setHooksPermissionSoundEnabled(true);
+                                    setHooksPermissionSound(value);
+                                  }}
+                                  placeholder="Sound..."
+                                  allowCustom={false}
+                                />
+                              </div>
+                              <button onClick={() => previewHookSound(hooksPermissionSound)} title={!hooksPermissionSoundEnabled ? "Select a sound to preview" : "Preview sound"} disabled={!hooksPermissionSoundEnabled} className="h-8 w-8 flex-shrink-0 flex items-center justify-center rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text)] disabled:opacity-40 transition-colors">
+                                <Volume2 className="w-3.5 h-3.5" />
+                              </button>
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                        <ToggleSwitch checked={systemNotifShowPermission} onChange={setSystemNotifShowPermission} />
+                      </div>
+                      {/* Turn completed */}
+                      <div className="flex items-center gap-3">
+                        <span className="flex-shrink-0 inline-block w-2 h-2 rounded-full bg-[var(--color-highlight)]" />
+                        <div className="flex-1 min-w-0">
+                          <div className="text-[13px] text-[var(--color-text)]">Turn completed</div>
+                          <div className="text-[11px] text-[var(--color-text-muted)]">When the agent finishes responding to a prompt</div>
+                        </div>
+                        <AnimatePresence initial={false}>
+                          {systemNotifShowDone && (
+                            <motion.div
+                              initial={{ opacity: 0, width: 0 }}
+                              animate={{ opacity: 1, width: "auto" }}
+                              exit={{ opacity: 0, width: 0 }}
+                              transition={{ duration: 0.15 }}
+                              className="overflow-hidden flex-shrink-0 flex items-center gap-1"
+                            >
+                              <div className="w-[140px]">
+                                <Combobox
+                                  options={soundOptions}
+                                  value={hooksResponseSoundEnabled ? hooksResponseSound : "none"}
+                                  onChange={(value) => {
+                                    if (value === "none") { setHooksResponseSoundEnabled(false); return; }
+                                    setHooksResponseSoundEnabled(true);
+                                    setHooksResponseSound(value);
+                                  }}
+                                  placeholder="Sound..."
+                                  allowCustom={false}
+                                />
+                              </div>
+                              <button onClick={() => previewHookSound(hooksResponseSound)} title={!hooksResponseSoundEnabled ? "Select a sound to preview" : "Preview sound"} disabled={!hooksResponseSoundEnabled} className="h-8 w-8 flex-shrink-0 flex items-center justify-center rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text)] disabled:opacity-40 transition-colors">
+                                <Volume2 className="w-3.5 h-3.5" />
+                              </button>
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                        <ToggleSwitch checked={systemNotifShowDone} onChange={setSystemNotifShowDone} />
+                      </div>
+                    </div>
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>
+            </div>
+
+            {/* Menu bar */}
+            <NotifChannel
+              title="Menu bar"
+              subtitle="Persistent popover anchored to the menubar icon"
+              enabled={trayEnabled}
+              onEnabledChange={setTrayEnabled}
+              showPermission={trayShowPermission}
+              onShowPermissionChange={setTrayShowPermission}
+              showDone={trayShowDone}
+              onShowDoneChange={setTrayShowDone}
+              showRunning={trayShowRunning}
+              onShowRunningChange={setTrayShowRunning}
+              extraControl={menubarShortcutControl}
+              note="Disabling the tray takes effect on next Grove launch."
+            />
+          </div>
+        </Section>
+
+        {/* Code Repo Indexing Section */}
+        <Section
+          id="indexing"
+          title="Code Repo Indexing"
+          description="Index source code so cmd+click navigates to definitions"
+          icon={Code}
+          iconColor="var(--color-info)"
+          isOpen={openSections.indexing ?? false}
+          onToggle={() => toggleSection("indexing")}
+        >
+          <div className="space-y-4">
+            <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold text-[var(--color-text)]">Enable indexing</div>
+                  <div className="text-xs text-[var(--color-text-muted)] mt-0.5">
+                    When off, cmd+click and the underline hint do nothing for newly opened tasks.
+                    Already-running tasks keep their index until grove restarts.
+                  </div>
+                </div>
+                <ToggleSwitch checked={indexingEnabled} onChange={setIndexingEnabled} />
               </div>
             </div>
 
-            {/* Message */}
-            <div>
-              <div className="text-sm font-medium text-[var(--color-text-muted)] mb-2">Message</div>
-              <input
-                type="text"
-                value={hookMessage}
-                onChange={(e) => setHookMessage(e.target.value)}
-                placeholder="e.g., Task completed..."
-                className="w-full px-3 py-2 text-sm bg-[var(--color-bg-secondary)] text-[var(--color-text)] border border-[var(--color-border)] rounded-lg focus:outline-none focus:ring-1 focus:ring-[var(--color-highlight)] placeholder:text-[var(--color-text-muted)]"
-              />
-              <p className="text-xs text-[var(--color-text-muted)] mt-1">
-                Optional message included with the notification.
-              </p>
-            </div>
+            {indexingEnabled && (
+              <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] p-4">
+                <div className="text-sm font-semibold text-[var(--color-text)] mb-1">Languages</div>
+                <div className="text-xs text-[var(--color-text-muted)] mb-3">
+                  Files with these languages are indexed during build. Removing a chip stops new
+                  scans from picking it up; existing rows in the cache are kept until the next
+                  manual reindex.
+                </div>
 
-            {/* Generated Command */}
-            <div>
-              <div className="text-sm font-medium text-[var(--color-text-muted)] mb-2">Generated Command</div>
-              <div className="flex items-center gap-2 p-3 bg-[var(--color-bg-secondary)] rounded-lg border border-[var(--color-border)]">
-                <code className="flex-1 text-sm text-[var(--color-highlight)] font-mono">{hookCommand}</code>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => handleCopy("hook-command", hookCommand)}
-                >
-                  {copiedField === "hook-command" ? (
-                    <Check className="w-4 h-4 text-[var(--color-success)]" />
-                  ) : (
-                    <Copy className="w-4 h-4" />
+                <div className="flex items-center gap-2 flex-wrap">
+                  {indexingSupportedLangs
+                    .filter((l) => !indexingDisabledLangs.includes(l.id))
+                    .map((l) => (
+                      <span
+                        key={l.id}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-[var(--color-info)]/10 text-[var(--color-info)] border border-[var(--color-info)]/30"
+                      >
+                        {/* Real per-language icon from vscode-icons (same set
+                            the file tree uses). Synthesize `index.<ext>` so
+                            getIconForFile resolves to the language icon. */}
+                        <VSCodeIcon filename={`index.${l.extensions[0] ?? l.id}`} size={14} />
+                        {l.display_name}
+                        <button
+                          onClick={() =>
+                            setIndexingDisabledLangs((prev) =>
+                              prev.includes(l.id) ? prev : [...prev, l.id],
+                            )
+                          }
+                          className="hover:bg-[var(--color-info)]/20 rounded-full w-4 h-4 flex items-center justify-center"
+                          title={`Remove ${l.display_name}`}
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </span>
+                    ))}
+
+                  {indexingSupportedLangs.some((l) => indexingDisabledLangs.includes(l.id)) && (
+                    <button
+                      ref={indexingAddBtnRef}
+                      onClick={() => setIndexingLangPickerOpen((v) => !v)}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs border border-dashed border-[var(--color-border)] text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)]"
+                    >
+                      <Plus className="w-3 h-3" />
+                      Add language
+                    </button>
                   )}
-                </Button>
+
+                  {indexingSupportedLangs.length === 0 && (
+                    <span className="text-xs text-[var(--color-text-muted)]">
+                      No supported languages reported by the server.
+                    </span>
+                  )}
+                </div>
+
+                {/* Picker portaled to body so the Section's overflow-hidden
+                    doesn't clip the dropdown when there's a section below. */}
+                {indexingLangPickerOpen && indexingPickerPos &&
+                  createPortal(
+                    <div
+                      ref={indexingPickerRef}
+                      style={{
+                        position: "fixed",
+                        top: indexingPickerPos.top,
+                        left: indexingPickerPos.left,
+                        zIndex: 9999,
+                      }}
+                      className="min-w-[160px] rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg p-1"
+                    >
+                      {indexingSupportedLangs
+                        .filter((l) => indexingDisabledLangs.includes(l.id))
+                        .map((l) => (
+                          <button
+                            key={l.id}
+                            onClick={() => {
+                              setIndexingDisabledLangs((prev) =>
+                                prev.filter((x) => x !== l.id),
+                              );
+                              setIndexingLangPickerOpen(false);
+                            }}
+                            className="w-full flex items-center gap-2 text-left px-2 py-1.5 rounded text-xs text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)]"
+                          >
+                            <VSCodeIcon filename={`index.${l.extensions[0] ?? l.id}`} size={14} />
+                            {l.display_name}
+                          </button>
+                        ))}
+                    </div>,
+                    document.body,
+                  )}
               </div>
-              <p className="text-xs text-[var(--color-text-muted)] mt-2">
-                Add this command to your agent's workflow to send notifications to Grove.
-              </p>
-            </div>
+            )}
           </div>
         </Section>
 
@@ -1145,7 +2501,7 @@ env_vars = [
           title="MCP Server"
           description="AI agent integration via MCP protocol"
           icon={Plug}
-          iconColor="#8b5cf6"
+          iconColor="#14b8a6"
           isOpen={openSections.mcp}
           onToggle={() => toggleSection("mcp")}
         >
@@ -1154,19 +2510,19 @@ env_vars = [
             <div className="p-4 bg-[var(--color-highlight)]/5 rounded-xl border border-[var(--color-highlight)]/20">
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <div className="text-xs text-[var(--color-text-muted)] mb-1">Name</div>
+                  <div className="text-xs text-[var(--color-text-muted)] mb-1 select-none">Name</div>
                   <code className="text-sm font-semibold text-[var(--color-highlight)]">{config.mcp.name}</code>
                 </div>
                 <div>
-                  <div className="text-xs text-[var(--color-text-muted)] mb-1">Type</div>
+                  <div className="text-xs text-[var(--color-text-muted)] mb-1 select-none">Type</div>
                   <code className="text-sm font-semibold text-[var(--color-text)]">{config.mcp.type}</code>
                 </div>
                 <div>
-                  <div className="text-xs text-[var(--color-text-muted)] mb-1">Command</div>
+                  <div className="text-xs text-[var(--color-text-muted)] mb-1 select-none">Command</div>
                   <code className="text-sm font-semibold text-[var(--color-text)]">{config.mcp.command}</code>
                 </div>
                 <div>
-                  <div className="text-xs text-[var(--color-text-muted)] mb-1">Args</div>
+                  <div className="text-xs text-[var(--color-text-muted)] mb-1 select-none">Args</div>
                   <code className="text-sm font-semibold text-[var(--color-text)]">{config.mcp.args.join(" ")}</code>
                 </div>
               </div>
@@ -1175,7 +2531,7 @@ env_vars = [
             {/* Claude Code Config */}
             <div>
               <div className="flex items-center justify-between mb-2">
-                <span className="text-sm font-medium text-[var(--color-text)]">Claude Code Configuration</span>
+                <span className="text-sm font-medium text-[var(--color-text)] select-none">Claude Code Configuration</span>
                 <Button
                   variant="ghost"
                   size="sm"
@@ -1191,7 +2547,7 @@ env_vars = [
               <pre className="p-3 bg-[var(--color-bg-secondary)] rounded-lg border border-[var(--color-border)] text-xs text-[var(--color-text-muted)] overflow-x-auto">
                 {claudeCodeConfig}
               </pre>
-              <p className="text-xs text-[var(--color-text-muted)] mt-2">
+              <p className="text-xs text-[var(--color-text-muted)] mt-2 select-none">
                 Add to your <code className="text-[var(--color-highlight)]">~/.claude.json</code> file.
               </p>
             </div>
@@ -1199,7 +2555,7 @@ env_vars = [
             {/* CodeX Config */}
             <div>
               <div className="flex items-center justify-between mb-2">
-                <span className="text-sm font-medium text-[var(--color-text)]">CodeX Configuration</span>
+                <span className="text-sm font-medium text-[var(--color-text)] select-none">CodeX Configuration</span>
                 <Button
                   variant="ghost"
                   size="sm"
@@ -1215,7 +2571,7 @@ env_vars = [
               <pre className="p-3 bg-[var(--color-bg-secondary)] rounded-lg border border-[var(--color-border)] text-xs text-[var(--color-text-muted)] overflow-x-auto">
                 {codexConfig}
               </pre>
-              <p className="text-xs text-[var(--color-text-muted)] mt-2">
+              <p className="text-xs text-[var(--color-text-muted)] mt-2 select-none">
                 Add to your <code className="text-[var(--color-highlight)]">~/.codex/config.toml</code> file.
               </p>
             </div>
@@ -1228,11 +2584,264 @@ env_vars = [
               className="flex items-center gap-3 p-3 rounded-lg bg-[var(--color-info)]/5 border border-[var(--color-info)]/20 hover:bg-[var(--color-info)]/10 transition-colors"
             >
               <ExternalLink className="w-4 h-4 text-[var(--color-info)]" />
-              <span className="text-sm text-[var(--color-text)]">Learn more about MCP protocol</span>
+              <span className="text-sm text-[var(--color-text)] select-none">Learn more about MCP protocol</span>
             </a>
           </div>
         </Section>
+
       </div>
+
+      {/* Custom Agent Servers Modal (existing) */}
+      <CustomAgentModal
+        isOpen={showCustomAgentModal}
+        onClose={() => setShowCustomAgentModal(false)}
+        agents={customAgents}
+        onSave={async (agents) => {
+          setCustomAgents(agents);
+          try {
+            await patchConfig({ acp: { custom_agents: agents } });
+            await refreshGlobalConfig();
+          } catch {
+            console.error("Failed to save custom agents");
+          }
+        }}
+      />
+
+      {/* Custom Agents (Persona) Modal */}
+      <CustomAgentsModal
+        isOpen={showCustomAgentsModal}
+        onClose={() => setShowCustomAgentsModal(false)}
+        agents={customAgentPersonas}
+        baseAgentOptions={chatAgentOptions}
+        customServers={customAgents}
+        loading={customAgentPersonasLoading}
+        onChanged={(next) => {
+          setCustomAgentPersonas(next);
+          setCustomAgentPersonasIconRegistry(next);
+        }}
+      />
+
+      <MarketplaceModal
+        open={showMarketplaceModal}
+        onClose={() => setShowMarketplaceModal(false)}
+      />
+
+      {installDialogOpen && (
+        <InstallExtensionDialog onClose={() => setInstallDialogOpen(false)} />
+      )}
+
+      {/* Layout Editor Dialog */}
+      <LayoutEditor
+        isOpen={isLayoutEditorOpen}
+        onClose={() => setIsLayoutEditorOpen(false)}
+        layouts={customLayouts}
+        onChange={(layouts) => {
+          setCustomLayouts(layouts);
+          setCustomLayoutsLoaded(true); // Mark as edited, so we can save
+        }}
+        selectedLayoutId={selectedCustomLayoutId}
+        onSelectLayout={setSelectedCustomLayoutId}
+      />
+
+      {/* Custom Theme Dialog — conditionally mounted so it picks up fresh
+          default state every time the user opens it (no stale name/colors
+          from a previous Cancel). */}
+      {isCustomThemeDialogOpen && (
+        <CustomThemeDialog
+          isOpen={isCustomThemeDialogOpen}
+          onClose={() => setIsCustomThemeDialogOpen(false)}
+          onSave={handleSaveCustomTheme}
+        />
+      )}
     </motion.div>
+  );
+}
+
+// ─── Notification channel sub-card ──────────────────────────────────────────
+
+// ─── Settings-style row used by Agent section hub ──────────────────────────
+
+interface HubRowProps {
+  icon: React.ReactNode;
+  iconBg: string; // CSS color string (e.g. var(--color-highlight))
+  label: string;
+  subtitle: string;
+  count?: number;
+  onClick: () => void;
+}
+
+function HubRow({ icon, iconBg, label, subtitle, count, onClick }: HubRowProps) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="group flex w-full items-center gap-3 bg-[var(--color-bg-secondary)] px-3.5 py-3 text-left transition-colors hover:bg-[var(--color-bg-tertiary)]"
+    >
+      <div
+        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md"
+        style={{ backgroundColor: `color-mix(in srgb, ${iconBg} 10%, transparent)` }}
+      >
+        {icon}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-medium text-[var(--color-text)]">{label}</span>
+          {typeof count === "number" && (
+            <span className="rounded-full bg-[var(--color-bg)] px-2 py-0.5 text-[10px] text-[var(--color-text-muted)]">
+              {count > 0 ? count : "None"}
+            </span>
+          )}
+        </div>
+        <div className="mt-0.5 text-xs text-[var(--color-text-muted)]">{subtitle}</div>
+      </div>
+      <ChevronRight className="h-4 w-4 shrink-0 text-[var(--color-text-muted)] transition-transform group-hover:translate-x-0.5" />
+    </button>
+  );
+}
+
+interface NotifChannelProps {
+  title: string;
+  subtitle: string;
+  enabled: boolean;
+  onEnabledChange: (v: boolean) => void;
+  showPermission: boolean;
+  onShowPermissionChange: (v: boolean) => void;
+  showDone: boolean;
+  onShowDoneChange: (v: boolean) => void;
+  showRunning?: boolean;
+  onShowRunningChange?: (v: boolean) => void;
+  note?: string;
+  /** Optional slot rendered inside the expanded body, below the toggles
+   *  (e.g. a shortcut recorder for the menubar channel). */
+  extraControl?: React.ReactNode;
+}
+
+function NotifChannel({
+  title,
+  subtitle,
+  enabled,
+  onEnabledChange,
+  showPermission,
+  onShowPermissionChange,
+  showDone,
+  onShowDoneChange,
+  showRunning,
+  onShowRunningChange,
+  note,
+  extraControl,
+}: NotifChannelProps) {
+  return (
+    <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] p-4">
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <div>
+          <div className="text-sm font-semibold text-[var(--color-text)]">{title}</div>
+          <div className="text-xs text-[var(--color-text-muted)] mt-0.5">{subtitle}</div>
+        </div>
+        <ToggleSwitch checked={enabled} onChange={onEnabledChange} />
+      </div>
+      <AnimatePresence initial={false}>
+        {enabled ? (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.18 }}
+            className="overflow-hidden"
+          >
+            <div className="mt-2 space-y-2.5 border-t border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] pt-3">
+              <CategoryToggle
+                label="Permission required"
+                description="Pending tool-call approvals"
+                accent="var(--color-warning)"
+                checked={showPermission}
+                onChange={onShowPermissionChange}
+              />
+              <CategoryToggle
+                label="Turn completed"
+                description="Hooks fired by finished agent turns"
+                accent="var(--color-highlight)"
+                checked={showDone}
+                onChange={onShowDoneChange}
+              />
+              {showRunning !== undefined && onShowRunningChange && (
+                <CategoryToggle
+                  label="Running session"
+                  description="Tasks actively processing a prompt"
+                  accent="var(--color-info)"
+                  checked={showRunning}
+                  onChange={onShowRunningChange}
+                />
+              )}
+            </div>
+            {extraControl ? (
+              <div className="mt-3 border-t border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] pt-3">
+                {extraControl}
+              </div>
+            ) : null}
+            {note ? (
+              <div className="mt-3 text-[11px] italic text-[var(--color-text-muted)]">{note}</div>
+            ) : null}
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function CategoryToggle({
+  label,
+  description,
+  accent,
+  checked,
+  onChange,
+}: {
+  label: string;
+  description: string;
+  accent: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 py-1">
+      <div className="flex items-center gap-2.5">
+        <span
+          className="h-1.5 w-1.5 rounded-full"
+          style={{ background: accent, boxShadow: `0 0 6px ${accent}` }}
+        />
+        <div>
+          <div className="text-[13px] text-[var(--color-text)]">{label}</div>
+          <div className="text-[11px] text-[var(--color-text-muted)]">{description}</div>
+        </div>
+      </div>
+      <ToggleSwitch checked={checked} onChange={onChange} />
+    </div>
+  );
+}
+
+function ToggleSwitch({
+  checked,
+  onChange,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      onClick={() => onChange(!checked)}
+      className="relative h-[20px] w-[34px] rounded-full border transition-all"
+      style={{
+        background: checked ? "color-mix(in srgb, var(--color-highlight) 70%, transparent)" : "var(--color-bg-tertiary)",
+        borderColor: checked ? "var(--color-highlight)" : "var(--color-border)",
+      }}
+    >
+      <motion.span
+        className="absolute top-[1px] block h-[16px] w-[16px] rounded-full"
+        animate={{ left: checked ? 15 : 1, background: checked ? "#ffffff" : "var(--color-text-muted)" }}
+        transition={{ type: "spring", stiffness: 500, damping: 30 }}
+      />
+    </button>
   );
 }

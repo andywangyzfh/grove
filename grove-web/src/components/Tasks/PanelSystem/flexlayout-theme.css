@@ -1,0 +1,237 @@
+/* Grove FlexLayout — Refined Workspace Theme
+   Design: Clean IDE aesthetic inspired by Cursor/Fleet.
+   Uses subtle depth, refined typography, and integrated controls. */
+
+/* ── Foundation ── */
+.flexlayout__layout,
+.grove-flex-flexlayout__layout {
+  --color-text: var(--grove-text);
+  --color-background: var(--grove-bg);
+  background: var(--color-bg);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+/* ── TabSet Container ── */
+.flexlayout__tabset,
+.grove-flex-flexlayout__tabset {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Tab Bar Header ── */
+.flexlayout__tabset_tabbar_outer,
+.grove-flex-flexlayout__tabset_header {
+  background: var(--color-bg);
+  border-bottom: 1px solid var(--color-border);
+  height: 38px;
+  padding: 0 4px 0 0;
+  display: flex;
+  align-items: center;
+}
+
+/* Tab Bar inner — flush edges */
+.flexlayout__tabset_tabbar_inner_tab_container,
+.flexlayout__tabset_tabbar_inner_tab_container_top {
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+  border-top: 0 !important;
+}
+
+/* ── Individual Tabs ── */
+.flexlayout__tab_button,
+.grove-flex-flexlayout__tab {
+  color: var(--color-text-muted);
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0 14px;
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 450;
+  letter-spacing: 0.01em;
+  transition: color 0.15s ease, background 0.15s ease;
+  position: relative;
+  cursor: pointer;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  border-right: 1px solid color-mix(in srgb, var(--color-border) 50%, transparent);
+}
+
+/* Hide the built-in dividers */
+.flexlayout__tabset_tab_divider {
+  width: 0 !important;
+  display: none !important;
+}
+
+.flexlayout__tab_button:hover,
+.grove-flex-flexlayout__tab:hover {
+  color: var(--color-text);
+  background: var(--color-bg-tertiary);
+}
+
+/* ── Selected Tab ── */
+.flexlayout__tab_button--selected,
+.grove-flex-flexlayout__tab--selected {
+  color: var(--color-text);
+  background: var(--color-bg-secondary);
+  font-weight: 500;
+}
+
+/* Active indicator — refined 2px bottom bar */
+.flexlayout__tab_button--selected::after,
+.grove-flex-flexlayout__tab--selected::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 8px;
+  right: 8px;
+  height: 2px;
+  background: var(--color-highlight);
+  border-radius: 2px 2px 0 0;
+}
+
+/* ── Tab Close Button ── */
+.flexlayout__tab_button_trailing,
+.grove-flex-flexlayout__tab_button {
+  color: var(--color-text-muted);
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  margin-left: 6px;
+  border-radius: 4px;
+  transition: all 0.12s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+}
+
+.flexlayout__tab_button:hover .flexlayout__tab_button_trailing,
+.flexlayout__tab_button_trailing:hover,
+.grove-flex-flexlayout__tab_button:hover {
+  color: var(--color-text);
+  background: color-mix(in srgb, var(--color-text) 10%, transparent);
+  opacity: 1;
+}
+
+.flexlayout__tab_button--selected .flexlayout__tab_button_trailing,
+.grove-flex-flexlayout__tab_button--selected {
+  color: var(--color-text-muted);
+  opacity: 0.6;
+}
+
+/* ── Tab Content Area ── */
+.flexlayout__tabset_content,
+.grove-flex-flexlayout__tabset_content {
+  background: var(--color-bg-secondary);
+  overflow: hidden;
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Splitter ── */
+.flexlayout__splitter,
+.grove-flex-flexlayout__splitter {
+  background: transparent;
+  transition: background 0.2s ease;
+}
+
+.flexlayout__splitter:hover,
+.grove-flex-flexlayout__splitter:hover {
+  background: var(--color-highlight);
+  opacity: 0.5;
+}
+
+.grove-flex-flexlayout__splitter_drag {
+  background: var(--color-highlight);
+  opacity: 0.4;
+  z-index: 1000;
+}
+
+/* ── Drag & Drop ── */
+.grove-flex-flexlayout__outline_rect {
+  border: 2px dashed var(--color-highlight);
+  background: color-mix(in srgb, var(--color-highlight) 8%, transparent);
+  border-radius: 6px;
+}
+
+.grove-flex-flexlayout__edge_rect {
+  background: color-mix(in srgb, var(--color-highlight) 15%, transparent);
+  border: 2px solid var(--color-highlight);
+  border-radius: 4px;
+}
+
+/* ── Floating Tab (drag preview) ── */
+.grove-flex-flexlayout__tab_floating {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 6px 14px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2), 0 2px 8px rgba(0, 0, 0, 0.1);
+  opacity: 0.9;
+}
+
+/* ── Popup Menu (overflow / context) ── */
+.flexlayout__popup_menu,
+.grove-flex-flexlayout__popup_menu {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18), 0 2px 8px rgba(0, 0, 0, 0.08);
+  padding: 4px;
+}
+
+.flexlayout__popup_menu_item,
+.grove-flex-flexlayout__popup_menu_item {
+  color: var(--color-text);
+  padding: 6px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 12.5px;
+  transition: background 0.12s ease;
+}
+
+.flexlayout__popup_menu_item:hover,
+.grove-flex-flexlayout__popup_menu_item:hover {
+  background: var(--color-bg-tertiary);
+}
+
+/* ── Borders (side panels) ── */
+.grove-flex-flexlayout__border {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+}
+
+.grove-flex-flexlayout__border_top,
+.grove-flex-flexlayout__border_bottom {
+  border-left: none;
+  border-right: none;
+}
+
+.grove-flex-flexlayout__border_left,
+.grove-flex-flexlayout__border_right {
+  border-top: none;
+  border-bottom: none;
+}
+
+/* ── Error State ── */
+.grove-flex-flexlayout__error_boundary_container {
+  background: var(--color-bg);
+  color: var(--color-text);
+  padding: 24px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+}
+
+.grove-flex-flexlayout__error_boundary_message {
+  color: var(--color-error);
+  font-weight: 600;
+  margin-bottom: 12px;
+}

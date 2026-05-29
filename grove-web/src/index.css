@@ -8,6 +8,8 @@
   --color-border: #27272a;
   --color-text: #fafafa;
   --color-text-muted: #71717a;
+  --grove-text: #fafafa;
+  --grove-bg: #0a0a0b;
   --color-highlight: #10b981;
   --color-accent: #06b6d4;
   --color-success: #10b981;
@@ -20,17 +22,83 @@
   box-sizing: border-box;
 }
 
+button {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+input,
+textarea,
+[contenteditable="true"] {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* Prevent iOS Safari from auto-zooming when focusing an input/textarea
+   with font-size < 16px. `max(16px, 1em)` lets larger inputs keep their
+   intentional size without squashing them down to 16px, while still
+   meeting the iOS auto-zoom threshold for everything ≤ 16px. Inputs
+   that genuinely need to stay smaller can opt out with `.compact` —
+   visual layout there is the author's problem. */
+@media (max-width: 768px) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not(.compact),
+  textarea:not(.compact),
+  select:not(.compact) {
+    font-size: max(16px, 1em);
+  }
+}
+
+html {
+  height: 100%;
+  overflow: hidden;
+}
+
 body {
   margin: 0;
+  height: 100%;
+  overflow: hidden;
   background-color: var(--color-bg);
   color: var(--color-text);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  overscroll-behavior: contain;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Non-desktop: prevent horizontal overflow */
+@media (max-width: 1199px) {
+  #root {
+    overflow-x: hidden;
+  }
+
+  /* Disable pull-to-refresh on mobile */
+  body {
+    overscroll-behavior-y: contain;
+  }
+
+  /* Better touch scrolling */
+  .overflow-y-auto,
+  .overflow-auto {
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* F1: Ensure minimum touch target size (44px) for standalone action buttons.
+     Only apply to buttons that are direct children of common action containers,
+     not to all buttons (which would bloat small icon buttons and toolbar items). */
+  button {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* F2: Ensure minimum font size on mobile (prevent text-[10px]) */
+  .text-\[10px\] {
+    font-size: 11px;
+  }
 }
 
 #root {
-  min-height: 100vh;
+  height: 100%;
+  overflow: hidden;
 }
 
 /* Scrollbar styling */
@@ -52,10 +120,62 @@ body {
   background: var(--color-text-muted);
 }
 
+/* Blitz scroll regions: hide the scrollbar thumb at rest. App.tsx sets
+   `body.grove-scrolling` for ~900ms after any scroll event, so the thumb
+   appears while scrolling and fades back to transparent when idle —
+   approximating the native macOS "scroll bars: when scrolling" behavior.
+   Scoped to .blitz-area so Zen keeps its always-visible scrollbars. */
+.blitz-area ::-webkit-scrollbar-track {
+  background: transparent;
+}
+.blitz-area ::-webkit-scrollbar-thumb {
+  background: transparent;
+  transition: background 200ms ease;
+}
+body.grove-scrolling .blitz-area ::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--color-border) 85%, transparent);
+}
+.blitz-area ::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
 /* Selection */
 ::selection {
   background: var(--color-highlight);
   color: white;
+}
+
+/* Tray popover: indeterminate progress bar sweep */
+@keyframes barSlide {
+  0% {
+    background-position: -50% 0;
+  }
+  100% {
+    background-position: 150% 0;
+  }
+}
+
+/* Tray popover: pulsing ring around the agent chip while a chat is running */
+@keyframes trayPulseRing {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-highlight) 60%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--color-highlight) 0%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-highlight) 0%, transparent);
+  }
+}
+
+/* Tray running card: indeterminate progress strip */
+@keyframes trayRunPulse {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
 }
 
 /* Aurora background animation for Blitz mode */
@@ -69,6 +189,38 @@ body {
   66% {
     transform: rotate(240deg) scale(0.95);
   }
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
+@keyframes pulse-cancel {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
+
+/* File-drop overlay animations — used by NewTaskDialog (and any future
+   drop zone that wants the same feedback as TaskChat's chatbox overlay).
+   Identical curves to task-chat.css's chatbox-drop-* keyframes so the
+   feel matches across surfaces. */
+@keyframes dropFadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes dropPop {
+  0%   { transform: translateY(4px) scale(0.96); opacity: 0; }
+  100% { transform: translateY(0)   scale(1);    opacity: 1; }
 }
 
 /* Blitz loading shimmer sweep */
@@ -100,7 +252,327 @@ body {
   }
 }
 
+@property --chatbox-busy-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@keyframes chatbox-busy-border-spin {
+  from {
+    --chatbox-busy-angle: 0deg;
+  }
+  to {
+    --chatbox-busy-angle: 360deg;
+  }
+}
+
+@keyframes overflow-title-marquee {
+  0%, 16% {
+    transform: translateX(0);
+  }
+  84%, 100% {
+    transform: translateX(var(--overflow-shift));
+  }
+}
+
+.chatbox-busy-border {
+  border-color: transparent !important;
+  position: relative;
+}
+
+.chatbox-busy-border::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  padding: 2px;
+  border-radius: inherit;
+  pointer-events: none;
+  background: conic-gradient(
+    from var(--chatbox-busy-angle),
+    color-mix(in srgb, var(--color-highlight) 16%, transparent) 0deg,
+    color-mix(in srgb, var(--color-highlight) 16%, transparent) 272deg,
+    color-mix(in srgb, var(--color-highlight) 24%, transparent) 306deg,
+    color-mix(in srgb, var(--color-highlight) 48%, white 4%) 328deg,
+    color-mix(in srgb, var(--color-highlight) 92%, white 8%) 342deg,
+    color-mix(in srgb, var(--color-highlight) 46%, white 4%) 354deg,
+    color-mix(in srgb, var(--color-highlight) 16%, transparent) 360deg
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: chatbox-busy-border-spin 4.8s linear infinite;
+}
+
+.overflow-title-animate {
+  animation: overflow-title-marquee 4.8s ease-in-out infinite;
+  will-change: transform;
+}
+
+/* Graph node "busy" pulse — surrounds a busy agent's avatar with an
+ * expanding-fading ring so users can spot in-flight work at a glance. */
+@keyframes graph-node-busy-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  100% {
+    transform: scale(1.45);
+    opacity: 0;
+  }
+}
+.graph-node-busy-pulse {
+  transform-origin: center;
+  transform-box: fill-box;
+  animation: graph-node-busy-pulse 1.4s ease-out infinite;
+}
+
+/* Edge "in-flight" marching ants — message is mid-delivery (target busy
+ * processing it), so the dashes flow along the line in the arrow direction. */
+@keyframes graph-edge-march {
+  to {
+    stroke-dashoffset: -16;
+  }
+}
+.graph-edge-in-flight {
+  animation: graph-edge-march 1.2s linear infinite;
+}
+
 /* Blitz mode: Show shortcuts when Command key is pressed */
 body.blitz-command-pressed .blitz-shortcut {
   opacity: 1 !important;
+}
+
+/* Skip layout/paint for code blocks outside the viewport.
+ * DOM nodes are preserved (per-line divs are needed for preview-comment
+ * anchoring), but the browser defers their rendering work until they
+ * scroll into view. `contain-intrinsic-size` reserves a placeholder
+ * height so the scrollbar doesn't jump as blocks materialize. */
+.markdown-code-block {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 600px;
+}
+
+.markdown-code-block .hljs-keyword,
+.markdown-code-block .hljs-selector-tag {
+  color: #c678dd;
+}
+
+.markdown-code-block .hljs-literal,
+.markdown-code-block .hljs-type {
+  color: #d19a66;
+}
+
+.markdown-code-block .hljs-string,
+.markdown-code-block .hljs-template-tag,
+.markdown-code-block .hljs-template-variable {
+  color: #98c379;
+}
+
+.markdown-code-block .hljs-number {
+  color: #d19a66;
+}
+
+.markdown-code-block .hljs-comment,
+.markdown-code-block .hljs-doctag {
+  color: #7f848e;
+  font-style: italic;
+}
+
+.markdown-code-block .hljs-title,
+.markdown-code-block .hljs-title\.function,
+.markdown-code-block .hljs-title\.class {
+  color: #61afef;
+}
+
+.markdown-code-block .hljs-variable,
+.markdown-code-block .hljs-params {
+  color: #e06c75;
+}
+
+.markdown-code-block .hljs-attr,
+.markdown-code-block .hljs-attribute {
+  color: #d19a66;
+}
+
+.markdown-code-block .hljs-built_in {
+  color: #e6c07b;
+}
+
+.markdown-code-block .hljs-symbol,
+.markdown-code-block .hljs-bullet,
+.markdown-code-block .hljs-regexp,
+.markdown-code-block .hljs-link {
+  color: #56b6c2;
+}
+
+.markdown-code-block .hljs-meta,
+.markdown-code-block .hljs-meta .hljs-keyword,
+.markdown-code-block .hljs-name,
+.markdown-code-block .hljs-tag,
+.markdown-code-block .hljs-property {
+  color: #e06c75;
+}
+
+.markdown-code-block .hljs-section {
+  color: #61afef;
+  font-weight: 600;
+}
+
+.markdown-code-block .hljs-link {
+  text-decoration: underline;
+}
+
+.markdown-code-block .hljs-emphasis {
+  font-style: italic;
+}
+
+.markdown-code-block .hljs-strong {
+  font-weight: 700;
+}
+
+.markdown-code-block .hljs-addition {
+  color: var(--color-success);
+}
+
+.markdown-code-block .hljs-deletion {
+  color: var(--color-error);
+}
+
+.markdown-code-block .hljs-selector-class,
+.markdown-code-block .hljs-selector-id,
+.markdown-code-block .hljs-selector-pseudo,
+.markdown-code-block .hljs-selector-attr {
+  color: #c678dd;
+}
+
+.markdown-code-block .hljs-punctuation {
+  color: var(--color-text-muted);
+}
+
+/* xterm.js visual cleanup:
+   1. .xterm-viewport has `overflow-y: scroll` + `background-color: #000` by
+      default, which on Mac reserves scrollbar track space that shows as a
+      thin black vertical stripe at the right edge. Hide the native scrollbar
+      and clear the black bg.
+   2. .xterm-scrollable-element draws its own custom scroll shadows (.shadow)
+      and scrollbar overlay (.scrollbar) — remove them too. */
+.xterm .xterm-viewport {
+  background-color: transparent !important;
+  scrollbar-width: none;
+}
+.xterm .xterm-viewport::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+.xterm .xterm-scrollable-element > .shadow,
+.xterm .xterm-scrollable-element > .scrollbar {
+  display: none !important;
+  box-shadow: none !important;
+}
+
+/* Preview search fallback for browsers without the CSS Custom Highlight API. */
+mark[data-grove-search-mark] {
+  background-color: color-mix(in srgb, var(--color-warning) 55%, transparent);
+  color: inherit;
+  border-radius: 2px;
+}
+mark[data-grove-search-mark][data-grove-search-mark-current="true"] {
+  background-color: color-mix(in srgb, var(--color-warning) 90%, transparent);
+  color: #1a1a1a;
+}
+
+/* Symbol-jump hint: ⌘+hover paints this on the word under the cursor.
+   Styled like an <a> tag — link blue + underline — to signal "this is
+   clickable". The click handler is what actually queries the index. */
+.grove-symbol-link {
+  color: var(--color-info);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Liquid Glass material system — TEMPERED GLASS PANELS, not windows.
+
+   Each class simulates the look of a solid tempered-glass plate floating
+   above the page:
+   - Solid base (95-98% opacity) — content behind is hinted, never legible
+   - Subtle vertical gradient — light falls from above, gives "thickness"
+   - Specular top-edge highlight (inset white) — the glass catching light
+   - Crisp 1px inset border — the glass plate's own edge
+   - Multi-layer soft drop shadow — the plate lifted off the surface
+   - NO backdrop-filter — the material is the surface, not the see-through
+
+   The caller still picks border-radius (sheet can be rounded-top-only,
+   panel can be 2xl, etc) since the radius is a per-component decision.
+
+   DO NOT apply to content surfaces: Monaco editor, xterm, diff viewer,
+   Excalidraw canvas, long-form markdown — the gradient + shadow add
+   visual weight that competes with reading.
+   ────────────────────────────────────────────────────────────────────────── */
+
+/* .glass-panel — sidebar, fixed side panels. Most prominent material. */
+.glass-panel {
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--color-bg) 95%, var(--color-text) 5%) 0%,
+    var(--color-bg) 100%
+  );
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    inset 0 0 0 1px color-mix(in oklab, var(--color-border) 60%, transparent),
+    0 1px 3px rgba(0, 0, 0, 0.04),
+    0 8px 24px rgba(0, 0, 0, 0.08),
+    0 24px 56px rgba(0, 0, 0, 0.06);
+}
+
+/* .glass-overlay — dialogs / bottom sheets. Strongest lift, top stack. */
+.glass-overlay {
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--color-bg) 96%, var(--color-text) 4%) 0%,
+    var(--color-bg) 100%
+  );
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.25),
+    inset 0 0 0 1px color-mix(in oklab, var(--color-border) 70%, transparent),
+    0 4px 12px rgba(0, 0, 0, 0.10),
+    0 16px 40px rgba(0, 0, 0, 0.14),
+    0 40px 80px rgba(0, 0, 0, 0.10);
+}
+
+/* .glass-popover — context menus, dropdown popovers. Medium lift. */
+.glass-popover {
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--color-bg) 96%, var(--color-text) 4%) 0%,
+    var(--color-bg) 100%
+  );
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.20),
+    inset 0 0 0 1px color-mix(in oklab, var(--color-border) 65%, transparent),
+    0 2px 6px rgba(0, 0, 0, 0.06),
+    0 8px 20px rgba(0, 0, 0, 0.10),
+    0 20px 40px rgba(0, 0, 0, 0.06);
+}
+
+/* .glass-control — segmented controls, inline button strips. Minimal lift. */
+.glass-control {
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--color-bg) 97%, var(--color-text) 3%) 0%,
+    var(--color-bg) 100%
+  );
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.15),
+    inset 0 0 0 1px color-mix(in oklab, var(--color-border) 50%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.04),
+    0 4px 12px rgba(0, 0, 0, 0.06);
 }

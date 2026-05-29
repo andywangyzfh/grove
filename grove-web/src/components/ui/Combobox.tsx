@@ -17,12 +17,14 @@ interface ComboboxProps {
   allowCustom?: boolean;
   customPlaceholder?: string;
   label?: string;
+  disabled?: boolean;
 }
 
 interface DropdownPosition {
   top: number;
   left: number;
   width: number;
+  maxHeight: number;
 }
 
 export function Combobox({
@@ -33,10 +35,12 @@ export function Combobox({
   allowCustom = true,
   customPlaceholder = "Enter custom value...",
   label,
+  disabled = false,
 }: ComboboxProps) {
   const [isOpen, setIsOpen] = useState(false);
-  const [isCustomMode, setIsCustomMode] = useState(false);
-  const [customValue, setCustomValue] = useState("");
+  // Initialize custom mode from initial props (lazy state initializer)
+  const [isCustomMode, setIsCustomMode] = useState(() => !!(value && !options.find((opt) => opt.value === value)));
+  const [customValue, setCustomValue] = useState(() => (value && !options.find((opt) => opt.value === value)) ? value : "");
   const [dropdownPosition, setDropdownPosition] = useState<DropdownPosition | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -47,22 +51,26 @@ export function Combobox({
   const selectedOption = options.find((opt) => opt.value === value);
   const isCustomValue = value && !selectedOption;
 
-  // Initialize custom value if current value is custom
-  useEffect(() => {
-    if (isCustomValue) {
-      setCustomValue(value);
-      setIsCustomMode(true);
-    }
-  }, []);
-
-  // Calculate dropdown position
+  // Calculate dropdown position (fixed positioning, viewport-relative)
   const updateDropdownPosition = useCallback(() => {
     if (triggerRef.current) {
       const rect = triggerRef.current.getBoundingClientRect();
+      const gap = 4;
+      const viewportPadding = 8;
+      const preferredMaxHeight = 240;
+      const availableBelow = window.innerHeight - rect.bottom - gap - viewportPadding;
+      const availableAbove = rect.top - gap - viewportPadding;
+      const opensUp = availableBelow < preferredMaxHeight && availableAbove > availableBelow;
+      const maxHeight = Math.max(
+        96,
+        Math.min(preferredMaxHeight, opensUp ? availableAbove : availableBelow)
+      );
+
       setDropdownPosition({
-        top: rect.bottom + window.scrollY + 4,
-        left: rect.left + window.scrollX,
+        top: opensUp ? rect.top - gap - maxHeight : rect.bottom + gap,
+        left: rect.left,
         width: rect.width,
+        maxHeight,
       });
     }
   }, []);
@@ -106,6 +114,7 @@ export function Combobox({
   }, [isCustomMode]);
 
   const handleSelect = (option: ComboboxOption) => {
+    if (disabled) return;
     if (option.id === "custom") {
       setIsCustomMode(true);
       setCustomValue("");
@@ -154,13 +163,14 @@ export function Combobox({
           exit={{ opacity: 0, y: -10 }}
           transition={{ duration: 0.15 }}
           style={{
-            position: "absolute",
+            position: "fixed",
             top: dropdownPosition.top,
             left: dropdownPosition.left,
             width: dropdownPosition.width,
+            maxHeight: dropdownPosition.maxHeight,
             zIndex: 9999,
           }}
-          className="py-1 bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg shadow-lg"
+          className="py-1 bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg shadow-lg overflow-y-auto"
         >
           {allOptions.map((option) => (
             <button
@@ -204,12 +214,14 @@ export function Combobox({
               onKeyDown={handleCustomKeyDown}
               onBlur={handleCustomSubmit}
               placeholder={customPlaceholder}
+              disabled={disabled}
               className="flex-1 px-3 py-2 bg-[var(--color-bg-secondary)] border border-[var(--color-highlight)] rounded-lg
                 text-[var(--color-text)] placeholder-[var(--color-text-muted)] text-sm
                 focus:outline-none focus:ring-1 focus:ring-[var(--color-highlight)]
                 transition-all duration-200"
             />
             <button
+              disabled={disabled}
               onClick={() => {
                 setIsCustomMode(false);
                 setIsOpen(true);
@@ -224,9 +236,11 @@ export function Combobox({
         ) : (
           <button
             ref={triggerRef}
-            onClick={() => setIsOpen(!isOpen)}
+            onClick={() => !disabled && setIsOpen(!isOpen)}
+            disabled={disabled}
             className={`w-full flex items-center justify-between px-3 py-2 bg-[var(--color-bg-secondary)] border rounded-lg
               text-sm transition-all duration-200
+              ${disabled ? "cursor-not-allowed border-[var(--color-border)] bg-[var(--color-bg-secondary)]/60 opacity-60" : ""}
               ${isOpen
                 ? "border-[var(--color-highlight)] ring-1 ring-[var(--color-highlight)]"
                 : "border-[var(--color-border)] hover:border-[var(--color-text-muted)]"

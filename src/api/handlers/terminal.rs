@@ -16,10 +16,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::api::state;
-use crate::session;
-use crate::storage::{config, config::Multiplexer, tasks, workspace};
-use crate::tmux;
-use crate::tmux::layout::{parse_custom_layout_tree, CustomLayout, TaskLayout};
+use crate::operations::tasks::create_task_session;
+use crate::session::SessionType;
+use crate::storage::{config, tasks, workspace};
 
 #[derive(Debug, Deserialize)]
 pub struct TerminalQuery {
@@ -68,38 +67,38 @@ pub async fn task_terminal_handler(
         .map_err(|e| TaskTerminalError::Internal(format!("Failed to get task: {}", e)))?
         .ok_or(TaskTerminalError::NotFound("Task not found".to_string()))?;
 
-    // 3. Resolve multiplexer and build session name
-    let global_mux = config::load_config().multiplexer;
-    let task_mux = session::resolve_multiplexer(&task.multiplexer, &global_mux);
-    let session_name = session::resolve_session_name(&task.session_name, &project_key, &task_id);
-
-    // 4. Ensure session exists (create if needed)
-    let session_created = !session::session_exists(&task_mux, &session_name);
-    let mut zellij_layout_path: Option<String> = None;
-    if session_created {
-        zellij_layout_path = ensure_task_session(&project, &project_key, &task, &task_mux)?;
-
-        // Register FileWatcher for this task's worktree
-        state::watch_task(&project_key, &task.id, &task.worktree_path);
-    }
-
+    // 3. Check web terminal mode
+    let cfg = config::load_config();
+    let web_terminal_mode = cfg.web.terminal_mode.as_deref().unwrap_or("multiplexer");
     let working_dir = task.worktree_path.clone();
 
-    // 5. Upgrade to WebSocket and handle mux terminal
-    Ok(ws.on_upgrade(move |socket| {
-        handle_mux_terminal(
-            socket,
-            MuxTerminalParams {
-                session_name,
-                mux: task_mux,
-                new_session: session_created,
-                working_dir,
-                zellij_layout_path,
-                cols,
-                rows,
-            },
-        )
-    }))
+    if web_terminal_mode == "direct" {
+        // Direct mode: spawn a plain shell in the task's worktree (no multiplexer)
+        state::ensure_task_active(&project_key, &task.id, &task.worktree_path);
+
+        Ok(ws.on_upgrade(move |socket| handle_shell_terminal(socket, working_dir, cols, rows)))
+    } else {
+        // Multiplexer mode: use shared create_task_session
+        let session_info = create_task_session(&project_key, &task, &project.path)
+            .map_err(|e| TaskTerminalError::Internal(format!("Session error: {}", e)))?;
+
+        state::ensure_task_active(&project_key, &task.id, &task.worktree_path);
+
+        Ok(ws.on_upgrade(move |socket| {
+            handle_mux_terminal(
+                socket,
+                MuxTerminalParams {
+                    session_name: session_info.session_name,
+                    mux: session_info.session_type,
+                    new_session: session_info.is_new,
+                    working_dir,
+                    zellij_layout_path: session_info.layout_path,
+                    cols,
+                    rows,
+                },
+            )
+        }))
+    }
 }
 
 /// Error type for task terminal handler
@@ -119,93 +118,87 @@ impl IntoResponse for TaskTerminalError {
     }
 }
 
-/// Ensure the task's session exists, creating it if needed.
-/// Returns the Zellij layout path if one was generated (for use at attach time).
-fn ensure_task_session(
-    project: &workspace::RegisteredProject,
-    project_key: &str,
-    task: &tasks::Task,
-    mux: &Multiplexer,
-) -> Result<Option<String>, TaskTerminalError> {
-    let session_name = session::resolve_session_name(&task.session_name, project_key, &task.id);
+/// Pick the default shell for the current platform.
+///
+/// Priority:
+/// 1. `GROVE_SHELL` env var (explicit override, e.g. `wsl.exe`, `pwsh`, `git-bash`)
+/// 2. `SHELL` env var (standard on Unix; may be set on Windows with Git Bash/WSL)
+/// 3. Platform default: `powershell.exe` on Windows, `/bin/bash` elsewhere
+///
+/// Returns (shell_path, initial_args) — Windows PowerShell gets UTF-8
+/// init args so CJK output doesn't garble.
+fn pick_default_shell() -> (String, Vec<String>) {
+    if let Ok(shell) = std::env::var("GROVE_SHELL") {
+        return (shell, vec![]);
+    }
+    if let Ok(shell) = std::env::var("SHELL") {
+        return (shell, vec![]);
+    }
 
-    // Build session environment
-    let project_name = std::path::Path::new(&project.path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
+    #[cfg(windows)]
+    {
+        (
+            "powershell.exe".to_string(),
+            vec![
+                "-NoLogo".to_string(),
+                "-NoExit".to_string(),
+                "-Command".to_string(),
+                "chcp 65001 > $null; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); $OutputEncoding = [System.Text.UTF8Encoding]::new()".to_string(),
+            ],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        ("/bin/bash".to_string(), vec![])
+    }
+}
 
-    let session_env = tmux::SessionEnv {
-        task_id: task.id.clone(),
-        task_name: task.name.clone(),
-        branch: task.branch.clone(),
-        target: task.target.clone(),
-        worktree: task.worktree_path.clone(),
-        project_name: project_name.to_string(),
-        project_path: project.path.clone(),
-    };
-
-    // Create session
-    session::create_session(mux, &session_name, &task.worktree_path, Some(&session_env))
-        .map_err(|e| TaskTerminalError::Internal(format!("Failed to create session: {}", e)))?;
-
-    // Load config and apply layout
-    let cfg = config::load_config();
-    let layout = TaskLayout::from_name(&cfg.layout.default).unwrap_or(TaskLayout::Single);
-    let agent_cmd = cfg.layout.agent_command.clone().unwrap_or_default();
-
-    // Parse custom layout if needed
-    let custom_layout = if layout == TaskLayout::Custom {
-        cfg.layout.custom.as_ref().and_then(|c| {
-            parse_custom_layout_tree(&c.tree, cfg.layout.selected_custom_id.as_deref())
-                .map(|root| CustomLayout { root })
-        })
-    } else {
-        None
-    };
-
-    // Apply layout
-    let mut layout_path: Option<String> = None;
-    match mux {
-        Multiplexer::Tmux => {
-            if layout != TaskLayout::Single {
-                if let Err(e) = tmux::layout::apply_layout(
-                    &session_name,
-                    &task.worktree_path,
-                    &layout,
-                    &agent_cmd,
-                    custom_layout.as_ref(),
-                ) {
-                    eprintln!("Warning: Failed to apply layout: {}", e);
-                }
-            }
-        }
-        Multiplexer::Zellij => {
-            // Zellij: 始终生成 KDL layout 以通过 pane 命令注入环境变量
-            let kdl = crate::zellij::layout::generate_kdl(
-                &layout,
-                &agent_cmd,
-                custom_layout.as_ref(),
-                &session_env.shell_export_prefix(),
-            );
-            match crate::zellij::layout::write_session_layout(&session_name, &kdl) {
-                Ok(path) => layout_path = Some(path),
-                Err(e) => eprintln!("Warning: Failed to write zellij layout: {}", e),
-            }
+/// Ensure the PTY child has a sane base environment.
+///
+/// When Grove is launched from Finder / Launchpad (packaged `.app` / DMG),
+/// the parent process inherits only a minimal env, so `LANG`, `LC_*`, `TERM`
+/// and `PATH` are all missing. Without `TERM` zsh's ZLE cannot redraw the
+/// prompt — each keystroke gets re-echoed cumulatively (`ls` → `lslssllss…`)
+/// — and without a UTF-8 locale zsh prints multibyte bytes as `\M-^…`.
+///
+/// We set safe defaults only when the variable is absent, so users who do
+/// have a terminal-inherited env keep their own values.
+pub(crate) fn apply_terminal_env_defaults(cmd: &mut CommandBuilder) {
+    let defaults: &[(&str, &str)] = &[
+        ("TERM", "xterm-256color"),
+        ("LANG", "en_US.UTF-8"),
+        ("LC_ALL", "en_US.UTF-8"),
+        ("LC_CTYPE", "en_US.UTF-8"),
+        ("COLORTERM", "truecolor"),
+    ];
+    for (k, v) in defaults {
+        if std::env::var_os(k).is_none() {
+            cmd.env(k, v);
         }
     }
 
-    Ok(layout_path)
+    // PATH can also be empty under a Finder launch — fall back to the
+    // standard macOS/Linux default so `ls`, `git`, etc. resolve. We put
+    // `/opt/homebrew/bin` first so Apple-Silicon Homebrew installs
+    // (`brew`, `node`, `gh`, ...) are reachable.
+    if std::env::var_os("PATH").is_none() {
+        cmd.env(
+            "PATH",
+            "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        );
+    }
 }
 
 /// Handle the WebSocket connection for a simple shell terminal
 async fn handle_shell_terminal(socket: WebSocket, cwd: String, cols: u16, rows: u16) {
-    // Get the user's default shell
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let (shell, args) = pick_default_shell();
 
-    // Create command
     let mut cmd = CommandBuilder::new(&shell);
+    for arg in &args {
+        cmd.arg(arg);
+    }
     cmd.cwd(&cwd);
+    apply_terminal_env_defaults(&mut cmd);
 
     handle_pty_terminal(socket, cmd, cols, rows).await;
 }
@@ -213,7 +206,7 @@ async fn handle_shell_terminal(socket: WebSocket, cwd: String, cols: u16, rows: 
 /// Parameters for multiplexer terminal connection
 struct MuxTerminalParams {
     session_name: String,
-    mux: Multiplexer,
+    mux: SessionType,
     new_session: bool,
     working_dir: String,
     zellij_layout_path: Option<String>,
@@ -233,19 +226,21 @@ async fn handle_mux_terminal(socket: WebSocket, params: MuxTerminalParams) {
         rows,
     } = params;
     match mux {
-        Multiplexer::Tmux => {
+        SessionType::Tmux => {
             let mut cmd = CommandBuilder::new("tmux");
             cmd.arg("attach-session");
             cmd.arg("-t");
             cmd.arg(&session_name);
+            apply_terminal_env_defaults(&mut cmd);
             handle_pty_terminal(socket, cmd, cols, rows).await;
         }
-        Multiplexer::Zellij => {
+        SessionType::Zellij => {
             let mut cmd = CommandBuilder::new("zellij");
             // Remove ZELLIJ env vars to prevent nested session issues
             cmd.env_remove("ZELLIJ");
             cmd.env_remove("ZELLIJ_SESSION_NAME");
             cmd.cwd(&working_dir);
+            apply_terminal_env_defaults(&mut cmd);
 
             if new_session {
                 // New session: use `zellij -s <name>` (mirrors TUI attach_session logic)
@@ -268,11 +263,19 @@ async fn handle_mux_terminal(socket: WebSocket, params: MuxTerminalParams) {
 
             handle_pty_terminal(socket, cmd, cols, rows).await;
         }
+        SessionType::Acp => {
+            eprintln!("Warning: ACP task reached terminal handler — this should not happen");
+        }
     }
 }
 
 /// Common PTY terminal handler
-async fn handle_pty_terminal(socket: WebSocket, cmd: CommandBuilder, cols: u16, rows: u16) {
+pub(crate) async fn handle_pty_terminal(
+    socket: WebSocket,
+    cmd: CommandBuilder,
+    cols: u16,
+    rows: u16,
+) {
     // Create PTY in blocking context
     let pty_result = tokio::task::spawn_blocking(move || {
         let pty_system = native_pty_system();
@@ -323,11 +326,11 @@ async fn handle_pty_terminal(socket: WebSocket, cmd: CommandBuilder, cols: u16, 
 
     // Task: Read from PTY (blocking) and send to channel
     let reader_clone = reader.clone();
-    let pty_reader_task = tokio::task::spawn_blocking(move || {
+    let mut pty_reader_task = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 4096];
         loop {
             let n = {
-                let mut reader = reader_clone.lock().unwrap();
+                let mut reader = reader_clone.lock().expect("PTY reader mutex poisoned");
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF
                     Ok(n) => n,
@@ -346,7 +349,7 @@ async fn handle_pty_terminal(socket: WebSocket, cmd: CommandBuilder, cols: u16, 
     });
 
     // Task: Send PTY output to WebSocket
-    let pty_to_ws = tokio::spawn(async move {
+    let mut pty_to_ws = tokio::spawn(async move {
         while let Some(data) = pty_rx.recv().await {
             if ws_sender.send(Message::Text(data.into())).await.is_err() {
                 break;
@@ -357,12 +360,12 @@ async fn handle_pty_terminal(socket: WebSocket, cmd: CommandBuilder, cols: u16, 
     // Task: Write to PTY (blocking)
     let writer_clone = writer.clone();
     let master_clone = master.clone();
-    let pty_writer_task = tokio::task::spawn_blocking(move || {
+    let mut pty_writer_task = tokio::task::spawn_blocking(move || {
         while let Some(data) = ws_rx.blocking_recv() {
             // Check for resize message (JSON format)
             if let Ok(resize) = serde_json::from_slice::<ResizeMessage>(&data) {
                 if resize.msg_type == "resize" {
-                    let master = master_clone.lock().unwrap();
+                    let master = master_clone.lock().expect("PTY master mutex poisoned");
                     let _ = master.resize(PtySize {
                         rows: resize.rows,
                         cols: resize.cols,
@@ -373,7 +376,7 @@ async fn handle_pty_terminal(socket: WebSocket, cmd: CommandBuilder, cols: u16, 
                 }
             }
 
-            let mut writer = writer_clone.lock().unwrap();
+            let mut writer = writer_clone.lock().expect("PTY writer mutex poisoned");
             if writer.write_all(&data).is_err() {
                 break;
             }
@@ -382,19 +385,16 @@ async fn handle_pty_terminal(socket: WebSocket, cmd: CommandBuilder, cols: u16, 
     });
 
     // Task: Read from WebSocket and send to channel
-    let ws_to_pty = tokio::spawn(async move {
+    let mut ws_to_pty = tokio::spawn(async move {
         while let Some(msg) = ws_receiver.next().await {
             match msg {
-                Ok(Message::Text(text)) => {
-                    if ws_tx.send(text.as_bytes().to_vec()).await.is_err() {
-                        break;
-                    }
+                Ok(Message::Text(text)) if ws_tx.send(text.as_bytes().to_vec()).await.is_err() => {
+                    break;
                 }
-                Ok(Message::Binary(data)) => {
-                    if ws_tx.send(data.to_vec()).await.is_err() {
-                        break;
-                    }
+                Ok(Message::Binary(data)) if ws_tx.send(data.to_vec()).await.is_err() => {
+                    break;
                 }
+                Ok(Message::Text(_) | Message::Binary(_)) => {}
                 Ok(Message::Close(_)) => break,
                 Err(_) => break,
                 _ => {}
@@ -402,13 +402,27 @@ async fn handle_pty_terminal(socket: WebSocket, cmd: CommandBuilder, cols: u16, 
         }
     });
 
-    // Wait for any task to complete
+    // Wait for any task to complete, detect panics
     tokio::select! {
-        _ = pty_reader_task => {},
-        _ = pty_to_ws => {},
-        _ = pty_writer_task => {},
-        _ = ws_to_pty => {},
+        result = &mut pty_reader_task => {
+            if let Err(ref e) = result { if e.is_panic() { eprintln!("[Grove] PTY reader task panicked"); } }
+        },
+        result = &mut pty_to_ws => {
+            if let Err(ref e) = result { if e.is_panic() { eprintln!("[Grove] PTY-to-WS task panicked"); } }
+        },
+        result = &mut pty_writer_task => {
+            if let Err(ref e) = result { if e.is_panic() { eprintln!("[Grove] PTY writer task panicked"); } }
+        },
+        result = &mut ws_to_pty => {
+            if let Err(ref e) = result { if e.is_panic() { eprintln!("[Grove] WS-to-PTY task panicked"); } }
+        },
     }
+
+    // One side finished; tear down the rest so the WebSocket actually closes
+    // instead of lingering with detached background tasks.
+    pty_to_ws.abort();
+    ws_to_pty.abort();
+    pty_writer_task.abort();
 
     // Cleanup: kill the child process
     // Note: For tmux attach, killing this process just detaches from the session

@@ -1,6 +1,9 @@
 import { useState, useRef, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import type { DiffFile } from '../../api/review';
-import { FolderOpen, Folder, Search, MessageSquare, FilePlus, FolderPlus } from 'lucide-react';
+import type { DirEntry } from '../../api/tasks';
+import { FolderOpen, Folder, Search, MessageSquare, FilePlus, FolderPlus, Copy, FileText } from 'lucide-react';
+import { VSCodeIcon } from '../ui';
 
 interface FileCommentCount {
   total: number;
@@ -18,6 +21,10 @@ interface FileTreeSidebarProps {
   getFileViewedStatus?: (path: string) => 'none' | 'viewed' | 'updated';
   onCreateVirtualPath?: (path: string) => void;
   viewMode?: 'diff' | 'full';
+  onExpandDir?: (dirPath: string) => Promise<DirEntry[]>;
+  onLoadFileDiff?: (filePath: string, fromRef?: string, toRef?: string) => Promise<void>;
+  /** Absolute worktree path — used to compute "Copy Full Path" */
+  taskPath?: string | null;
 }
 
 interface DirNode {
@@ -47,6 +54,9 @@ export function FileTreeSidebar({
   getFileViewedStatus,
   onCreateVirtualPath,
   viewMode = 'diff',
+  onExpandDir,
+  onLoadFileDiff,
+  taskPath,
 }: FileTreeSidebarProps) {
   // Context menu state
   const [contextMenu, setContextMenu] = useState<{
@@ -77,9 +87,6 @@ export function FileTreeSidebar({
   };
 
   const handleContextMenu = (e: React.MouseEvent, path: string, isDirectory: boolean) => {
-    // Only show context menu in All Files Mode
-    if (viewMode !== 'full') return;
-
     e.preventDefault();
     e.stopPropagation();
     setContextMenu({
@@ -88,6 +95,30 @@ export function FileTreeSidebar({
       targetPath: path,
       isDirectory,
     });
+  };
+
+  const copyToClipboard = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (err) {
+      console.error('Copy failed:', err);
+    }
+  };
+
+  const handleCopyRelativePath = () => {
+    if (!contextMenu) return;
+    void copyToClipboard(contextMenu.targetPath);
+    setContextMenu(null);
+  };
+
+  const handleCopyFullPath = () => {
+    if (!contextMenu) return;
+    const rel = contextMenu.targetPath;
+    const full = taskPath
+      ? `${taskPath.replace(/\/$/, '')}/${rel}`
+      : rel;
+    void copyToClipboard(full);
+    setContextMenu(null);
   };
 
   const handleCreateVirtual = (type: 'file' | 'directory') => {
@@ -156,27 +187,49 @@ export function FileTreeSidebar({
             onSubmitVirtualPath={handleSubmitVirtualPath}
             onCancelVirtualPath={handleCancelVirtualPath}
             virtualInputRef={virtualInputRef}
+            viewMode={viewMode}
+            onExpandDir={onExpandDir}
+            onLoadFileDiff={onLoadFileDiff}
           />
         ))}
       </div>
 
-      {/* Context Menu */}
-      {contextMenu && (
-        <div
-          className="file-tree-context-menu"
-          style={{
-            position: 'fixed',
-            left: contextMenu.x,
-            top: contextMenu.y,
-            zIndex: 9999,
-          }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <button onClick={() => handleCreateVirtual('file')}>
-            <FilePlus style={{ width: 14, height: 14 }} />
-            Create Virtual File
-          </button>
-        </div>
+      {/* Context Menu (portaled to body to escape transformed ancestors) */}
+      {contextMenu && createPortal(
+        <>
+          <div
+            className="file-tree-context-menu-backdrop"
+            onClick={handleCloseContextMenu}
+            onContextMenu={(e) => { e.preventDefault(); handleCloseContextMenu(); }}
+          />
+          <div
+            className="file-tree-context-menu"
+            style={{
+              left: contextMenu.x,
+              top: contextMenu.y,
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button onClick={handleCopyRelativePath}>
+              <Copy style={{ width: 14, height: 14 }} />
+              Copy Relative Path
+            </button>
+            <button onClick={handleCopyFullPath} disabled={!taskPath}>
+              <FileText style={{ width: 14, height: 14 }} />
+              Copy Full Path
+            </button>
+            {viewMode === 'full' && onCreateVirtualPath && (
+              <>
+                <div className="file-tree-context-menu-separator" />
+                <button onClick={() => handleCreateVirtual('file')}>
+                  <FilePlus style={{ width: 14, height: 14 }} />
+                  Create Virtual File
+                </button>
+              </>
+            )}
+          </div>
+        </>,
+        document.body,
       )}
     </div>
   );
@@ -236,6 +289,9 @@ function TreeNode({
   onSubmitVirtualPath,
   onCancelVirtualPath,
   virtualInputRef,
+  viewMode,
+  onExpandDir,
+  onLoadFileDiff,
 }: {
   node: DirNode | FileNode;
   depth: number;
@@ -248,8 +304,30 @@ function TreeNode({
   onSubmitVirtualPath?: (name: string) => void;
   onCancelVirtualPath?: () => void;
   virtualInputRef?: React.RefObject<HTMLInputElement | null>;
+  viewMode?: 'diff' | 'full';
+  onExpandDir?: (dirPath: string) => Promise<DirEntry[]>;
+  onLoadFileDiff?: (filePath: string, fromRef?: string, toRef?: string) => Promise<void>;
 }) {
-  const [expanded, setExpanded] = useState(true);
+  // In lazy dir mode (onExpandDir provided) start collapsed, UNLESS the selected file is
+  // a descendant of this directory — in which case start expanded so the file is visible.
+  const isAncestorOfSelected = isDirNode(node) && !!selectedFile?.startsWith(node.path + '/');
+  const [expanded, setExpanded] = useState(() => !onExpandDir || isAncestorOfSelected);
+  // Track which selectedFile we last auto-expanded for, to avoid re-expanding after user collapses.
+  const autoExpandedForRef = useRef<string | null>(isAncestorOfSelected ? selectedFile : null);
+
+  // Auto-expand when selectedFile changes to a descendant of this directory.
+  useEffect(() => {
+    if (!isDirNode(node)) return;
+    if (!selectedFile || !selectedFile.startsWith(node.path + '/')) return;
+    if (autoExpandedForRef.current === selectedFile) return;
+    autoExpandedForRef.current = selectedFile;
+    // Auto-expand when an ancestor of `selectedFile`. The ref guard above
+    // ensures we don't re-expand after user collapses, so this is a one-shot
+    // sync from external prop change.
+    setExpanded(true);
+    // In lazy-load mode, also trigger dir load so children become available.
+    if (onExpandDir) onExpandDir(node.path).catch(console.error);
+  }, [selectedFile]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (creatingVirtual && virtualInputRef?.current) {
@@ -266,10 +344,26 @@ function TreeNode({
         <button
           className="diff-sidebar-item"
           style={{ paddingLeft: depth * 12 + 12 }}
-          onClick={() => setExpanded(!expanded)}
+          onClick={() => {
+            if (!expanded && onExpandDir) {
+              // After the dir expands, preload diffs for the newly-revealed files
+              onExpandDir(node.path).then((entries) => {
+                if (onLoadFileDiff) {
+                  entries.forEach((entry) => {
+                    if (!entry.is_dir) {
+                      onLoadFileDiff(entry.path).catch(console.error);
+                    }
+                  });
+                }
+              }).catch(console.error);
+            }
+            setExpanded(!expanded);
+          }}
           onContextMenu={(e) => onContextMenu?.(e, node.path, true)}
         >
-          {expanded ? (
+          {viewMode === 'full' ? (
+            <VSCodeIcon filename={node.name.split('/').pop() || node.name} isFolder isOpen={expanded} size={14} />
+          ) : expanded ? (
             <FolderOpen style={{ width: 14, height: 14, color: 'var(--color-text-muted)', flexShrink: 0 }} />
           ) : (
             <Folder style={{ width: 14, height: 14, color: 'var(--color-text-muted)', flexShrink: 0 }} />
@@ -301,6 +395,9 @@ function TreeNode({
                 onSubmitVirtualPath={onSubmitVirtualPath}
                 onCancelVirtualPath={onCancelVirtualPath}
                 virtualInputRef={virtualInputRef}
+                viewMode={viewMode}
+                onExpandDir={onExpandDir}
+                onLoadFileDiff={onLoadFileDiff}
               />
             ))}
           </>
@@ -321,8 +418,18 @@ function TreeNode({
       onClick={() => onSelectFile(file.new_path)}
       onContextMenu={(e) => onContextMenu?.(e, file.new_path, false)}
       title={file.is_virtual ? 'Planned file (not yet created)' : undefined}
+      draggable
+      onDragStart={(e) => {
+        e.dataTransfer.effectAllowed = 'copy';
+        e.dataTransfer.setData('application/x-grove-file-path', file.new_path);
+        e.dataTransfer.setData('text/plain', file.new_path);
+      }}
     >
-      <StatusIcon changeType={file.change_type} isVirtual={file.is_virtual} />
+      {viewMode === 'full' ? (
+        <VSCodeIcon filename={node.name} size={14} />
+      ) : (
+        <StatusIcon changeType={file.change_type} isVirtual={file.is_virtual} isUntracked={file.is_untracked} />
+      )}
       <span
         className={`truncate ${viewedStatus === 'viewed' ? 'diff-sidebar-file-viewed' : ''}`}
         style={file.is_virtual ? { opacity: 0.7, fontStyle: 'italic' } : undefined}
@@ -343,15 +450,21 @@ function TreeNode({
           </span>
         )}
         <span className="diff-sidebar-item-stats">
-          {file.additions > 0 && <span className="stat-add">+{file.additions}</span>}
-          {file.deletions > 0 && <span className="stat-del">-{file.deletions}</span>}
+          {file.is_binary ? (
+            <span style={{ fontSize: 9, color: 'var(--color-text-muted)', fontStyle: 'italic' }}>Binary</span>
+          ) : (
+            <>
+              {file.additions > 0 && <span className="stat-add">+{file.additions}</span>}
+              {file.deletions > 0 && <span className="stat-del">-{file.deletions}</span>}
+            </>
+          )}
         </span>
       </span>
     </button>
   );
 }
 
-function StatusIcon({ changeType, isVirtual }: { changeType: string; isVirtual?: boolean }) {
+function StatusIcon({ changeType, isVirtual, isUntracked }: { changeType: string; isVirtual?: boolean; isUntracked?: boolean }) {
   const color =
     changeType === 'added'
       ? 'var(--color-success)'
@@ -360,7 +473,7 @@ function StatusIcon({ changeType, isVirtual }: { changeType: string; isVirtual?:
         : changeType === 'renamed'
           ? 'var(--color-warning)'
           : 'var(--color-info)';
-  const letter = changeType === 'added' ? 'A' : changeType === 'deleted' ? 'D' : changeType === 'renamed' ? 'R' : 'M';
+  const letter = isUntracked ? 'U' : changeType === 'added' ? 'A' : changeType === 'deleted' ? 'D' : changeType === 'renamed' ? 'R' : 'M';
 
   return (
     <span
@@ -385,7 +498,9 @@ function buildTree(files: DiffFile[]): (DirNode | FileNode)[] {
   const root: DirNode = { name: '', path: '', children: [] };
 
   for (const file of files) {
-    const parts = file.new_path.split('/');
+    const rawPath = file.new_path;
+    const isDirPlaceholder = rawPath.endsWith('/');
+    const parts = rawPath.replace(/\/$/, '').split('/');
     let current = root;
 
     for (let i = 0; i < parts.length - 1; i++) {
@@ -401,11 +516,19 @@ function buildTree(files: DiffFile[]): (DirNode | FileNode)[] {
       current = existing;
     }
 
-    current.children.push({
-      name: parts[parts.length - 1],
-      path: file.new_path,
-      file,
-    });
+    if (isDirPlaceholder) {
+      const dirName = parts[parts.length - 1];
+      const dirPath = parts.join('/');
+      if (!current.children.find((c) => isDirNode(c) && c.name === dirName)) {
+        current.children.push({ name: dirName, path: dirPath, children: [] });
+      }
+    } else {
+      current.children.push({
+        name: parts[parts.length - 1],
+        path: file.new_path,
+        file,
+      });
+    }
   }
 
   // Sort: dirs first, then files, alphabetically

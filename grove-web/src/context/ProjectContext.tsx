@@ -1,11 +1,14 @@
 import { createContext, useContext, useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
-import type { Project, Task, TaskStatus } from "../data/types";
+import type { Project, Task } from "../data/types";
 import {
   listProjects,
   getProject,
   addProject as apiAddProject,
+  createNewProject as apiCreateNewProject,
+  cloneProject as apiCloneProject,
   deleteProject as apiDeleteProject,
+  renameProject as apiRenameProject,
   type ProjectListItem,
   type ProjectResponse,
   type TaskResponse,
@@ -18,14 +21,30 @@ interface ProjectContextType {
   currentProjectId: string | null;
   selectProject: (project: Project | null) => void;
   addProject: (path: string, name?: string) => Promise<Project>;
+  createNewProject: (parentDir: string, name: string, initGit: boolean, projectType?: string) => Promise<Project>;
+  cloneProject: (url: string, name?: string) => Promise<Project>;
   deleteProject: (id: string) => Promise<void>;
+  renameProject: (id: string, name: string) => Promise<void>;
   refreshProjects: () => Promise<void>;
   refreshSelectedProject: () => Promise<void>;
+  /**
+   * Directly replace the selected project with a pre-fetched API response.
+   * Use this when you have fresh data from an API call and want to avoid an
+   * extra `getProject` round-trip. Also refreshes the projects list in the
+   * background.
+   */
+  applySelectedProject: (response: ProjectResponse) => void;
   isLoading: boolean;
   error: string | null;
 }
 
 const ProjectContext = createContext<ProjectContextType | undefined>(undefined);
+
+/** Normalize API project_type to the frontend union type. */
+function normalizeProjectType(apiType: string | undefined): 'repo' | 'studio' {
+  if (apiType === 'studio') return 'studio';
+  return 'repo'; // default for undefined, 'repo', and any future types
+}
 
 // Convert API TaskResponse to frontend Task type
 function convertTask(task: TaskResponse): Task {
@@ -34,18 +53,12 @@ function convertTask(task: TaskResponse): Task {
     name: task.name,
     branch: task.branch,
     target: task.target,
-    status: task.status as TaskStatus,
-    additions: task.additions,
-    deletions: task.deletions,
-    filesChanged: task.files_changed,
-    commits: task.commits.map((c) => ({
-      hash: c.hash,
-      message: c.message,
-      author: "author", // API doesn't provide author yet
-      date: new Date(), // API provides time_ago, not exact date
-    })),
+    status: task.status === "archived" ? "archived" : "active",
     createdAt: new Date(task.created_at),
     updatedAt: new Date(task.updated_at),
+    multiplexer: task.multiplexer || "tmux",
+    createdBy: task.created_by || "",
+    isLocal: task.is_local || false,
   };
 }
 
@@ -57,7 +70,11 @@ function convertProject(project: ProjectResponse): Project {
     path: project.path,
     currentBranch: project.current_branch,
     tasks: project.tasks.map(convertTask),
+    localTask: project.local_task ? convertTask(project.local_task) : null,
     addedAt: new Date(project.added_at),
+    isGitRepo: project.is_git_repo,
+    exists: project.exists,
+    projectType: normalizeProjectType(project.project_type),
   };
 }
 
@@ -69,9 +86,12 @@ function convertProjectListItem(item: ProjectListItem): Project {
     path: item.path,
     currentBranch: "", // Will be loaded when selected
     tasks: [], // Will be loaded when selected
+    localTask: null, // Will be loaded when selected
     addedAt: new Date(item.added_at),
     taskCount: item.task_count,
-    liveCount: item.live_count,
+    isGitRepo: item.is_git_repo,
+    exists: item.exists,
+    projectType: normalizeProjectType(item.project_type),
   };
 }
 
@@ -99,9 +119,8 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       setError("Failed to load projects");
       setProjects([]);
       setCurrentProjectId(null);
-    } finally {
-      if (isInitial) setIsLoading(false);
     }
+    if (isInitial) setIsLoading(false);
   }, []);
 
   // Load full project data when selected
@@ -117,14 +136,23 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
 
   // Initial load
   useEffect(() => {
-    loadProjects();
+    void (async () => {
+      await loadProjects();
+    })();
   }, [loadProjects]);
+
+  // Track selectedProject in a ref so the auto-select effect can read it
+  // without re-triggering when it changes (which would cause a loop).
+  const selectedProjectRef = useRef(selectedProject);
+  useEffect(() => {
+    selectedProjectRef.current = selectedProject;
+  });
 
   // Auto-select project after projects are loaded
   // Priority: currentProjectId (from server cwd) > savedProjectId > first project
   // Only runs when no project is currently selected.
   useEffect(() => {
-    if (isLoading || projects.length === 0 || selectedProject) return;
+    if (isLoading || projects.length === 0 || selectedProjectRef.current) return;
 
     // Priority 1: If server is running in a registered project directory, select it
     if (currentProjectId) {
@@ -163,7 +191,6 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         }
       });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLoading, projects, currentProjectId, loadProjectDetails]);
 
   const selectProject = useCallback(
@@ -196,6 +223,26 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     [loadProjects]
   );
 
+  const createNewProject = useCallback(
+    async (parentDir: string, name: string, initGit: boolean, projectType?: string): Promise<Project> => {
+      const response = await apiCreateNewProject(parentDir, name, initGit, projectType);
+      const newProject = convertProject(response);
+      await loadProjects();
+      return newProject;
+    },
+    [loadProjects]
+  );
+
+  const cloneProject = useCallback(
+    async (url: string, name?: string): Promise<Project> => {
+      const response = await apiCloneProject(url, name);
+      const newProject = convertProject(response);
+      await loadProjects();
+      return newProject;
+    },
+    [loadProjects]
+  );
+
   const deleteProject = useCallback(
     async (id: string): Promise<void> => {
       await apiDeleteProject(id);
@@ -215,14 +262,41 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     await loadProjects();
   }, [loadProjects]);
 
+  const applySelectedProject = useCallback(
+    (response: ProjectResponse) => {
+      setSelectedProject(convertProject(response));
+      void loadProjects();
+    },
+    [loadProjects],
+  );
+
   const refreshSelectedProject = useCallback(async () => {
     if (selectedProject) {
-      const fullProject = await loadProjectDetails(selectedProject.id);
+      const [fullProject] = await Promise.all([
+        loadProjectDetails(selectedProject.id),
+        loadProjects(),
+      ]);
       if (fullProject) {
         setSelectedProject(fullProject);
       }
     }
-  }, [selectedProject, loadProjectDetails]);
+  }, [selectedProject, loadProjectDetails, loadProjects]);
+
+  const renameProject = useCallback(
+    async (id: string, name: string): Promise<void> => {
+      await apiRenameProject(id, name);
+      // Always refresh the project list so the cards show the new
+      // name. If the renamed project is the currently selected one,
+      // also refresh its detail view (refreshSelectedProject loads
+      // both list + selected in parallel, so don't double-load it).
+      if (selectedProject?.id === id) {
+        await refreshSelectedProject();
+      } else {
+        await loadProjects();
+      }
+    },
+    [selectedProject, refreshSelectedProject, loadProjects]
+  );
 
   return (
     <ProjectContext.Provider
@@ -232,7 +306,11 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         currentProjectId,
         selectProject,
         addProject,
+        createNewProject,
+        cloneProject,
+        applySelectedProject,
         deleteProject,
+        renameProject,
         refreshProjects,
         refreshSelectedProject,
         isLoading,
@@ -244,6 +322,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   );
 }
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function useProject() {
   const context = useContext(ProjectContext);
   if (!context) {

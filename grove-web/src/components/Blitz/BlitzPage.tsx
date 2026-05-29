@@ -1,208 +1,366 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Terminal, GitCommit, GitBranchPlus, RefreshCw, GitMerge, Archive, RotateCcw, Trash2, Search } from "lucide-react";
+import { Search, ArrowLeft, ChevronRight, Laptop, Radio, Plus, Folder } from "lucide-react";
 import { TaskInfoPanel } from "../Tasks/TaskInfoPanel";
-import type { TabType } from "../Tasks/TaskInfoPanel";
-import { TaskView } from "../Tasks/TaskView";
-import { CommitDialog, ConfirmDialog, MergeDialog } from "../Dialogs";
-import type { ApiError } from "../../api/client";
+import { TaskView, type TaskViewHandle } from "../Tasks/TaskView";
+import { CommitDialog, ConfirmDialog, DirtyBranchDialog, MergeDialog } from "../Dialogs";
 import { RebaseDialog } from "../Tasks/dialogs";
-import { HelpOverlay } from "../Tasks/HelpOverlay";
 import { ContextMenu } from "../ui/ContextMenu";
-import type { ContextMenuItem } from "../ui/ContextMenu";
 import { LogoBrand } from "../Layout/LogoBrand";
-import { useNotifications } from "../../context";
-import { useHotkeys } from "../../hooks";
+import { useNotifications, useCommandPalette } from "../../context";
+import {
+  useIsMobile,
+  useHotkeys,
+  useTaskPageState,
+  useTaskNavigation,
+  usePostMergeArchive,
+  useTaskOperations,
+  useTaskGroups,
+  useRadioEvents,
+  buildCommands,
+} from "../../hooks";
+import { RadioConnectDialog } from "./RadioConnectDialog";
 import { useBlitzTasks } from "./useBlitzTasks";
 import { BlitzTaskListItem } from "./BlitzTaskListItem";
-import {
-  archiveTask as apiArchiveTask,
-  deleteTask as apiDeleteTask,
-  syncTask as apiSyncTask,
-  commitTask as apiCommitTask,
-  mergeTask as apiMergeTask,
-  getCommits as apiGetCommits,
-  resetTask as apiResetTask,
-  rebaseToTask as apiRebaseToTask,
-  getBranches as apiGetBranches,
-} from "../../api";
-import type { Task, BlitzTask } from "../../data/types";
+import type { BlitzTask } from "../../data/types";
+import { MAIN_GROUP_ID, LOCAL_GROUP_ID } from "../../data/types";
+import type { PendingArchiveConfirm } from "../../utils/archiveHelpers";
+import type { PanelType } from "../Tasks/PanelSystem/types";
+import { buildContextMenuItems, type TaskOperationHandlers } from "../../utils/taskOperationUtils";
 
-type ViewMode = "list" | "info" | "terminal";
+
+interface DragInfo {
+  source: "main" | "group" | "local";
+  taskKey: string;           // `${projectId}:${taskId}`
+  index: number;             // index in source list
+  groupId: string;           // always present — MAIN_GROUP_ID, LOCAL_GROUP_ID, or custom UUID
+}
 
 interface BlitzPageProps {
   onSwitchToZen: () => void;
+  onNavigate?: (page: string) => void;
 }
 
-export function BlitzPage({ onSwitchToZen }: BlitzPageProps) {
+export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
   const { blitzTasks, isLoading, refresh } = useBlitzTasks();
   const { getTaskNotification, dismissNotification } = useNotifications();
+  const { isMobile } = useIsMobile();
 
+  // TaskGroup state (folder-based)
+  const taskGroupsHook = useTaskGroups();
+  const {
+    groups: taskGroups,
+    createGroup: createTaskGroup,
+    updateGroup: updateTaskGroup,
+    deleteGroup: deleteTaskGroup,
+  } = taskGroupsHook;
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
+  const [showNewGroupInput, setShowNewGroupInput] = useState(false);
+  const [newGroupName, setNewGroupName] = useState("");
+  const newGroupInputRef = useRef<HTMLInputElement | null>(null);
+  const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
+  const [editingGroupName, setEditingGroupName] = useState("");
+  const editGroupInputRef = useRef<HTMLInputElement | null>(null);
+  const [pendingDeleteGroup, setPendingDeleteGroup] = useState<{ id: string; name: string } | null>(null);
+  const [groupFolderContextMenu, setGroupFolderContextMenu] = useState<{ id: string; name: string; position: { x: number; y: number } } | null>(null);
+
+  // Radio connect dialog
+  const [showRadioConnect, setShowRadioConnect] = useState(false);
+
+  // Blitz-specific state
   const [selectedBlitzTask, setSelectedBlitzTask] = useState<BlitzTask | null>(null);
-  const [viewMode, setViewMode] = useState<ViewMode>("list");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [reviewOpen, setReviewOpen] = useState(false);
-  const [editorOpen, setEditorOpen] = useState(false);
+  const [mobileShowDetail, setMobileShowDetail] = useState(false);
 
-  // Drag and drop state
-  const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
-  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
-  const [taskOrder, setTaskOrder] = useState<string[]>([]);
+  // ── Unified drag-and-drop state ──────────────────────────────────────────
+  // Single ref tracks the drag source; render state tracks visual feedback
+  const dragInfoRef = useRef<DragInfo | null>(null);
+  const dropTargetRef = useRef<{ zone: "main" | "group" | "local"; index?: number; groupId?: string } | null>(null);
+  const [dragState, setDragState] = useState<{
+    source: "main" | "group" | "local" | null;
+    taskKey: string | null;
+    overZone: "main" | "group" | "local" | null;
+    overIndex: number | null;
+    overGroupId: string | null;
+  }>({ source: null, taskKey: null, overZone: null, overIndex: null, overGroupId: null });
 
-  // Commit dialog state
-  const [showCommitDialog, setShowCommitDialog] = useState(false);
-  const [isCommitting, setIsCommitting] = useState(false);
-  const [commitError, setCommitError] = useState<string | null>(null);
-
-  // Merge dialog state
-  const [showMergeDialog, setShowMergeDialog] = useState(false);
-  const [isMerging, setIsMerging] = useState(false);
-  const [mergeError, setMergeError] = useState<string | null>(null);
-
-  // Post-merge archive confirm
-  const [showArchiveAfterMerge, setShowArchiveAfterMerge] = useState(false);
-  const [mergedTaskId, setMergedTaskId] = useState<string | null>(null);
-  const [mergedTaskName, setMergedTaskName] = useState<string>("");
-  const [mergedProjectId, setMergedProjectId] = useState<string | null>(null);
-
-  const [pendingArchiveConfirm, setPendingArchiveConfirm] = useState<{
-    projectId: string;
-    taskId: string;
-    message: React.ReactNode;
-    context: "normal" | "after-merge";
-  } | null>(null);
-
-  const buildArchiveConfirmMessage = useCallback((
-    data: {
-      task_name?: string;
-      branch?: string;
-      target?: string;
-      worktree_dirty?: boolean;
-      branch_merged?: boolean;
-      dirty_check_failed?: boolean;
-      merge_check_failed?: boolean;
-    },
-    fallbackTaskName: string
-  ): React.ReactNode => {
-    // Keep wording consistent with TUI ConfirmType::ArchiveConfirm
-    const taskName = data.task_name || fallbackTaskName;
-    const branch = data.branch || "";
-    const target = data.target || "";
-
-    const lines: string[] = [
-      `Task: ${taskName}`,
-      `Branch: ${branch}`,
-      `Target: ${target}`,
-      "",
-    ];
-
-    if (data.dirty_check_failed) {
-      lines.push("Cannot check worktree status.");
-    } else if (data.worktree_dirty) {
-      lines.push("Worktree has uncommitted changes.");
-      lines.push("They will be LOST after archive.");
-    }
-
-    if (data.merge_check_failed) {
-      lines.push("Cannot check merge status.");
-    } else if (data.branch_merged === false) {
-      lines.push("Branch not merged yet.");
-    }
-
-    lines.push("", "Archive anyway?");
-    return lines.join("\n");
+  const clearDrag = useCallback(() => {
+    dragInfoRef.current = null;
+    dropTargetRef.current = null;
+    setDragState({ source: null, taskKey: null, overZone: null, overIndex: null, overGroupId: null });
   }, []);
 
-  // Clean confirm
-  const [showCleanConfirm, setShowCleanConfirm] = useState(false);
-  const [isDeleting, setIsDeleting] = useState(false);
-
-  // Sync state
-  const [isSyncing, setIsSyncing] = useState(false);
-
-  // Reset confirm
-  const [showResetConfirm, setShowResetConfirm] = useState(false);
-  const [isResetting, setIsResetting] = useState(false);
-
-  // Rebase dialog
-  const [showRebaseDialog, setShowRebaseDialog] = useState(false);
-  const [isRebasing, setIsRebasing] = useState(false);
-  const [availableBranches, setAvailableBranches] = useState<string[]>([]);
-
-  // Toast
-  const [operationMessage, setOperationMessage] = useState<string | null>(null);
-
-  // Context menu
-  const [contextMenu, setContextMenu] = useState<{ task: Task; position: { x: number; y: number } } | null>(null);
-
-  // Help overlay
-  const [showHelp, setShowHelp] = useState(false);
-
-  // Info panel tab
-  const [infoPanelTab, setInfoPanelTab] = useState<TabType>("stats");
-
-  // Search input ref
+  const [localTasksExpanded, setLocalTasksExpanded] = useState(false);
+  const mainListRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  // Callback ref: only SET on mount, never clear on unmount.
+  // This prevents AnimatePresence exit animation from clearing the ref
+  // when the old TaskView unmounts after the new one has already mounted.
+  const taskViewRef = useRef<TaskViewHandle | null>(null);
+  const taskViewCallbackRef = useCallback((handle: TaskViewHandle | null) => {
+    if (handle) taskViewRef.current = handle;
+  }, []);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
-  // Derived helpers
-  const activeProjectId = selectedBlitzTask?.projectId ?? null;
-  const selectedTask = selectedBlitzTask?.task ?? null;
+  // Archive confirmation state (shared between hooks)
+  const [pendingArchiveConfirm, setPendingArchiveConfirm] = useState<PendingArchiveConfirm | null>(null);
+
+  // `selectedBlitzTask` is a snapshot from the click moment; `blitzTasks`
+  // refreshes underneath us. `liveSelected` is the same task with its latest
+  // fields, used by hooks that need fresh data. Falls back to the snapshot
+  // whenever the lookup misses — mid-archive, mid-refresh, or after the task
+  // has been permanently removed. Callers that perform a hard removal are
+  // expected to clear `selectedBlitzTask` themselves (e.g. archive flow
+  // calls `setSelectedBlitzTask(null)`); without that, keyboard ops can
+  // still fire against the deleted task and get a 404 from the backend.
+  const liveSelected = useMemo(() => {
+    if (!selectedBlitzTask) return null;
+    return (
+      blitzTasks.find(
+        (bt) =>
+          bt.task.id === selectedBlitzTask.task.id &&
+          bt.projectId === selectedBlitzTask.projectId,
+      ) ?? selectedBlitzTask
+    );
+  }, [blitzTasks, selectedBlitzTask]);
+
+  const activeProjectId = liveSelected?.projectId ?? null;
+  const selectedTask = liveSelected?.task ?? null;
+
+  // Page state hook
+  const [pageState, pageHandlers] = useTaskPageState();
+
+  // Post-merge archive hook (with Blitz-specific projectId tracking)
+  const [postMergeState, postMergeHandlers] = usePostMergeArchive({
+    projectId: activeProjectId,
+    onRefresh: refresh,
+    onShowMessage: pageHandlers.showMessage,
+    onCleanup: () => {
+      setSelectedBlitzTask(null);
+      pageHandlers.setInWorkspace(false);
+    },
+    setPendingArchiveConfirm,
+  });
+
+  // Task operations hook
+  const [opsState, opsHandlers] = useTaskOperations({
+    projectId: activeProjectId,
+    selectedTask,
+    onRefresh: refresh,
+    onShowMessage: pageHandlers.showMessage,
+    onTaskArchived: () => {
+      setSelectedBlitzTask(null);
+      pageHandlers.setInWorkspace(false);
+    },
+    onTaskMerged: (taskId, taskName) => {
+      // Blitz: pass mergedProjectId for cross-project operations
+      postMergeHandlers.triggerPostMergeArchive(taskId, taskName, activeProjectId ?? undefined);
+    },
+    setPendingArchiveConfirm,
+  });
+
+  // Radio events: desktop receives focus/prompt events from Radio phone
+  const blitzTasksRef = useRef(blitzTasks);
+  useEffect(() => { blitzTasksRef.current = blitzTasks; }, [blitzTasks]);
+  const radioFocusedTaskRef = useRef<string | null>(null);
+
+  // Helper: ensure the right panel is open for the currently selected task.
+  // Does NOT call setSelectedBlitzTask — task selection is handled by onFocusTask.
+  const ensureRadioPanel = useCallback((panelType: "chat" | "terminal") => {
+    const tryEnsure = (attempts: number) => {
+      if (taskViewRef.current) {
+        taskViewRef.current.ensurePanel(panelType);
+      } else if (attempts > 0) {
+        setTimeout(() => tryEnsure(attempts - 1), 100);
+      }
+    };
+    setTimeout(() => tryEnsure(10), 100);
+  }, []);
+
+  const { radioClients } = useRadioEvents({
+    onFocusTask: useCallback((projectId: string, taskId: string, target?: import("../../api/walkieTalkie").TargetMode) => {
+      const taskKey = `${projectId}:${taskId}`;
+      const bt = blitzTasksRef.current.find(
+        (t) => t.projectId === projectId && t.task.id === taskId,
+      );
+      if (!bt || bt.task.status === "archived") return;
+
+      setSelectedBlitzTask(bt);
+      pageHandlers.setInWorkspace(true);
+
+      // Switch panel based on Radio's target mode
+      const panelType = target?.mode === "terminal" ? "terminal" : "chat";
+      if (radioFocusedTaskRef.current !== taskKey) {
+        radioFocusedTaskRef.current = taskKey;
+        ensureRadioPanel(panelType);
+      }
+
+      // Clear any stale pending chat from a previous focus event
+      delete (window as unknown as Record<string, unknown>).__grove_pending_chat;
+
+      // Tell TaskChat which session to show (Radio's active session)
+      if (target?.mode === "chat" && "chat_id" in target && target.chat_id) {
+        const chatId = target.chat_id;
+        // Store as pending so TaskChat can pick it up on mount (before its listener is set up)
+        (window as unknown as Record<string, unknown>).__grove_pending_chat = { projectId, taskId, chatId };
+        window.dispatchEvent(new CustomEvent("grove:switch-chat", {
+          detail: { projectId, taskId, chatId },
+        }));
+      }
+    }, [pageHandlers, ensureRadioPanel]),
+
+    onFocusTarget: useCallback((_projectId: string, _taskId: string, target: import("../../api/walkieTalkie").TargetMode) => {
+      // Only switch panel — task selection is already handled by onFocusTask (tap/hold)
+      const panelType = target.mode === "terminal" ? "terminal" : "chat";
+      ensureRadioPanel(panelType);
+      // If chat mode with specific session, tell TaskChat to switch
+      if (target.mode === "chat" && "chat_id" in target && target.chat_id) {
+        window.dispatchEvent(new CustomEvent("grove:switch-chat", {
+          detail: { projectId: _projectId, taskId: _taskId, chatId: target.chat_id },
+        }));
+      }
+    }, [ensureRadioPanel]),
+
+    onTerminalInput: useCallback((_projectId: string, _taskId: string, text: string) => {
+      // Send input to terminal — task should already be selected via prior events
+      const targetKey = `${_projectId}:${_taskId}`;
+      const trySend = (attempts: number) => {
+        // Bail if task changed since event was received
+        if (radioFocusedTaskRef.current && radioFocusedTaskRef.current !== targetKey) return;
+        if (taskViewRef.current) {
+          taskViewRef.current.ensurePanel("terminal");
+          const sent = taskViewRef.current.sendTerminalInput(text.trimEnd() + "\r");
+          if (!sent && attempts > 0) {
+            setTimeout(() => trySend(attempts - 1), 200);
+          }
+        } else if (attempts > 0) {
+          setTimeout(() => trySend(attempts - 1), 200);
+        }
+      };
+      setTimeout(() => trySend(15), 100);
+    }, []),
+  });
+  const radioConnected = radioClients > 0;
+
+  // Auto-close Radio connect dialog when a phone connects
+  // Derived: if radio is connected, never show the connect dialog
+  const effectiveShowRadioConnect = showRadioConnect && !radioConnected;
 
   // Filter tasks by search query (match task name, branch, or project name)
-  const filteredTasks = useMemo(() => {
-    if (!searchQuery) return blitzTasks;
-    const q = searchQuery.toLowerCase();
+  const searchFilteredTasks = useMemo(() => {
+    if (!pageState.searchQuery) return blitzTasks;
+    const q = pageState.searchQuery.toLowerCase();
     return blitzTasks.filter(
       (bt) =>
         bt.task.name.toLowerCase().includes(q) ||
         bt.task.branch.toLowerCase().includes(q) ||
         bt.projectName.toLowerCase().includes(q)
     );
-  }, [blitzTasks, searchQuery]);
+  }, [blitzTasks, pageState.searchQuery]);
 
-  // Keep selectedBlitzTask in sync with refreshed data
+  const filteredTasks = searchFilteredTasks;
+
+  // Pre-built map from task key to BlitzTask (shared across getGroupTasks calls)
+  const taskMap = useMemo(
+    () => new Map(filteredTasks.map(bt => [`${bt.projectId}:${bt.task.id}`, bt])),
+    [filteredTasks],
+  );
+
+  // Get tasks for a specific group
+  const getGroupTasks = useCallback((group: { slots: { position: number; project_id: string; task_id: string }[] } | undefined) => {
+    if (!group) return [];
+    // Return tasks sorted by slot position
+    return group.slots
+      .slice()
+      .sort((a, b) => a.position - b.position)
+      .map(s => taskMap.get(`${s.project_id}:${s.task_id}`))
+      .filter((bt): bt is BlitzTask => bt !== undefined);
+  }, [taskMap]);
+
+  // Search-aware live row. Null while the selected task is filtered out of
+  // view by the search query — used for the highlighted-row check and the
+  // info/workspace panels, which should hide when the task isn't on screen.
   const currentSelected = useMemo(() => {
     if (!selectedBlitzTask) return null;
-    return filteredTasks.find((bt) => bt.task.id === selectedBlitzTask.task.id && bt.projectId === selectedBlitzTask.projectId) ?? selectedBlitzTask;
+    return filteredTasks.find((bt) => bt.task.id === selectedBlitzTask.task.id && bt.projectId === selectedBlitzTask.projectId) ?? null;
   }, [filteredTasks, selectedBlitzTask]);
 
-  // Initialize task order when filtered tasks change
+  // Derive studio status from current selection — kept in sync via React state
+  const isStudioTask = currentSelected?.projectType === "studio";
+
+  // Clear stale taskViewRef when no task is selected
   useEffect(() => {
-    if (filteredTasks.length > 0 && taskOrder.length === 0) {
-      setTaskOrder(filteredTasks.map(bt => `${bt.projectId}:${bt.task.id}`));
+    if (!currentSelected) taskViewRef.current = null;
+  }, [currentSelected]);
+
+  // Derive task lists from groups
+  const mainGroup = useMemo(() => taskGroups.find(g => g.id === MAIN_GROUP_ID), [taskGroups]);
+  const localGroup = useMemo(() => taskGroups.find(g => g.id === LOCAL_GROUP_ID), [taskGroups]);
+  const customGroups = useMemo(() => taskGroups.filter(g => g.id !== MAIN_GROUP_ID && g.id !== LOCAL_GROUP_ID), [taskGroups]);
+
+  const mainListTasks = useMemo(() => getGroupTasks(mainGroup), [getGroupTasks, mainGroup]);
+  const folderLocalTasks = useMemo(() => getGroupTasks(localGroup), [getGroupTasks, localGroup]);
+
+  // Combined for navigation: main + group folder tasks (if expanded) + local folder tasks
+  const expandedGroupTasks = useMemo(() => {
+    const tasks: BlitzTask[] = [];
+    for (const group of customGroups) {
+      if (expandedGroups.has(group.id)) {
+        tasks.push(...getGroupTasks(group));
+      }
     }
-  }, [filteredTasks, taskOrder.length]);
+    return tasks;
+  }, [customGroups, expandedGroups, getGroupTasks]);
 
-  // Apply custom order to tasks
-  const displayTasks = useMemo(() => {
-    if (taskOrder.length === 0) return filteredTasks;
+  const displayTasks = useMemo(() => [...mainListTasks, ...expandedGroupTasks, ...folderLocalTasks], [mainListTasks, expandedGroupTasks, folderLocalTasks]);
 
-    const taskMap = new Map(filteredTasks.map(bt => [`${bt.projectId}:${bt.task.id}`, bt]));
-    const ordered = taskOrder
-      .map(key => taskMap.get(key))
-      .filter((bt): bt is BlitzTask => bt !== undefined);
+  // Task selection handlers (Blitz-specific: handle BlitzTask)
+  const handleSelectTask = useCallback((bt: BlitzTask) => {
+    setSelectedBlitzTask(bt);
+    if (isMobile) {
+      setMobileShowDetail(true);
+    }
+  }, [isMobile]);
 
-    // Add any new tasks that aren't in the order yet
-    const orderedKeys = new Set(taskOrder);
-    const newTasks = filteredTasks.filter(bt => !orderedKeys.has(`${bt.projectId}:${bt.task.id}`));
+  const handleDoubleClickTask = useCallback((bt: BlitzTask) => {
+    if (bt.task.status === "archived") return;
+    setSelectedBlitzTask(bt);
+    pageHandlers.setInWorkspace(true);
+  }, [pageHandlers]);
 
-    return [...ordered, ...newTasks];
-  }, [filteredTasks, taskOrder]);
-
-  // Listen for Command key press for quick navigation
+  // Listen for Command key press for quick navigation.
+  // Cleanup is layered (keyup / blur / visibilitychange / 3s safety timer)
+  // because the bare keyup-of-Meta path is unreliable on macOS: when Tauri
+  // Overlay title-bar mode is on, the OS occasionally swallows the meta
+  // keyup if a system shortcut intercepts it, leaving the body class stuck
+  // and chips visible. Any one of the fallback triggers clears the class.
   useEffect(() => {
+    let safetyTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const clearChips = () => {
+      document.body.classList.remove('blitz-command-pressed');
+      if (safetyTimer) {
+        clearTimeout(safetyTimer);
+        safetyTimer = undefined;
+      }
+    };
+
     const handleKeyDown = (e: KeyboardEvent) => {
       // Only listen for Command key (metaKey), not Control
       if (e.metaKey) {
         // Add CSS class to body to show shortcuts (no React re-render)
         document.body.classList.add('blitz-command-pressed');
 
+        // Safety net: if every cleanup path fails (rare), drop the class
+        // after 3s anyway so chips don't stay forever.
+        if (safetyTimer) clearTimeout(safetyTimer);
+        safetyTimer = setTimeout(clearChips, 3000);
+
         // Handle Command+0-9 for quick navigation
         if (e.key >= '0' && e.key <= '9') {
           e.preventDefault();
           const index = e.key === '0' ? 9 : parseInt(e.key) - 1; // 1->0, 2->1, ..., 0->9
-          if (index < displayTasks.length) {
-            const taskToSelect = displayTasks[index];
+          if (index < mainListTasks.length) {
+            const taskToSelect = mainListTasks[index];
             const notif = getTaskNotification(taskToSelect.task.id);
             if (notif) {
               dismissNotification(notif.project_id, notif.task_id);
@@ -214,599 +372,411 @@ export function BlitzPage({ onSwitchToZen }: BlitzPageProps) {
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
-      if (!e.metaKey) {
-        document.body.classList.remove('blitz-command-pressed');
-      }
+      // Once Meta is released, clear regardless of which key fired the keyup.
+      if (!e.metaKey) clearChips();
+    };
+
+    // App lost focus (Cmd+Tab, switched window) — Meta keyup never arrives.
+    const handleBlur = () => clearChips();
+    const handleVisibilityChange = () => {
+      if (document.hidden) clearChips();
     };
 
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
-
-    // Handle window blur (when user switches apps while holding Command)
-    const handleBlur = () => {
-      document.body.classList.remove('blitz-command-pressed');
-    };
     window.addEventListener('blur', handleBlur);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', handleBlur);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      if (safetyTimer) clearTimeout(safetyTimer);
       // Clean up class on unmount
       document.body.classList.remove('blitz-command-pressed');
     };
-  }, [displayTasks, getTaskNotification, dismissNotification]);
+  }, [mainListTasks, handleSelectTask, getTaskNotification, dismissNotification]);
 
-  const showMessage = (message: string) => {
-    setOperationMessage(message);
-    setTimeout(() => setOperationMessage(null), 3000);
-  };
+  // ── Unified drag handlers ───────────────────────────────────────────────
 
-  // --- Handlers ---
-  const handleSelectTask = (bt: BlitzTask) => {
-    setSelectedBlitzTask(bt);
-    if (bt.task.status !== "archived") {
-      setViewMode("terminal");
-      setReviewOpen(false);
-      setEditorOpen(false);
-    } else if (viewMode === "list") {
-      setViewMode("info");
-    }
-  };
+  const startDrag = useCallback((source: "main" | "group" | "local", index: number, taskKey: string, groupId: string) => {
+    dragInfoRef.current = { source, taskKey, index, groupId };
+    setDragState({ source, taskKey, overZone: null, overIndex: null, overGroupId: null });
+  }, []);
 
-  const handleDoubleClickTask = (bt: BlitzTask) => {
-    if (bt.task.status === "archived") return;
-    setSelectedBlitzTask(bt);
-    setViewMode("terminal");
-    setReviewOpen(false);
-    setEditorOpen(false);
-  };
+  const handleItemDragOver = useCallback((e: React.DragEvent, zone: "main" | "group" | "local", index: number, groupId?: string) => {
+    if (!dragInfoRef.current) return;
+    e.stopPropagation(); // Prevent zone-level handler from overriding index to -1
+    dropTargetRef.current = { zone, index, groupId };
+    setDragState(prev => ({ ...prev, overZone: zone, overIndex: index, overGroupId: groupId ?? null }));
+  }, []);
 
-  // Drag and drop handlers
-  const handleDragStart = (index: number) => {
-    setDraggedIndex(index);
-  };
+  const handleZoneDragOver = useCallback((e: React.DragEvent, zone: "main" | "group" | "local", groupId?: string) => {
+    if (!dragInfoRef.current) return;
+    // Don't accept drop from same group to same group header (only to items within)
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    dropTargetRef.current = { zone, index: -1, groupId };
+    setDragState(prev => ({ ...prev, overZone: zone, overIndex: null, overGroupId: groupId ?? null }));
+  }, []);
 
-  const handleDragOver = (index: number) => {
-    if (draggedIndex === null || draggedIndex === index) return;
-    setDragOverIndex(index);
-  };
+  const handleDragLeave = useCallback(() => {
+    dropTargetRef.current = null;
+    setDragState(prev => ({ ...prev, overZone: null, overIndex: null, overGroupId: null }));
+  }, []);
 
-  const handleDragEnd = () => {
-    if (draggedIndex === null || dragOverIndex === null || draggedIndex === dragOverIndex) {
-      setDraggedIndex(null);
-      setDragOverIndex(null);
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    const info = dragInfoRef.current;
+    const target = dropTargetRef.current;
+    if (!info || !target) { clearDrag(); return; }
+
+    const { taskKey, groupId: srcGroupId } = info;
+    const { groupId: tgtGroupId } = target;
+    const targetIndex = target.index ?? -1;
+
+    // Find the BlitzTask
+    const bt = blitzTasks.find(b => `${b.projectId}:${b.task.id}` === taskKey);
+    if (!bt) { clearDrag(); return; }
+
+    const resolvedTgtGroupId = tgtGroupId ?? srcGroupId;
+
+    // ── Same group reorder ──
+    if (srcGroupId === resolvedTgtGroupId && targetIndex >= 0 && info.index !== targetIndex) {
+      const group = taskGroups.find(g => g.id === srcGroupId);
+      if (group) {
+        const tasksInGroup = getGroupTasks(group);
+        if (info.index < tasksInGroup.length && targetIndex < tasksInGroup.length) {
+          const srcTask = tasksInGroup[info.index];
+          const tgtTask = tasksInGroup[targetIndex];
+          // Find their slots in the full list and swap positions
+          const newSlots = group.slots.map(s => {
+            if (s.project_id === srcTask.projectId && s.task_id === srcTask.task.id) {
+              const tgtSlot = group.slots.find(ts => ts.project_id === tgtTask.projectId && ts.task_id === tgtTask.task.id);
+              return { ...s, position: tgtSlot?.position ?? s.position };
+            }
+            if (s.project_id === tgtTask.projectId && s.task_id === tgtTask.task.id) {
+              const srcSlot = group.slots.find(ss => ss.project_id === srcTask.projectId && ss.task_id === srcTask.task.id);
+              return { ...s, position: srcSlot?.position ?? s.position };
+            }
+            return s;
+          }).sort((a, b) => a.position - b.position);
+          taskGroupsHook.setSlots(srcGroupId, newSlots);
+        }
+      }
+      clearDrag();
       return;
     }
 
-    const newOrder = [...taskOrder];
-    const [movedItem] = newOrder.splice(draggedIndex, 1);
-    newOrder.splice(dragOverIndex, 0, movedItem);
-
-    setTaskOrder(newOrder);
-    setDraggedIndex(null);
-    setDragOverIndex(null);
-  };
-
-  const handleDragLeave = () => {
-    setDragOverIndex(null);
-  };
-
-  const handleCloseTask = () => {
-    if (viewMode === "terminal") {
-      setViewMode("info");
-      setReviewOpen(false);
-      setEditorOpen(false);
-    } else {
-      setSelectedBlitzTask(null);
-      setViewMode("list");
+    // ── Cross-group move ──
+    if (srcGroupId !== resolvedTgtGroupId) {
+      taskGroupsHook.moveTask(srcGroupId, resolvedTgtGroupId, bt.projectId, bt.task.id);
     }
-  };
 
-  const handleEnterTerminal = () => {
-    if (selectedTask?.status === "archived") return;
-    setViewMode("terminal");
-  };
+    clearDrag();
+  }, [blitzTasks, taskGroups, getGroupTasks, taskGroupsHook, clearDrag]);
 
-  const handleToggleReview = () => {
-    if (!reviewOpen) setEditorOpen(false);
-    setReviewOpen(!reviewOpen);
-  };
 
-  const handleToggleEditor = () => {
-    if (!editorOpen) setReviewOpen(false);
-    setEditorOpen(!editorOpen);
-  };
-
-  const handleReviewFromInfo = () => {
-    setViewMode("terminal");
-    setReviewOpen(true);
-    setEditorOpen(false);
-  };
-
-  const handleEditorFromInfo = () => {
-    setViewMode("terminal");
-    setEditorOpen(true);
-    setReviewOpen(false);
-  };
-
-  const handleStartSession = () => {
-    setViewMode("terminal");
-  };
-
-  const handleTerminalConnected = useCallback(async () => {
-    await refresh();
-  }, [refresh]);
-
-  // Unified shortcut handlers for Review/Editor/Terminal
-  const handleReviewShortcut = () => {
-    if (viewMode === "terminal") {
-      handleToggleReview();
-    } else {
-      handleReviewFromInfo();
-    }
-  };
-
-  const handleEditorShortcut = () => {
-    if (viewMode === "terminal") {
-      handleToggleEditor();
-    } else {
-      handleEditorFromInfo();
-    }
-  };
-
-  const handleTerminalShortcut = () => {
-    if (viewMode === "terminal") {
-      // Close review/editor if open
-      if (reviewOpen) setReviewOpen(false);
-      if (editorOpen) setEditorOpen(false);
-    } else {
-      handleEnterTerminal();
-    }
-  };
-
-  // --- Actions ---
-  const handleCommit = () => {
-    setCommitError(null);
-    setShowCommitDialog(true);
-  };
-
-  const handleCommitSubmit = useCallback(async (message: string) => {
-    if (!activeProjectId || !selectedTask) return;
-    try {
-      setIsCommitting(true);
-      setCommitError(null);
-      const result = await apiCommitTask(activeProjectId, selectedTask.id, message);
-      if (result.success) {
-        showMessage("Changes committed successfully");
-        setShowCommitDialog(false);
-        await refresh();
+  // Toggle group folder expansion
+  const toggleGroupExpanded = useCallback((groupId: string) => {
+    setExpandedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(groupId)) {
+        next.delete(groupId);
       } else {
-        setCommitError(result.message || "Commit failed");
+        next.add(groupId);
       }
-    } catch {
-      setCommitError("Failed to commit changes");
-    } finally {
-      setIsCommitting(false);
-    }
-  }, [activeProjectId, selectedTask, refresh]);
-
-  const handleRebase = useCallback(async () => {
-    if (!activeProjectId) return;
-    try {
-      const branchesRes = await apiGetBranches(activeProjectId);
-      setAvailableBranches(branchesRes.branches.map((b) => b.name));
-      setShowRebaseDialog(true);
-    } catch {
-      showMessage("Failed to load branches");
-    }
-  }, [activeProjectId]);
-
-  const handleRebaseSubmit = useCallback(async (newTarget: string) => {
-    if (!activeProjectId || !selectedTask || isRebasing) return;
-    try {
-      setIsRebasing(true);
-      const result = await apiRebaseToTask(activeProjectId, selectedTask.id, newTarget);
-      if (result.success) {
-        showMessage(result.message || "Target branch changed");
-        setShowRebaseDialog(false);
-        await refresh();
-        setSelectedBlitzTask((prev) =>
-          prev ? { ...prev, task: { ...prev.task, target: newTarget } } : null
-        );
-      } else {
-        showMessage(result.message || "Failed to change target branch");
-      }
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message :
-        (err as { message?: string })?.message || "Failed to change target branch";
-      showMessage(errorMessage);
-    } finally {
-      setIsRebasing(false);
-    }
-  }, [activeProjectId, selectedTask, isRebasing, refresh]);
-
-  const handleSync = useCallback(async () => {
-    if (!activeProjectId || !selectedTask || isSyncing) return;
-    try {
-      setIsSyncing(true);
-      const result = await apiSyncTask(activeProjectId, selectedTask.id);
-      showMessage(result.message || (result.success ? "Synced successfully" : "Sync failed"));
-      if (result.success) await refresh();
-    } catch {
-      showMessage("Failed to sync task");
-    } finally {
-      setIsSyncing(false);
-    }
-  }, [activeProjectId, selectedTask, isSyncing, refresh]);
-
-  const handleMerge = useCallback(async () => {
-    if (!activeProjectId || !selectedTask || isMerging) return;
-    try {
-      const commitsRes = await apiGetCommits(activeProjectId, selectedTask.id);
-      if (commitsRes.total <= 1) {
-        setIsMerging(true);
-        const result = await apiMergeTask(activeProjectId, selectedTask.id, "merge-commit");
-        setIsMerging(false);
-        if (result.success) {
-          showMessage(result.message || "Merged successfully");
-          await refresh();
-          setMergedTaskId(selectedTask.id);
-          setMergedTaskName(selectedTask.name);
-          setMergedProjectId(activeProjectId);
-          setShowArchiveAfterMerge(true);
-        } else {
-          showMessage(result.message || "Merge failed");
-        }
-      } else {
-        setMergeError(null);
-        setShowMergeDialog(true);
-      }
-    } catch {
-      setMergeError(null);
-      setShowMergeDialog(true);
-    }
-  }, [activeProjectId, selectedTask, isMerging, refresh]);
-
-  const handleMergeSubmit = useCallback(async (method: "squash" | "merge-commit") => {
-    if (!activeProjectId || !selectedTask || isMerging) return;
-    try {
-      setIsMerging(true);
-      setMergeError(null);
-      const result = await apiMergeTask(activeProjectId, selectedTask.id, method);
-      if (result.success) {
-        showMessage(result.message || "Merged successfully");
-        setShowMergeDialog(false);
-        await refresh();
-        setMergedTaskId(selectedTask.id);
-        setMergedTaskName(selectedTask.name);
-        setMergedProjectId(activeProjectId);
-        setShowArchiveAfterMerge(true);
-      } else {
-        setMergeError(result.message || "Merge failed");
-      }
-    } catch {
-      setMergeError("Failed to merge task");
-    } finally {
-      setIsMerging(false);
-    }
-  }, [activeProjectId, selectedTask, isMerging, refresh]);
-
-  const handleArchiveAfterMerge = useCallback(async () => {
-    if (!mergedProjectId || !mergedTaskId) return;
-    let shouldCleanup = true;
-    try {
-      await apiArchiveTask(mergedProjectId, mergedTaskId);
-      await refresh();
-      showMessage("Task archived");
-    } catch (err) {
-      const e = err as ApiError;
-      const data = (e.data || {}) as {
-        code?: string;
-        task_name?: string;
-        branch?: string;
-        target?: string;
-        worktree_dirty?: boolean;
-        branch_merged?: boolean;
-        dirty_check_failed?: boolean;
-        merge_check_failed?: boolean;
-      };
-      if (e?.status === 409 && data.code === "ARCHIVE_CONFIRM_REQUIRED") {
-        setPendingArchiveConfirm({
-          projectId: mergedProjectId,
-          taskId: mergedTaskId,
-          message: buildArchiveConfirmMessage(data, mergedTaskName),
-          context: "after-merge",
-        });
-        setShowArchiveAfterMerge(false);
-        shouldCleanup = false;
-        return;
-      }
-      showMessage(e?.message || "Failed to archive task");
-    } finally {
-      if (shouldCleanup) {
-        setShowArchiveAfterMerge(false);
-        setMergedTaskId(null);
-        setMergedTaskName("");
-        setMergedProjectId(null);
-        setSelectedBlitzTask(null);
-        setViewMode("list");
-      }
-    }
-  }, [mergedProjectId, mergedTaskId, mergedTaskName, refresh]);
-
-  const handleSkipArchive = useCallback(() => {
-    setShowArchiveAfterMerge(false);
-    setMergedTaskId(null);
-    setMergedTaskName("");
-    setMergedProjectId(null);
-    setSelectedBlitzTask(null);
-    setViewMode("list");
+      return next;
+    });
   }, []);
 
-  const handleArchive = useCallback(async () => {
-    if (!activeProjectId || !selectedTask) return;
-    try {
-      await apiArchiveTask(activeProjectId, selectedTask.id);
-      await refresh();
-      setSelectedBlitzTask(null);
-      setViewMode("list");
-    } catch (err) {
-      const e = err as ApiError;
-      const data = (e.data || {}) as {
-        code?: string;
-        task_name?: string;
-        branch?: string;
-        target?: string;
-        worktree_dirty?: boolean;
-        branch_merged?: boolean;
-        dirty_check_failed?: boolean;
-        merge_check_failed?: boolean;
-      };
-      if (e?.status === 409 && data.code === "ARCHIVE_CONFIRM_REQUIRED") {
-        setPendingArchiveConfirm({
-          projectId: activeProjectId,
-          taskId: selectedTask.id,
-          message: buildArchiveConfirmMessage(data, selectedTask.name),
-          context: "normal",
-        });
-        return;
+  // Mobile: manual move up/down (replaces drag on touch devices)
+  const handleMoveTask = useCallback((groupId: string, index: number, direction: "up" | "down") => {
+    const group = taskGroups.find(g => g.id === groupId);
+    if (!group) return;
+    const groupTaskList = getGroupTasks(group);
+    const targetIndex = direction === "up" ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= groupTaskList.length) return;
+    const srcTask = groupTaskList[index];
+    const tgtTask = groupTaskList[targetIndex];
+    // Swap positions in the full slot list to preserve hidden (filtered-out) tasks
+    const newSlots = group.slots.map(s => {
+      if (s.project_id === srcTask.projectId && s.task_id === srcTask.task.id) {
+        const tgtSlot = group.slots.find(ts => ts.project_id === tgtTask.projectId && ts.task_id === tgtTask.task.id);
+        return { ...s, position: tgtSlot?.position ?? s.position };
       }
-      showMessage(e?.message || "Failed to archive task");
-    }
-  }, [activeProjectId, selectedTask, refresh]);
-
-  const handleArchiveConfirm = useCallback(async () => {
-    if (!pendingArchiveConfirm) return;
-    try {
-      await apiArchiveTask(pendingArchiveConfirm.projectId, pendingArchiveConfirm.taskId, {
-        force: true,
-      });
-      await refresh();
-      showMessage("Task archived");
-      setSelectedBlitzTask(null);
-      setViewMode("list");
-    } catch (err) {
-      const e = err as ApiError;
-      showMessage(e?.message || "Failed to archive task");
-    } finally {
-      const ctx = pendingArchiveConfirm.context;
-      setPendingArchiveConfirm(null);
-      if (ctx === "after-merge") {
-        setMergedTaskId(null);
-        setMergedTaskName("");
-        setMergedProjectId(null);
+      if (s.project_id === tgtTask.projectId && s.task_id === tgtTask.task.id) {
+        const srcSlot = group.slots.find(ss => ss.project_id === srcTask.projectId && ss.task_id === srcTask.task.id);
+        return { ...s, position: srcSlot?.position ?? s.position };
       }
-    }
-  }, [pendingArchiveConfirm, refresh]);
+      return s;
+    }).sort((a, b) => a.position - b.position);
+    taskGroupsHook.setSlots(groupId, newSlots);
+  }, [taskGroups, getGroupTasks, taskGroupsHook]);
 
-  const handleArchiveCancel = useCallback(() => {
-    const ctx = pendingArchiveConfirm?.context;
-    setPendingArchiveConfirm(null);
-    if (ctx === "after-merge") {
-      setMergedTaskId(null);
-      setMergedTaskName("");
-      setMergedProjectId(null);
-      setSelectedBlitzTask(null);
-      setViewMode("list");
-    }
-  }, [pendingArchiveConfirm]);
-
-  const handleClean = () => {
-    setShowCleanConfirm(true);
-  };
-
-  const handleCleanConfirm = useCallback(async () => {
-    if (!activeProjectId || !selectedTask || isDeleting) return;
-    try {
-      setIsDeleting(true);
-      await apiDeleteTask(activeProjectId, selectedTask.id);
-      await refresh();
-      showMessage("Task deleted successfully");
-      setSelectedBlitzTask(null);
-      setViewMode("list");
-    } catch {
-      showMessage("Failed to delete task");
-    } finally {
-      setIsDeleting(false);
-      setShowCleanConfirm(false);
-    }
-  }, [activeProjectId, selectedTask, isDeleting, refresh]);
-
-  const handleReset = () => {
-    setShowResetConfirm(true);
-  };
-
-  const handleResetConfirm = useCallback(async () => {
-    if (!activeProjectId || !selectedTask || isResetting) return;
-    try {
-      setIsResetting(true);
-      const result = await apiResetTask(activeProjectId, selectedTask.id);
-      if (result.success) {
-        showMessage(result.message || "Task reset successfully");
-        await refresh();
-      } else {
-        showMessage(result.message || "Reset failed");
-      }
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message :
-        (err as { message?: string })?.message || "Failed to reset task";
-      showMessage(errorMessage);
-    } finally {
-      setIsResetting(false);
-      setShowResetConfirm(false);
-    }
-  }, [activeProjectId, selectedTask, isResetting, refresh]);
-
-  // Context menu
+  // Context menu handler (Blitz-specific: handle BlitzTask)
   const handleContextMenu = useCallback((bt: BlitzTask, e: React.MouseEvent) => {
     e.preventDefault();
     setSelectedBlitzTask(bt);
-    setContextMenu({ task: bt.task, position: { x: e.clientX, y: e.clientY } });
-  }, []);
+    pageHandlers.handleContextMenu(bt.task, e);
+  }, [pageHandlers]);
 
-  const closeContextMenu = useCallback(() => {
-    setContextMenu(null);
-  }, []);
-
-  const getContextMenuItems = (task: Task): ContextMenuItem[] => {
-    const canOperate = task.status !== "broken";
-    return [
-      { id: "terminal", label: "Enter Terminal", icon: Terminal, variant: "default", onClick: () => { if (currentSelected) handleDoubleClickTask(currentSelected); } },
-      { id: "div-1", label: "", divider: true, onClick: () => {} },
-      { id: "commit", label: "Commit", icon: GitCommit, variant: "default", onClick: handleCommit },
-      { id: "rebase", label: "Rebase", icon: GitBranchPlus, variant: "default", onClick: handleRebase, disabled: !canOperate },
-      { id: "sync", label: "Sync", icon: RefreshCw, variant: "default", onClick: handleSync, disabled: !canOperate },
-      { id: "merge", label: "Merge", icon: GitMerge, variant: "default", onClick: handleMerge, disabled: !canOperate },
-      { id: "div-2", label: "", divider: true, onClick: () => {} },
-      { id: "archive", label: "Archive", icon: Archive, variant: "warning", onClick: handleArchive, disabled: task.status === "broken" },
-      { id: "reset", label: "Reset", icon: RotateCcw, variant: "warning", onClick: handleReset },
-      { id: "clean", label: "Clean", icon: Trash2, variant: "danger", onClick: handleClean },
-    ];
-  };
-
-  // --- Hotkey helpers ---
-  const selectNextTask = useCallback(() => {
-    if (displayTasks.length === 0) return;
-    const currentIndex = currentSelected
-      ? displayTasks.findIndex((bt) => bt.task.id === currentSelected.task.id && bt.projectId === currentSelected.projectId)
-      : -1;
-    const nextIndex = currentIndex < displayTasks.length - 1 ? currentIndex + 1 : 0;
-    const next = displayTasks[nextIndex];
-    setSelectedBlitzTask(next);
-    if (viewMode === "list") setViewMode("info");
-    const el = document.querySelector(`[data-task-id="${next.task.id}"]`);
-    el?.scrollIntoView({ block: "nearest" });
-  }, [displayTasks, currentSelected, viewMode]);
-
-  const selectPreviousTask = useCallback(() => {
-    if (displayTasks.length === 0) return;
-    const currentIndex = currentSelected
-      ? displayTasks.findIndex((bt) => bt.task.id === currentSelected.task.id && bt.projectId === currentSelected.projectId)
-      : -1;
-    const prevIndex = currentIndex > 0 ? currentIndex - 1 : displayTasks.length - 1;
-    const prev = displayTasks[prevIndex];
-    setSelectedBlitzTask(prev);
-    if (viewMode === "list") setViewMode("info");
-    const el = document.querySelector(`[data-task-id="${prev.task.id}"]`);
-    el?.scrollIntoView({ block: "nearest" });
-  }, [displayTasks, currentSelected, viewMode]);
-
-  const openContextMenuAtSelectedTask = useCallback(() => {
-    if (!selectedTask) return;
-    const el = document.querySelector(`[data-task-id="${selectedTask.id}"]`);
-    if (el) {
-      const rect = el.getBoundingClientRect();
-      setContextMenu({
-        task: selectedTask,
-        position: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
-      });
+  // Wrap page handlers to handle selectedBlitzTask
+  const handleCloseTask = useCallback(() => {
+    if (pageState.inWorkspace) {
+      pageHandlers.handleCloseTask();
+    } else {
+      setSelectedBlitzTask(null);
     }
-  }, [selectedTask]);
+  }, [pageState.inWorkspace, pageHandlers]);
+
+  // Handle adding panel from Info Panel (enter workspace + open panel)
+  const handleAddPanelFromInfo = useCallback((type: PanelType) => {
+    pageHandlers.setInWorkspace(true);
+    pageHandlers.setPendingPanel(type);
+  }, [pageHandlers]);
+
+  // Process pendingPanel after entering workspace
+  useEffect(() => {
+    if (pageState.inWorkspace && pageState.pendingPanel && taskViewRef.current) {
+      taskViewRef.current.addPanel(pageState.pendingPanel);
+      pageHandlers.setPendingPanel(null);
+    }
+  }, [pageState.inWorkspace, pageState.pendingPanel, pageHandlers]);
+
+  // Task navigation hook (for Blitz tasks)
+  const navHandlers = useTaskNavigation({
+    tasks: displayTasks.map(bt => bt.task),
+    selectedTask,
+    inWorkspace: pageState.inWorkspace,
+    onSelectTask: (task) => {
+      const bt = displayTasks.find(t => t.task.id === task.id);
+      if (bt) handleSelectTask(bt);
+    },
+    setContextMenu: pageHandlers.setContextMenu,
+  });
+
+  // Build context menu items
+  const contextMenuItems = useMemo(() => {
+    if (!pageState.contextMenu) return [];
+    // Find the BlitzTask to get projectType — more reliable than checking branch.
+    const ctxBlitzTask = filteredTasks.find(
+      (bt) => bt.task.id === pageState.contextMenu!.task.id,
+    );
+    const isStudioTask = ctxBlitzTask?.projectType === "studio";
+    const items = buildContextMenuItems(pageState.contextMenu.task, {
+      onEnterTerminal: () => {
+        if (currentSelected) handleDoubleClickTask(currentSelected);
+      },
+      onCommit: isStudioTask ? undefined : opsHandlers.handleCommit,
+      onRebase: isStudioTask ? undefined : opsHandlers.handleRebase,
+      onSync: isStudioTask ? undefined : opsHandlers.handleSync,
+      onMerge: isStudioTask ? undefined : opsHandlers.handleMerge,
+      onArchive: opsHandlers.handleArchive,
+      onReset: isStudioTask ? undefined : opsHandlers.handleReset,
+      onClean: isStudioTask ? undefined : opsHandlers.handleClean,
+    } as TaskOperationHandlers);
+
+    // Add "Move to group" options for all tasks
+    const task = pageState.contextMenu.task;
+    const bt = blitzTasks.find(b => b.task.id === task.id);
+    if (bt) {
+      const taskKey = `${bt.projectId}:${task.id}`;
+      // Find which group the task is currently in
+      const currentGroup = taskGroups.find(g => g.slots.some(s => `${s.project_id}:${s.task_id}` === taskKey));
+      // Show "Move to" options for groups the task is NOT in
+      const availableGroups = taskGroups.filter(g => g.id !== currentGroup?.id);
+      if (availableGroups.length > 0) {
+        items.push({ id: "div-group", label: "", divider: true, onClick: () => {} });
+        for (const group of availableGroups) {
+          const label = group.id === MAIN_GROUP_ID ? "Main" : group.id === LOCAL_GROUP_ID ? "Local" : group.name;
+          const icon = group.id === LOCAL_GROUP_ID ? Laptop : Folder;
+          items.push({
+            id: `move-to-group-${group.id}`,
+            label: `Move to ${label}`,
+            icon,
+            variant: "default" as const,
+            onClick: () => {
+              if (currentGroup) {
+                taskGroupsHook.moveTask(currentGroup.id, group.id, bt.projectId, task.id);
+              }
+            },
+          });
+        }
+      }
+    }
+    return items;
+  }, [pageState.contextMenu, opsHandlers, handleDoubleClickTask, currentSelected, taskGroups, blitzTasks, taskGroupsHook, filteredTasks]);
 
   const hasTask = !!selectedTask;
   const isActive = hasTask && selectedTask.status !== "archived";
-  const canOperate = isActive && selectedTask.status !== "broken";
-  const notTerminal = viewMode !== "terminal";
+  const canOperate = isActive;
+  const notInWorkspace = !pageState.inWorkspace;
+
+  // Workspace keyboard shortcuts (higher priority than Blitz task selection)
+  // Cmd+1-9: switch panel tabs, Cmd+W / Alt+W: close active tab
+  useEffect(() => {
+    if (!pageState.inWorkspace) return;
+    const isTauri = !!((window as Window & { __TAURI__?: unknown }).__TAURI__);
+    const handler = (e: KeyboardEvent) => {
+      if (e.metaKey && !e.altKey && !e.ctrlKey && e.key >= "1" && e.key <= "9") {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        taskViewRef.current?.selectTabByIndex(parseInt(e.key) - 1);
+        return;
+      }
+      const isCloseTab = (isTauri && e.metaKey && e.code === "KeyW")
+        || (e.altKey && !e.metaKey && e.code === "KeyW");
+      if (isCloseTab) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        taskViewRef.current?.closeActiveTab();
+      }
+    };
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [pageState.inWorkspace]);
 
   useHotkeys(
     [
-      { key: "j", handler: selectNextTask, options: { enabled: notTerminal } },
-      { key: "ArrowDown", handler: selectNextTask, options: { enabled: notTerminal } },
-      { key: "k", handler: selectPreviousTask, options: { enabled: notTerminal } },
-      { key: "ArrowUp", handler: selectPreviousTask, options: { enabled: notTerminal } },
+      { key: "j", handler: navHandlers.selectNextTask, options: { enabled: notInWorkspace } },
+      { key: "ArrowDown", handler: navHandlers.selectNextTask, options: { enabled: notInWorkspace } },
+      { key: "k", handler: navHandlers.selectPreviousTask, options: { enabled: notInWorkspace } },
+      { key: "ArrowUp", handler: navHandlers.selectPreviousTask, options: { enabled: notInWorkspace } },
       {
         key: "Enter",
         handler: () => {
-          if (viewMode === "info" && selectedTask && selectedTask.status !== "archived") {
-            handleEnterTerminal();
-          } else if (viewMode === "list" && selectedTask) {
-            setViewMode("info");
+          if (!pageState.inWorkspace && selectedTask && selectedTask.status !== "archived") {
+            pageHandlers.handleEnterWorkspace();
           }
         },
-        options: { enabled: notTerminal && hasTask },
+        options: { enabled: notInWorkspace && hasTask },
       },
-      { key: "Escape", handler: handleCloseTask, options: { enabled: viewMode !== "list" } },
+      { key: "Escape", handler: handleCloseTask, options: { enabled: pageState.inWorkspace || hasTask } },
 
-      // Info panel tabs
-      { key: "1", handler: () => setInfoPanelTab("stats"), options: { enabled: notTerminal && hasTask } },
-      { key: "2", handler: () => setInfoPanelTab("git"), options: { enabled: notTerminal && hasTask } },
-      { key: "3", handler: () => setInfoPanelTab("notes"), options: { enabled: notTerminal && hasTask } },
-      { key: "4", handler: () => setInfoPanelTab("comments"), options: { enabled: notTerminal && hasTask } },
+      // Info panel tabs (only in Task List page)
+      { key: "1", handler: () => pageHandlers.setInfoPanelTab("stats"), options: { enabled: notInWorkspace && hasTask } },
+      { key: "2", handler: () => pageHandlers.setInfoPanelTab("git"), options: { enabled: notInWorkspace && hasTask } },
+      { key: "3", handler: () => pageHandlers.setInfoPanelTab("notes"), options: { enabled: notInWorkspace && hasTask } },
+      { key: "4", handler: () => pageHandlers.setInfoPanelTab("comments"), options: { enabled: notInWorkspace && hasTask } },
 
-      // Actions (no 'n' for new task)
-      { key: "Space", handler: openContextMenuAtSelectedTask, options: { enabled: hasTask && notTerminal } },
-      { key: "c", handler: handleCommit, options: { enabled: isActive } },
-      { key: "s", handler: handleSync, options: { enabled: canOperate } },
-      { key: "m", handler: handleMerge, options: { enabled: canOperate } },
-      { key: "b", handler: handleRebase, options: { enabled: canOperate } },
-      { key: "r", handler: handleReviewShortcut, options: { enabled: isActive } },
-      { key: "e", handler: handleEditorShortcut, options: { enabled: isActive } },
-      { key: "t", handler: handleTerminalShortcut, options: { enabled: isActive } },
-      // Dangerous operations removed from hotkeys - use menu instead
-      // Archive, Clean, Reset are too dangerous for accidental press
+      // Actions (no 'n' for new task in Blitz)
+      { key: "Space", handler: navHandlers.openContextMenuAtSelectedTask, options: { enabled: hasTask && notInWorkspace } },
+      // Panel shortcuts in the task-LIST view: enter workspace + open panel.
+      // In-workspace panel + git op shortcuts are registered by TaskView
+      // itself so every host page has consistent behavior.
+      { key: "r", handler: () => handleAddPanelFromInfo("review"), options: { enabled: hasTask && isActive && notInWorkspace } },
+      { key: "e", handler: () => handleAddPanelFromInfo("editor"), options: { enabled: hasTask && isActive && notInWorkspace } },
+      { key: "i", handler: () => handleAddPanelFromInfo("chat"), options: { enabled: hasTask && isActive && notInWorkspace } },
+      { key: "t", handler: () => handleAddPanelFromInfo("terminal"), options: { enabled: hasTask && isActive && notInWorkspace } },
 
       // Search
-      { key: "/", handler: () => searchInputRef.current?.focus(), options: { enabled: notTerminal } },
+      { key: "/", handler: () => searchInputRef.current?.focus(), options: { enabled: notInWorkspace } },
 
-      // Help
-      { key: "?", handler: () => setShowHelp((v) => !v) },
     ],
     [
-      selectNextTask, selectPreviousTask, handleCloseTask,
-      handleEnterTerminal, openContextMenuAtSelectedTask,
-      handleCommit, handleSync, handleMerge, handleRebase,
-      handleReviewShortcut, handleEditorShortcut, handleTerminalShortcut,
-      viewMode, selectedTask, hasTask, isActive, canOperate, notTerminal,
-      reviewOpen, editorOpen,
+      navHandlers, pageHandlers, opsHandlers, handleCloseTask, handleAddPanelFromInfo, refresh,
+      pageState.inWorkspace, pageState.showHelp, selectedTask, hasTask, isActive, canOperate, notInWorkspace,
     ]
   );
 
-  const isTerminalMode = viewMode === "terminal";
-  const isInfoMode = viewMode === "info";
+  // Register page-level commands for Cmd+K command palette
+  const {
+    registerPageCommands,
+    unregisterPageCommands,
+    setInWorkspace: setContextInWorkspace,
+    setPageContext,
+  } = useCommandPalette();
+
+  useEffect(() => {
+    setContextInWorkspace(pageState.inWorkspace);
+    setPageContext(pageState.inWorkspace ? "workspace" : "tasks");
+    return () => {
+      setContextInWorkspace(false);
+      setPageContext("default");
+    };
+  }, [pageState.inWorkspace, setContextInWorkspace, setPageContext]);
+  const pageOptionsRef = useRef<Parameters<typeof buildCommands>[0]>(null!);
+  useEffect(() => {
+    pageOptionsRef.current = {
+      taskActions: {
+        selectedTask: selectedTask ?? null,
+        inWorkspace: pageState.inWorkspace,
+        opsHandlers,
+        onEnterWorkspace: pageHandlers.handleEnterWorkspace,
+        onOpenPanel: (panel) => handleAddPanelFromInfo(panel as PanelType),
+        onSwitchInfoTab: pageHandlers.setInfoPanelTab,
+        onRefresh: refresh,
+      },
+    };
+  });
+
+  useEffect(() => {
+    registerPageCommands(() => buildCommands(pageOptionsRef.current));
+    return () => unregisterPageCommands();
+  }, [registerPageCommands, unregisterPageCommands]);
+
+  const handleMobileBack = useCallback(() => {
+    if (pageState.inWorkspace) {
+      pageHandlers.setInWorkspace(false);
+    } else {
+      setMobileShowDetail(false);
+    }
+  }, [pageState.inWorkspace, pageHandlers]);
 
   return (
     <>
-      {/* Blitz Sidebar — replaces the normal app sidebar */}
-      <aside className="w-72 h-screen bg-[var(--color-bg)] border-r border-[var(--color-border)] flex flex-col flex-shrink-0">
-        {/* Logo + Mode Brand */}
-        <div className="p-4">
+      {/* Blitz Sidebar — replaces the normal app sidebar.
+         Desktop: floating glass-panel matching the Zen sidebar (top-3/left-3/
+         bottom-3, w-72, rounded-2xl, z-40). Mobile keeps the original
+         full-screen list-detail toggle since the floating-panel pattern
+         doesn't fit small viewports. */}
+      <aside
+        className={
+          isMobile
+            ? `${mobileShowDetail ? "hidden" : "w-full h-full"} bg-[var(--color-bg)] flex flex-col flex-shrink-0`
+            : "blitz-area glass-panel fixed top-3 bottom-3 left-3 w-72 z-40 rounded-2xl flex flex-col"
+        }
+      >
+        {/* Logo + Mode Brand
+           pt-8 clears macOS traffic lights when Tauri title bar is Overlay.
+           data-tauri-drag-region gives double-click-maximize; data-window-drag-strip
+           is what the App.tsx native mousedown listener uses to call startDragging()
+           (the bare data-tauri-drag-region silently fails after the first drag when
+           the webview is loaded from http://localhost). */}
+        <div className="px-4 pt-8 pb-4 flex items-center justify-between" data-tauri-drag-region data-window-drag-strip>
           <LogoBrand mode="blitz" onToggle={onSwitchToZen} />
+          <button
+            onClick={() => setShowRadioConnect(true)}
+            className={`relative flex items-center gap-1.5 px-2.5 py-1.5 text-xs border rounded-lg transition-colors ${
+              radioConnected
+                ? "text-[var(--color-success)] border-[var(--color-success)]/30 bg-[var(--color-success)]/10 hover:bg-[var(--color-success)]/20"
+                : "text-[var(--color-text-muted)] hover:text-[var(--color-text)] bg-[var(--color-bg-secondary)] hover:bg-[var(--color-bg-tertiary)] border-[var(--color-border)]"
+            }`}
+            title={radioConnected ? `Radio Connected (${radioClients} device${radioClients > 1 ? "s" : ""})` : "Connect Radio (Walkie-Talkie)"}
+          >
+            <Radio className="w-3.5 h-3.5" />
+            Radio
+            {radioConnected && (
+              <span className="w-1.5 h-1.5 rounded-full bg-[var(--color-success)] animate-pulse" />
+            )}
+          </button>
         </div>
 
         {/* Search */}
-        <div className="p-3 border-b border-[var(--color-border)]">
+        <div className="px-3 pt-3 pb-2 border-b border-[var(--color-border)]">
           <div className="relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--color-text-muted)]" />
             <input
               ref={searchInputRef}
               type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              value={pageState.searchQuery}
+              onChange={(e) => pageHandlers.setSearchQuery(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Escape") {
                   e.preventDefault();
-                  setSearchQuery("");
+                  pageHandlers.setSearchQuery("");
                   (e.target as HTMLInputElement).blur();
                 }
               }}
@@ -817,6 +787,7 @@ export function BlitzPage({ onSwitchToZen }: BlitzPageProps) {
                 transition-all duration-200"
             />
           </div>
+
         </div>
 
         {/* Task List */}
@@ -861,44 +832,305 @@ export function BlitzPage({ onSwitchToZen }: BlitzPageProps) {
             </div>
           ) : (
             <div className="flex flex-col gap-1.5 px-2 py-1">
-              {displayTasks.map((bt, index) => {
-                const notif = getTaskNotification(bt.task.id);
-                const isThisSelected =
-                  currentSelected?.task.id === bt.task.id &&
-                  currentSelected?.projectId === bt.projectId;
-                return (
-                  <motion.div
-                    key={`${bt.projectId}-${bt.task.id}`}
-                    initial={{ opacity: 0, x: -16 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    transition={{
-                      opacity: { delay: index * 0.06, duration: 0.35 },
-                      x: { delay: index * 0.06, duration: 0.35, ease: [0.22, 1, 0.36, 1] },
-                    }}
-                  >
-                    <BlitzTaskListItem
-                      blitzTask={bt}
-                      isSelected={isThisSelected}
-                      onClick={() => {
-                        if (notif) {
-                          dismissNotification(notif.project_id, notif.task_id);
-                        }
-                        handleSelectTask(bt);
+              {/* Main task list — universal drop zone */}
+              <div
+                ref={mainListRef}
+                onDragOver={(e) => handleZoneDragOver(e, "main", MAIN_GROUP_ID)}
+                onDrop={handleDrop}
+                onDragLeave={handleDragLeave}
+                className={`flex flex-col gap-1.5 rounded-lg transition-colors ${
+                  dragState.source && dragState.source !== "main" && dragState.overZone === "main" ? "bg-[var(--color-accent)]/5 ring-1 ring-[var(--color-accent)]/20 p-1" : ""
+                }`}
+              >
+                {mainListTasks.map((bt, index) => {
+                  const notif = getTaskNotification(bt.task.id);
+                  const taskKey = `${bt.projectId}:${bt.task.id}`;
+                  const isThisSelected =
+                    currentSelected?.task.id === bt.task.id &&
+                    currentSelected?.projectId === bt.projectId;
+                  return (
+                    <motion.div
+                      key={`${bt.projectId}-${bt.task.id}`}
+                      initial={{ opacity: 0, x: -16 }}
+                      animate={{ opacity: 1, x: 0 }}
+                      transition={{
+                        opacity: { delay: index * 0.06, duration: 0.35 },
+                        x: { delay: index * 0.06, duration: 0.35, ease: [0.22, 1, 0.36, 1] },
                       }}
-                      onDoubleClick={() => handleDoubleClickTask(bt)}
-                      onContextMenu={(e) => handleContextMenu(bt, e)}
-                      notification={notif ? { level: notif.level } : undefined}
-                      shortcutNumber={index < 10 ? (index === 9 ? 0 : index + 1) : undefined}
-                      onDragStart={() => handleDragStart(index)}
-                      onDragOver={() => handleDragOver(index)}
-                      onDragEnd={handleDragEnd}
-                      onDragLeave={handleDragLeave}
-                      isDragging={draggedIndex === index}
-                      isDragOver={dragOverIndex === index}
-                    />
-                  </motion.div>
+                    >
+                      <BlitzTaskListItem
+                        blitzTask={bt}
+                        isSelected={isThisSelected}
+                        onClick={() => {
+                          if (notif) {
+                            dismissNotification(notif.project_id, notif.task_id);
+                          }
+                          handleSelectTask(bt);
+                        }}
+                        onDoubleClick={() => handleDoubleClickTask(bt)}
+                        onContextMenu={(e) => handleContextMenu(bt, e)}
+                        notification={notif ? { level: notif.level } : undefined}
+                        shortcutNumber={index < 10 ? (index === 9 ? 0 : index + 1) : undefined}
+                        onDragStart={() => startDrag("main", index, taskKey, MAIN_GROUP_ID)}
+                        onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "main", index, MAIN_GROUP_ID)}
+                        onDragEnd={clearDrag}
+                        onDragLeave={handleDragLeave}
+                        isDragging={dragState.taskKey === taskKey && dragState.source === "main"}
+                        isDragOver={dragState.overZone === "main" && dragState.overIndex === index}
+                        onMoveUp={() => handleMoveTask(MAIN_GROUP_ID, index, "up")}
+                        onMoveDown={() => handleMoveTask(MAIN_GROUP_ID, index, "down")}
+                        isFirst={index === 0}
+                        isLast={index === mainListTasks.length - 1}
+                      />
+                    </motion.div>
+                  );
+                })}
+              </div>
+
+              {/* TaskGroup Folders */}
+              {customGroups.map((group) => {
+                const groupTasks = getGroupTasks(group);
+                const isExpanded = expandedGroups.has(group.id);
+                const isDragOverThis = dragState.overZone === "group" && dragState.overGroupId === group.id;
+                return (
+                  <div
+                    key={group.id}
+                    className={`mt-1 rounded-lg transition-colors ${
+                      isDragOverThis ? "bg-[var(--color-highlight)]/10 ring-1 ring-[var(--color-highlight)]/30" : ""
+                    }`}
+                    onDragOver={(e) => handleZoneDragOver(e, "group", group.id)}
+                    onDrop={handleDrop}
+                    onDragLeave={handleDragLeave}
+                  >
+                    {editingGroupId === group.id ? (
+                      <div className="flex items-center gap-2 px-3 py-2">
+                        <Folder className="w-3.5 h-3.5 text-[var(--color-highlight)]" />
+                        <input
+                          ref={editGroupInputRef}
+                          type="text"
+                          value={editingGroupName}
+                          onChange={(e) => setEditingGroupName(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && editingGroupName.trim()) {
+                              updateTaskGroup(group.id, { name: editingGroupName.trim() });
+                              setEditingGroupId(null);
+                            } else if (e.key === "Escape") {
+                              setEditingGroupId(null);
+                            }
+                          }}
+                          onBlur={() => {
+                            if (editingGroupName.trim() && editingGroupName.trim() !== group.name) {
+                              updateTaskGroup(group.id, { name: editingGroupName.trim() });
+                            }
+                            setEditingGroupId(null);
+                          }}
+                          autoFocus
+                          className="flex-1 min-w-0 px-2 py-0.5 rounded-md text-xs bg-[var(--color-bg)] border border-[var(--color-highlight)] text-[var(--color-text)] outline-none"
+                        />
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => toggleGroupExpanded(group.id)}
+                        onDoubleClick={() => {
+                          setEditingGroupId(group.id);
+                          setEditingGroupName(group.name);
+                          setTimeout(() => editGroupInputRef.current?.select(), 50);
+                        }}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          setGroupFolderContextMenu({
+                            id: group.id,
+                            name: group.name,
+                            position: { x: e.clientX, y: e.clientY },
+                          });
+                        }}
+                        className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+                        title="Double-click to rename, right-click for options"
+                      >
+                        <motion.span
+                          animate={{ rotate: isExpanded ? 90 : 0 }}
+                          transition={{ duration: 0.15 }}
+                        >
+                          <ChevronRight className="w-3.5 h-3.5" />
+                        </motion.span>
+                        <Folder className="w-3.5 h-3.5 text-[var(--color-highlight)]" />
+                        <span>{group.name}</span>
+                        <span className="ml-auto px-1.5 py-0.5 rounded-full bg-[var(--color-bg-tertiary)] text-[10px]">
+                          {groupTasks.length}
+                        </span>
+                      </button>
+                    )}
+                    <AnimatePresence>
+                      {isExpanded && (
+                        <motion.div
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: "auto", opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+                          className="overflow-hidden"
+                        >
+                          <div className="flex flex-col gap-1.5 pt-1.5 pl-2">
+                            {groupTasks.length === 0 ? (
+                              <div className="px-3 py-2 text-[10px] text-[var(--color-text-muted)] italic">
+                                Drop tasks here to add them to this group
+                              </div>
+                            ) : (
+                              groupTasks.map((bt, gIdx) => {
+                                const notif = getTaskNotification(bt.task.id);
+                                const isThisSelected =
+                                  currentSelected?.task.id === bt.task.id &&
+                                  currentSelected?.projectId === bt.projectId;
+                                const taskKey = `${bt.projectId}:${bt.task.id}`;
+                                return (
+                                  <BlitzTaskListItem
+                                    key={`group-${group.id}-${bt.projectId}-${bt.task.id}`}
+                                    blitzTask={bt}
+                                    isSelected={isThisSelected}
+                                    onClick={() => {
+                                      if (notif) {
+                                        dismissNotification(notif.project_id, notif.task_id);
+                                      }
+                                      handleSelectTask(bt);
+                                    }}
+                                    onDoubleClick={() => handleDoubleClickTask(bt)}
+                                    onContextMenu={(e) => handleContextMenu(bt, e)}
+                                    notification={notif ? { level: notif.level } : undefined}
+                                    onDragStart={() => startDrag("group", gIdx, taskKey, group.id)}
+                                    onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "group", gIdx, group.id)}
+                                    onDragEnd={clearDrag}
+                                    onDragLeave={handleDragLeave}
+                                    isDragging={dragState.taskKey === taskKey && dragState.source === "group"}
+                                    isDragOver={dragState.overZone === "group" && dragState.overGroupId === group.id && dragState.overIndex === gIdx}
+                                  />
+                                );
+                              })
+                            )}
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
                 );
               })}
+
+              {/* New group button / input */}
+              <div className="mt-1">
+                {showNewGroupInput ? (
+                  <div className="flex items-center gap-2 px-3 py-2">
+                    <Folder className="w-3.5 h-3.5 text-[var(--color-highlight)]" />
+                    <input
+                      ref={newGroupInputRef}
+                      type="text"
+                      value={newGroupName}
+                      onChange={(e) => setNewGroupName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && newGroupName.trim()) {
+                          createTaskGroup(newGroupName.trim());
+                          setNewGroupName("");
+                          setShowNewGroupInput(false);
+                        } else if (e.key === "Escape") {
+                          setNewGroupName("");
+                          setShowNewGroupInput(false);
+                        }
+                      }}
+                      onBlur={() => {
+                        if (newGroupName.trim()) {
+                          createTaskGroup(newGroupName.trim());
+                        }
+                        setNewGroupName("");
+                        setShowNewGroupInput(false);
+                      }}
+                      placeholder="Group name..."
+                      autoFocus
+                      className="flex-1 min-w-0 px-2 py-0.5 rounded-md text-xs bg-[var(--color-bg)] border border-[var(--color-highlight)] text-[var(--color-text)] outline-none"
+                    />
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => {
+                      setShowNewGroupInput(true);
+                      setTimeout(() => newGroupInputRef.current?.focus(), 50);
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-[var(--color-text-muted)] hover:text-[var(--color-highlight)] hover:bg-[var(--color-bg-tertiary)] border border-dashed border-transparent hover:border-[var(--color-highlight)]/30 transition-all"
+                    title="Create new group"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>New group</span>
+                  </button>
+                )}
+              </div>
+
+              {/* Collapsible Local Tasks folder */}
+              {folderLocalTasks.length > 0 && (
+                <div
+                  className={`mt-1 rounded-lg transition-colors ${
+                    dragState.overZone === "local" ? "bg-[var(--color-accent)]/10 ring-1 ring-[var(--color-accent)]/30" : ""
+                  }`}
+                  onDragOver={(e) => handleZoneDragOver(e, "local", LOCAL_GROUP_ID)}
+                  onDrop={handleDrop}
+                  onDragLeave={handleDragLeave}
+                >
+                  <button
+                    onClick={() => setLocalTasksExpanded(!localTasksExpanded)}
+                    className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+                  >
+                    <motion.span
+                      animate={{ rotate: localTasksExpanded ? 90 : 0 }}
+                      transition={{ duration: 0.15 }}
+                    >
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </motion.span>
+                    <Laptop className="w-3.5 h-3.5 text-[var(--color-accent)]" />
+                    <span>Local</span>
+                    <span className="ml-auto px-1.5 py-0.5 rounded-full bg-[var(--color-bg-tertiary)] text-[10px]">
+                      {folderLocalTasks.length}
+                    </span>
+                  </button>
+                  <AnimatePresence>
+                    {localTasksExpanded && (
+                      <motion.div
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: "auto", opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+                        className="overflow-hidden"
+                      >
+                        <div className="flex flex-col gap-1.5 pt-1.5">
+                          {folderLocalTasks.map((bt, index) => {
+                            const notif = getTaskNotification(bt.task.id);
+                            const taskKey = `${bt.projectId}:${bt.task.id}`;
+                            const isThisSelected =
+                              currentSelected?.task.id === bt.task.id &&
+                              currentSelected?.projectId === bt.projectId;
+                            return (
+                              <BlitzTaskListItem
+                                key={`${bt.projectId}-${bt.task.id}`}
+                                blitzTask={bt}
+                                isSelected={isThisSelected}
+                                onClick={() => {
+                                  if (notif) {
+                                    dismissNotification(notif.project_id, notif.task_id);
+                                  }
+                                  handleSelectTask(bt);
+                                }}
+                                onDoubleClick={() => handleDoubleClickTask(bt)}
+                                onContextMenu={(e) => handleContextMenu(bt, e)}
+                                notification={notif ? { level: notif.level } : undefined}
+                                onDragStart={() => startDrag("local", index, taskKey, LOCAL_GROUP_ID)}
+                                onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "local", index, LOCAL_GROUP_ID)}
+                                onDragEnd={clearDrag}
+                                onDragLeave={handleDragLeave}
+                                isDragging={dragState.taskKey === taskKey && dragState.source === "local"}
+                                isDragOver={dragState.overZone === "local" && dragState.overIndex === index}
+                              />
+                            );
+                          })}
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -906,7 +1138,7 @@ export function BlitzPage({ onSwitchToZen }: BlitzPageProps) {
         {/* Help shortcut hint */}
         <div className="px-3 py-2 border-t border-[var(--color-border)]">
           <button
-            onClick={() => setShowHelp(true)}
+            onClick={() => window.dispatchEvent(new Event("grove:open-help"))}
             className="w-full text-center text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
           >
             Press <kbd className="px-1 py-0.5 text-[10px] font-mono rounded border bg-[var(--color-bg-secondary)] border-[var(--color-border)]">?</kbd> for shortcuts
@@ -914,56 +1146,85 @@ export function BlitzPage({ onSwitchToZen }: BlitzPageProps) {
         </div>
       </aside>
 
-      {/* Main Content */}
-      <main className="flex-1 overflow-hidden relative">
-        {/* Aurora background */}
-        <div className="absolute inset-0 pointer-events-none overflow-hidden">
-          <div
-            className="absolute -inset-[50%] opacity-[0.25] animate-[aurora_20s_ease-in-out_infinite]"
-            style={{
-              background: "conic-gradient(from 0deg at 50% 50%, #f59e0b, #8b5cf6, #06b6d4, #10b981, #f59e0b)",
-              filter: "blur(50px)",
-            }}
-          />
-        </div>
-        <div className="h-full p-6 relative z-[1]">
+      {/* Main Content
+         Desktop: floating card mirroring the sidebar. Uses flex+margin
+         instead of `fixed` because BlitzPage's internal task-detail /
+         workspace transitions rely on `absolute inset-0` motion divs —
+         turning main into `fixed` breaks the containing-block chain for
+         those motion children and leaves the main area blank. ml-[312px]
+         clears the fixed sidebar (left-3 + w-72 + 12px buffer = 12+288+12);
+         mt/mr/mb give the same 12px gap as the sidebar. Mobile keeps the original
+         flex layout since the sidebar there is full-screen, not floating. */}
+      <main
+        className={
+          isMobile
+            ? `flex-1 overflow-hidden relative ${!mobileShowDetail ? "hidden" : ""}`
+            : "blitz-area flex-1 ml-[312px] mt-3 mr-3 mb-3 rounded-2xl bg-[var(--color-bg)] overflow-hidden relative"
+        }
+        style={
+          isMobile
+            ? undefined
+            : {
+                boxShadow:
+                  "0 1px 3px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.06), 0 0 0 1px color-mix(in oklab, var(--color-border) 35%, transparent)",
+              }
+        }
+      >
+        {/* Mobile back button */}
+        {isMobile && mobileShowDetail && (
+          <div className="absolute top-2 left-2 z-10">
+            <button
+              onClick={handleMobileBack}
+              className="flex items-center gap-1 px-2 py-1 text-sm text-[var(--color-text-muted)] hover:text-[var(--color-text)] bg-[var(--color-bg)]/80 backdrop-blur rounded-lg transition-colors"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              Back
+            </button>
+          </div>
+        )}
+        {/* Hairline inner padding so child content doesn't get clipped by
+           the main card's rounded-2xl corners. Matches Zen's workspace-mode
+           p-2 (8px); Zen's non-workspace pages use p-6 instead. Blitz uses
+           the same p-2 across all states because every Blitz inner view is
+           a task-centric panel (no "breathing-room dashboard" page like Zen
+           has). */}
+        <div className="h-full relative p-2">
           <div className="h-full relative">
-            {/* List + Info Mode */}
+            {/* Task List Page */}
             <motion.div
               animate={{
-                opacity: isTerminalMode ? 0 : 1,
-                x: isTerminalMode ? -20 : 0,
+                opacity: pageState.inWorkspace ? 0 : 1,
+                x: pageState.inWorkspace ? -20 : 0,
               }}
               transition={{ type: "spring", damping: 25, stiffness: 200 }}
-              className={`absolute inset-0 ${isTerminalMode ? "pointer-events-none" : ""}`}
+              className={`absolute inset-0 ${pageState.inWorkspace ? "pointer-events-none" : ""}`}
             >
               <AnimatePresence mode="wait">
-                {isInfoMode && currentSelected ? (
+                {!pageState.inWorkspace && currentSelected ? (
                   <motion.div
                     key="info-panel"
                     initial={{ opacity: 0, x: 20 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 20 }}
                     transition={{ type: "spring", damping: 25, stiffness: 200 }}
-                    className="h-full"
+                    className="h-full min-w-0"
                   >
                     <TaskInfoPanel
                       projectId={currentSelected.projectId}
                       task={currentSelected.task}
                       projectName={currentSelected.projectName}
                       onClose={handleCloseTask}
-                      onEnterTerminal={currentSelected.task.status !== "archived" ? handleEnterTerminal : undefined}
-                      onClean={handleClean}
-                      onCommit={currentSelected.task.status !== "archived" ? handleCommit : undefined}
-                      onReview={currentSelected.task.status !== "archived" ? handleReviewFromInfo : undefined}
-                      onEditor={currentSelected.task.status !== "archived" ? handleEditorFromInfo : undefined}
-                      onRebase={currentSelected.task.status !== "archived" ? handleRebase : undefined}
-                      onSync={currentSelected.task.status !== "archived" ? handleSync : undefined}
-                      onMerge={currentSelected.task.status !== "archived" ? handleMerge : undefined}
-                      onArchive={currentSelected.task.status !== "archived" ? handleArchive : undefined}
-                      onReset={currentSelected.task.status !== "archived" ? handleReset : undefined}
-                      activeTab={infoPanelTab}
-                      onTabChange={setInfoPanelTab}
+                      onEnterWorkspace={currentSelected.task.status !== "archived" ? pageHandlers.handleEnterWorkspace : undefined}
+                      onAddPanel={currentSelected.task.status !== "archived" ? handleAddPanelFromInfo : undefined}
+                      onClean={isStudioTask ? undefined : opsHandlers.handleClean}
+                      onCommit={isStudioTask ? undefined : (currentSelected.task.status !== "archived" ? opsHandlers.handleCommit : undefined)}
+                      onRebase={isStudioTask ? undefined : (currentSelected.task.status !== "archived" ? opsHandlers.handleRebase : undefined)}
+                      onSync={isStudioTask ? undefined : (currentSelected.task.status !== "archived" ? opsHandlers.handleSync : undefined)}
+                      onMerge={isStudioTask ? undefined : (currentSelected.task.status !== "archived" ? opsHandlers.handleMerge : undefined)}
+                      onArchive={currentSelected.task.status !== "archived" ? opsHandlers.handleArchive : undefined}
+                      onReset={isStudioTask ? undefined : (currentSelected.task.status !== "archived" ? opsHandlers.handleReset : undefined)}
+                      activeTab={pageState.infoPanelTab}
+                      onTabChange={pageHandlers.setInfoPanelTab}
                     />
                   </motion.div>
                 ) : (
@@ -972,7 +1233,7 @@ export function BlitzPage({ onSwitchToZen }: BlitzPageProps) {
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
                     exit={{ opacity: 0 }}
-                    className="h-full flex items-center justify-center rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)]"
+                    className="h-full flex items-center justify-center"
                   >
                     <div className="text-center">
                       <p className="text-[var(--color-text-muted)] mb-2">
@@ -987,40 +1248,32 @@ export function BlitzPage({ onSwitchToZen }: BlitzPageProps) {
               </AnimatePresence>
             </motion.div>
 
-            {/* Terminal Mode */}
-            <AnimatePresence>
-              {isTerminalMode && currentSelected && (
+            {/* Workspace Page */}
+            <AnimatePresence mode="popLayout">
+              {pageState.inWorkspace && currentSelected && (
                 <motion.div
-                  initial={{ x: "100%", opacity: 0 }}
-                  animate={{ x: 0, opacity: 1 }}
-                  exit={{ x: "100%", opacity: 0 }}
-                  transition={{ type: "spring", damping: 25, stiffness: 200 }}
-                  className="absolute inset-0 flex gap-3"
+                  key={currentSelected.task.id}
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.15 }}
+                  className="absolute inset-0"
                 >
-                  <TaskInfoPanel
-                    projectId={currentSelected.projectId}
-                    task={currentSelected.task}
-                    projectName={currentSelected.projectName}
-                    onClose={handleCloseTask}
-                    isTerminalMode
-                  />
                   <TaskView
+                    ref={taskViewCallbackRef}
                     projectId={currentSelected.projectId}
                     task={currentSelected.task}
                     projectName={currentSelected.projectName}
-                    reviewOpen={reviewOpen}
-                    editorOpen={editorOpen}
-                    onToggleReview={handleToggleReview}
-                    onToggleEditor={handleToggleEditor}
-                    onCommit={handleCommit}
-                    onRebase={handleRebase}
-                    onSync={handleSync}
-                    onMerge={handleMerge}
-                    onArchive={handleArchive}
-                    onClean={handleClean}
-                    onReset={handleReset}
-                    onStartSession={handleStartSession}
-                    onTerminalConnected={handleTerminalConnected}
+                    fullscreen={isFullscreen}
+                    onFullscreenChange={setIsFullscreen}
+                    onBack={handleCloseTask}
+                    onCommit={isStudioTask ? undefined : opsHandlers.handleCommit}
+                    onRebase={isStudioTask ? undefined : opsHandlers.handleRebase}
+                    onSync={isStudioTask ? undefined : opsHandlers.handleSync}
+                    onMerge={isStudioTask ? undefined : opsHandlers.handleMerge}
+                    onArchive={opsHandlers.handleArchive}
+                    onClean={isStudioTask ? undefined : opsHandlers.handleClean}
+                    onReset={isStudioTask ? undefined : opsHandlers.handleReset}
                   />
                 </motion.div>
               )}
@@ -1031,61 +1284,69 @@ export function BlitzPage({ onSwitchToZen }: BlitzPageProps) {
 
       {/* Toast */}
       <AnimatePresence>
-        {operationMessage && (
+        {pageState.operationMessage && (
           <motion.div
             initial={{ opacity: 0, y: -20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -20 }}
             className="fixed top-4 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-lg bg-[var(--color-bg-secondary)] border border-[var(--color-border)] shadow-lg"
           >
-            <span className="text-sm text-[var(--color-text)]">{operationMessage}</span>
+            <span className="text-sm text-[var(--color-text)]">{pageState.operationMessage}</span>
           </motion.div>
         )}
       </AnimatePresence>
 
       {/* Dialogs */}
       <CommitDialog
-        isOpen={showCommitDialog}
-        isLoading={isCommitting}
-        error={commitError}
-        onCommit={handleCommitSubmit}
-        onCancel={() => { setShowCommitDialog(false); setCommitError(null); }}
+        isOpen={opsState.showCommitDialog}
+        isLoading={opsState.isCommitting}
+        error={opsState.commitError}
+        onCommit={opsHandlers.handleCommitSubmit}
+        onCancel={opsHandlers.handleCommitCancel}
       />
 
       <MergeDialog
-        isOpen={showMergeDialog}
+        isOpen={opsState.showMergeDialog}
         taskName={selectedTask?.name || ""}
         branchName={selectedTask?.branch || ""}
         targetBranch={selectedTask?.target || ""}
-        isLoading={isMerging}
-        error={mergeError}
-        onMerge={handleMergeSubmit}
-        onCancel={() => { setShowMergeDialog(false); setMergeError(null); }}
+        isLoading={opsState.isMerging}
+        error={opsState.mergeError}
+        onMerge={opsHandlers.handleMergeSubmit}
+        onCancel={opsHandlers.handleMergeCancel}
       />
 
       <ConfirmDialog
-        isOpen={showCleanConfirm}
+        isOpen={opsState.showCleanConfirm}
         title="Delete Task"
         message={`Are you sure you want to delete "${selectedTask?.name}"? This will remove the worktree and all associated data. This action cannot be undone.`}
-        confirmLabel={isDeleting ? "Deleting..." : "Delete"}
+        confirmLabel={opsState.isDeleting ? "Deleting..." : "Delete"}
         variant="danger"
-        onConfirm={handleCleanConfirm}
-        onCancel={() => setShowCleanConfirm(false)}
+        onConfirm={opsHandlers.handleCleanConfirm}
+        onCancel={opsHandlers.handleCleanCancel}
       />
 
       <ConfirmDialog
-        isOpen={showArchiveAfterMerge}
-        title="Success"
-        message={[
-          "Merged successfully!",
-          "",
-          `Task: ${mergedTaskName}`,
-          "",
-          "Archive this task?",
-        ].join("\n")}
+        isOpen={postMergeState.showArchiveAfterMerge}
+        title="Merge Complete"
+        message={
+          <div className="flex flex-col gap-4">
+            <div className="bg-[var(--color-bg-tertiary)] rounded-lg p-3">
+              <div className="flex justify-between text-sm">
+                <span className="text-[var(--color-text-muted)]">Task</span>
+                <span className="text-[var(--color-text)] font-medium">{postMergeState.mergedTaskName}</span>
+              </div>
+            </div>
+            <p className="text-sm text-[var(--color-text-muted)]">
+              Would you like to archive this task?
+            </p>
+          </div>
+        }
         variant="info"
-        onConfirm={handleArchiveAfterMerge}
-        onCancel={handleSkipArchive}
+        confirmLabel="Archive"
+        cancelLabel="Later"
+        onConfirm={postMergeHandlers.handleArchiveAfterMerge}
+        onCancel={postMergeHandlers.handleSkipArchive}
       />
 
       <ConfirmDialog
@@ -1093,36 +1354,92 @@ export function BlitzPage({ onSwitchToZen }: BlitzPageProps) {
         title="Archive"
         message={pendingArchiveConfirm?.message || ""}
         variant="warning"
-        onConfirm={handleArchiveConfirm}
-        onCancel={handleArchiveCancel}
+        onConfirm={() => opsHandlers.handleArchiveConfirm(pendingArchiveConfirm)}
+        onCancel={() => opsHandlers.handleArchiveCancel()}
       />
 
       <ConfirmDialog
-        isOpen={showResetConfirm}
+        isOpen={opsState.showResetConfirm}
         title="Reset Task"
         message={`Are you sure you want to reset "${selectedTask?.name}"? This will discard all changes and recreate the worktree from ${selectedTask?.target}. This action cannot be undone.`}
-        confirmLabel={isResetting ? "Resetting..." : "Reset"}
+        confirmLabel={opsState.isResetting ? "Resetting..." : "Reset"}
         variant="danger"
-        onConfirm={handleResetConfirm}
-        onCancel={() => setShowResetConfirm(false)}
+        onConfirm={opsHandlers.handleResetConfirm}
+        onCancel={opsHandlers.handleResetCancel}
       />
 
       <RebaseDialog
-        isOpen={showRebaseDialog}
+        isOpen={opsState.showRebaseDialog}
         taskName={selectedTask?.name}
         currentTarget={selectedTask?.target || ""}
-        availableBranches={availableBranches}
-        onClose={() => setShowRebaseDialog(false)}
-        onRebase={handleRebaseSubmit}
+        availableBranches={opsState.availableBranches}
+        onClose={opsHandlers.handleRebaseCancel}
+        onRebase={opsHandlers.handleRebaseSubmit}
       />
 
       <ContextMenu
-        items={contextMenu ? getContextMenuItems(contextMenu.task) : []}
-        position={contextMenu?.position ?? null}
-        onClose={closeContextMenu}
+        items={contextMenuItems}
+        position={pageState.contextMenu?.position ?? null}
+        onClose={pageHandlers.closeContextMenu}
       />
 
-      <HelpOverlay isOpen={showHelp} onClose={() => setShowHelp(false)} />
+      <DirtyBranchDialog
+        error={opsState.dirtyBranchError}
+        onClose={opsHandlers.handleDirtyBranchErrorClose}
+      />
+
+      <RadioConnectDialog
+        open={effectiveShowRadioConnect}
+        onClose={() => setShowRadioConnect(false)}
+        onGoToSettings={() => {
+          onSwitchToZen();
+          onNavigate?.("ai");
+        }}
+      />
+
+      {/* TaskGroup folder context menu */}
+      <ContextMenu
+        items={groupFolderContextMenu ? [
+          {
+            id: "rename-group",
+            label: "Rename",
+            variant: "default" as const,
+            onClick: () => {
+              setEditingGroupId(groupFolderContextMenu.id);
+              setEditingGroupName(groupFolderContextMenu.name);
+              setTimeout(() => editGroupInputRef.current?.select(), 50);
+              setGroupFolderContextMenu(null);
+            },
+          },
+          {
+            id: "delete-group",
+            label: "Delete",
+            variant: "danger" as const,
+            onClick: () => {
+              setPendingDeleteGroup({ id: groupFolderContextMenu.id, name: groupFolderContextMenu.name });
+              setGroupFolderContextMenu(null);
+            },
+          },
+        ] : []}
+        position={groupFolderContextMenu?.position ?? null}
+        onClose={() => setGroupFolderContextMenu(null)}
+      />
+
+      {/* TaskGroup delete confirmation */}
+      <ConfirmDialog
+        isOpen={!!pendingDeleteGroup}
+        title="Delete Group"
+        message={`Delete group "${pendingDeleteGroup?.name}"? Tasks in this group will not be deleted.`}
+        confirmLabel="Delete"
+        variant="danger"
+        onConfirm={() => {
+          if (pendingDeleteGroup) {
+            deleteTaskGroup(pendingDeleteGroup.id);
+          }
+          setPendingDeleteGroup(null);
+        }}
+        onCancel={() => setPendingDeleteGroup(null)}
+      />
     </>
   );
 }

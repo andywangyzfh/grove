@@ -1,6 +1,10 @@
 //! Git API handlers for project-level git operations
 
-use axum::{extract::Path, http::StatusCode, Json};
+use axum::{
+    extract::{Path, Query},
+    http::StatusCode,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -20,19 +24,17 @@ pub struct RepoStatusResponse {
     pub uncommitted: u32,
     pub stash_count: u32,
     pub has_conflicts: bool,
-    /// Whether the repo has an origin remote for the current branch
+    /// Whether the current branch has an upstream tracking ref on origin
     pub has_origin: bool,
+    /// Whether the repository has an `origin` remote configured at all
+    pub has_remote: bool,
 }
 
-/// Branch info with ahead/behind
 #[derive(Debug, Serialize)]
 pub struct BranchDetailInfo {
     pub name: String,
     pub is_local: bool,
     pub is_current: bool,
-    pub last_commit: Option<String>,
-    pub ahead: Option<u32>,
-    pub behind: Option<u32>,
 }
 
 /// Branches list response
@@ -126,40 +128,51 @@ fn git_cmd(path: &str, args: &[&str]) -> crate::error::Result<String> {
     }
 }
 
-/// Get commits ahead/behind for a branch relative to origin
+/// Get commits ahead/behind for a branch relative to origin in a single git call.
+///
+/// Uses `git rev-list --left-right --count branch...origin/branch` which returns
+/// "<ahead>\t<behind>" in one fork. Returns (None, None) if origin/branch is missing
+/// or branch is unknown.
 fn get_ahead_behind(path: &str, branch: &str) -> (Option<u32>, Option<u32>) {
-    let origin_ref = format!("origin/{}", branch);
-
-    // Check if origin ref exists
-    if git_cmd(path, &["rev-parse", "--verify", &origin_ref]).is_err() {
+    if branch == "unknown" || branch.is_empty() {
         return (None, None);
     }
-
-    // Get ahead count
-    let ahead = git_cmd(
-        path,
-        &[
-            "rev-list",
-            "--count",
-            &format!("{}..{}", origin_ref, branch),
-        ],
-    )
-    .ok()
-    .and_then(|s| s.parse().ok());
-
-    // Get behind count
-    let behind = git_cmd(
-        path,
-        &[
-            "rev-list",
-            "--count",
-            &format!("{}..{}", branch, origin_ref),
-        ],
-    )
-    .ok()
-    .and_then(|s| s.parse().ok());
-
+    let spec = format!("{}...origin/{}", branch, branch);
+    let output = match git_cmd(path, &["rev-list", "--left-right", "--count", &spec]) {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    let mut parts = output.split_whitespace();
+    let ahead = parts.next().and_then(|s| s.parse().ok());
+    let behind = parts.next().and_then(|s| s.parse().ok());
     (ahead, behind)
+}
+
+/// Single `git status --porcelain` call → both uncommitted count and conflict flag.
+fn uncommitted_and_conflicts(path: &str) -> (u32, bool) {
+    let output = match git_cmd(path, &["status", "--porcelain"]) {
+        Ok(s) => s,
+        Err(_) => return (0, false),
+    };
+    let mut count: u32 = 0;
+    let mut conflict = false;
+    for line in output.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        count += 1;
+        if !conflict {
+            let bytes = line.as_bytes();
+            if bytes.len() >= 2 {
+                let x = bytes[0];
+                let y = bytes[1];
+                if matches!((x, y), (b'U', _) | (_, b'U') | (b'A', b'A') | (b'D', b'D')) {
+                    conflict = true;
+                }
+            }
+        }
+    }
+    (count, conflict)
 }
 
 // ============================================================================
@@ -168,52 +181,110 @@ fn get_ahead_behind(path: &str, branch: &str) -> (Option<u32>, Option<u32>) {
 
 /// GET /api/v1/projects/{id}/git/status
 /// Get repository git status
+#[cfg_attr(
+    feature = "perf-monitor",
+    tracing::instrument(skip_all, fields(project_id = %id))
+)]
 pub async fn get_status(Path(id): Path<String>) -> Result<Json<RepoStatusResponse>, StatusCode> {
+    #[cfg(feature = "perf-monitor")]
+    let _s = tracing::info_span!("find_project_path").entered();
     let project_path = find_project_path(&id)?;
+    #[cfg(feature = "perf-monitor")]
+    drop(_s);
 
-    let current_branch =
-        git::current_branch(&project_path).unwrap_or_else(|_| "unknown".to_string());
+    // Open gix repo once — shared by current_branch / has_remote / stash_count.
+    #[cfg(feature = "perf-monitor")]
+    let _s = tracing::info_span!("gix_open").entered();
+    let gix_repo = gix::open(&project_path).ok();
+    #[cfg(feature = "perf-monitor")]
+    drop(_s);
 
-    // Get ahead/behind from origin
-    let (ahead, behind) = get_ahead_behind(&project_path, &current_branch);
+    #[cfg(feature = "perf-monitor")]
+    let _s = tracing::info_span!("current_branch").entered();
+    let current_branch = gix_repo
+        .as_ref()
+        .and_then(git::gix_current_branch)
+        .unwrap_or_else(|| "unknown".to_string());
+    #[cfg(feature = "perf-monitor")]
+    drop(_s);
 
-    // Determine if origin exists for this branch
-    let has_origin = ahead.is_some() || behind.is_some();
+    #[cfg(feature = "perf-monitor")]
+    let _s = tracing::info_span!("remote_get_url").entered();
+    let has_remote = gix_repo.as_ref().map(git::gix_has_origin).unwrap_or(false);
+    #[cfg(feature = "perf-monitor")]
+    drop(_s);
 
-    // Get uncommitted count
-    let uncommitted = git::uncommitted_count(&project_path).unwrap_or(0) as u32;
+    #[cfg(feature = "perf-monitor")]
+    let _s = tracing::info_span!("stash_count").entered();
+    let stash_count = gix_repo.as_ref().map(git::gix_stash_count).unwrap_or(0) as u32;
+    #[cfg(feature = "perf-monitor")]
+    drop(_s);
 
-    // Get stash count
-    let stash_count = git::stash_count(&project_path).unwrap_or(0) as u32;
+    // Single rev-list call gives ahead + behind + has_origin in one fork.
+    #[cfg(feature = "perf-monitor")]
+    let _s = tracing::info_span!("ahead_behind").entered();
+    let (ahead_opt, behind_opt) = get_ahead_behind(&project_path, &current_branch);
+    let has_origin = ahead_opt.is_some() || behind_opt.is_some();
+    let ahead = ahead_opt.unwrap_or(0);
+    let behind = behind_opt.unwrap_or(0);
+    #[cfg(feature = "perf-monitor")]
+    drop(_s);
 
-    // Check for conflicts
-    let has_conflicts = git::has_conflicts(&project_path);
+    // Single `git status --porcelain` call gives uncommitted + has_conflicts.
+    #[cfg(feature = "perf-monitor")]
+    let _s = tracing::info_span!("status_porcelain").entered();
+    let (uncommitted, has_conflicts) = uncommitted_and_conflicts(&project_path);
+    #[cfg(feature = "perf-monitor")]
+    drop(_s);
 
     Ok(Json(RepoStatusResponse {
         current_branch,
-        ahead: ahead.unwrap_or(0),
-        behind: behind.unwrap_or(0),
+        ahead,
+        behind,
         uncommitted,
         stash_count,
         has_conflicts,
         has_origin,
+        has_remote,
     }))
 }
 
-/// GET /api/v1/projects/{id}/git/branches
-/// Get all branches with details
+/// Query parameters for branch listing
+#[derive(Debug, Deserialize)]
+pub struct BranchQueryParams {
+    /// Remote name to fetch branches from
+    /// - "local" or empty: only local branches (default)
+    /// - "origin": origin remote branches
+    /// - "upstream": upstream remote branches
+    /// - any other remote name
+    #[serde(default)]
+    pub remote: String,
+}
+
+impl Default for BranchQueryParams {
+    fn default() -> Self {
+        Self {
+            remote: "local".to_string(),
+        }
+    }
+}
+
+/// GET /api/v1/projects/{id}/git/branches?remote=local|origin|upstream|...
+/// Get branches with details
+///
+/// Examples:
+/// - `/branches` or `/branches?remote=local` - only local branches
+/// - `/branches?remote=origin` - only origin/* branches
+/// - `/branches?remote=upstream` - only upstream/* branches
 pub async fn get_branches(
     Path(id): Path<String>,
+    Query(params): Query<BranchQueryParams>,
 ) -> Result<Json<BranchesDetailResponse>, StatusCode> {
     let project_path = find_project_path(&id)?;
 
     let current_branch = git::current_branch(&project_path).unwrap_or_else(|_| "main".to_string());
 
-    // Get local branches
-    let local_branches =
-        git::list_branches(&project_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Get Grove-managed branches from tasks
+    // Get Grove-managed branches from tasks (to filter them out)
     let project_key = workspace::project_hash(&project_path);
     let mut grove_branches = HashSet::new();
 
@@ -231,60 +302,61 @@ pub async fn get_branches(
         }
     }
 
-    // Get remote branches
-    let remote_output = git_cmd(
-        &project_path,
-        &["branch", "-r", "--format=%(refname:short)"],
-    )
-    .unwrap_or_default();
-    let remote_branches: Vec<String> = remote_output
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| {
-            !s.is_empty() && !s.contains("HEAD") && s.contains('/') // Must have format "remote/branch", filter out bare remote names like "origin"
-        })
-        .collect();
-
     let mut branches: Vec<BranchDetailInfo> = Vec::new();
 
-    // Add local branches (filter out Grove-managed branches)
-    for name in &local_branches {
-        if grove_branches.contains(name) {
-            continue;
+    // Determine what to fetch based on remote parameter
+    let remote = if params.remote.is_empty() {
+        "local"
+    } else {
+        &params.remote
+    };
+
+    if remote == "local" {
+        let local_branches =
+            git::list_branches(&project_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        for name in &local_branches {
+            if grove_branches.contains(name) {
+                continue;
+            }
+            branches.push(BranchDetailInfo {
+                name: name.clone(),
+                is_local: true,
+                is_current: name == &current_branch,
+            });
         }
+    } else {
+        let remote_output = git_cmd(
+            &project_path,
+            &[
+                "branch",
+                "-r",
+                "--format=%(refname:short)",
+                "--list",
+                &format!("{}/*", remote),
+            ],
+        )
+        .unwrap_or_default();
 
-        let is_current = name == &current_branch;
-        let last_commit = git_cmd(&project_path, &["rev-parse", "--short", name]).ok();
-        let (ahead, behind) = get_ahead_behind(&project_path, name);
+        let remote_branches: Vec<String> = remote_output
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !s.contains("HEAD"))
+            .collect();
 
-        branches.push(BranchDetailInfo {
-            name: name.clone(),
-            is_local: true,
-            is_current,
-            last_commit,
-            ahead,
-            behind,
-        });
-    }
+        let local_branches = git::list_branches(&project_path).unwrap_or_default();
 
-    // Add remote branches (skip those that have local counterparts)
-    for name in &remote_branches {
-        // Check if local version exists
-        let local_name = name.strip_prefix("origin/").unwrap_or(name);
-        if local_branches.contains(&local_name.to_string()) {
-            continue;
+        for name in &remote_branches {
+            let local_name = name.strip_prefix(&format!("{}/", remote)).unwrap_or(name);
+            if local_branches.contains(&local_name.to_string()) {
+                continue;
+            }
+            branches.push(BranchDetailInfo {
+                name: name.clone(),
+                is_local: false,
+                is_current: false,
+            });
         }
-
-        let last_commit = git_cmd(&project_path, &["rev-parse", "--short", name]).ok();
-
-        branches.push(BranchDetailInfo {
-            name: name.clone(),
-            is_local: false,
-            is_current: false,
-            last_commit,
-            ahead: None,
-            behind: None,
-        });
     }
 
     Ok(Json(BranchesDetailResponse {
@@ -293,34 +365,110 @@ pub async fn get_branches(
     }))
 }
 
-/// GET /api/v1/projects/{id}/git/commits
-/// Get recent commits for the repository
-pub async fn get_commits(Path(id): Path<String>) -> Result<Json<RepoCommitsResponse>, StatusCode> {
+/// Remotes list response
+#[derive(Debug, Serialize)]
+pub struct RemotesResponse {
+    pub remotes: Vec<String>,
+}
+
+/// GET /api/v1/projects/{id}/git/remotes
+/// Get all remote names
+pub async fn get_remotes(Path(id): Path<String>) -> Result<Json<RemotesResponse>, StatusCode> {
     let project_path = find_project_path(&id)?;
 
-    // Get recent commits with hash, message, author, and time
-    let output =
-        git_cmd(&project_path, &["log", "-20", "--format=%H\t%s\t%an\t%cr"]).unwrap_or_default();
+    let remotes =
+        git::list_remotes(&project_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let commits: Vec<RepoCommitEntry> = output
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.splitn(4, '\t').collect();
-            if parts.len() >= 4 {
-                Some(RepoCommitEntry {
-                    hash: parts[0].to_string(),
-                    message: parts[1].to_string(),
-                    author: parts[2].to_string(),
-                    time_ago: parts[3].to_string(),
-                })
-            } else {
-                None
-            }
+    Ok(Json(RemotesResponse { remotes }))
+}
+
+/// GET /api/v1/projects/{id}/git/commits
+/// Get recent commits for the repository
+#[derive(Deserialize)]
+pub struct CommitQueryParams {
+    /// Optional: only return commits since this date (e.g. "1 week ago", "2024-01-01")
+    pub since: Option<String>,
+    /// Max number of commits to return (default: 20)
+    pub limit: Option<usize>,
+}
+
+pub async fn get_commits(
+    Path(id): Path<String>,
+    Query(params): Query<CommitQueryParams>,
+) -> Result<Json<RepoCommitsResponse>, StatusCode> {
+    let project_path = find_project_path(&id)?;
+    let limit = params.limit.unwrap_or(20).min(100);
+
+    // Convert frontend's "1 week ago"-style strings to a Unix-timestamp cutoff.
+    // Unrecognized formats fall through to no filter (matches the previous
+    // behavior of silently dropping invalid `since`).
+    let min_committer_time = params
+        .since
+        .as_deref()
+        .and_then(parse_relative_since)
+        .map(|secs| chrono::Utc::now().timestamp() - secs);
+
+    let Ok(mut repo) = gix::open(&project_path) else {
+        return Ok(Json(RepoCommitsResponse {
+            commits: Vec::new(),
+        }));
+    };
+    // 64 MiB object cache 让连续 commit decode 命中已解压数据。
+    repo.object_cache_size_if_unset(64 * 1024 * 1024);
+
+    let entries = git::gix_recent_log(&repo, limit, min_committer_time).unwrap_or_default();
+
+    let commits: Vec<RepoCommitEntry> = entries
+        .into_iter()
+        .map(|e| RepoCommitEntry {
+            hash: e.hash,
+            message: e.message,
+            author: e.author,
+            time_ago: e.time_ago,
         })
         .collect();
 
     Ok(Json(RepoCommitsResponse { commits }))
+}
+
+/// Parse strings like "1 week ago", "2 days ago", "3 months ago" into a
+/// duration-in-seconds offset. Returns None on anything unrecognized.
+///
+/// Only the subset of git's `--since` syntax that the frontend actually emits.
+/// We deliberately keep this small: the previous shell-out variant accepted
+/// almost anything and let git complain or silently no-op; matching that
+/// behavior is good enough.
+fn parse_relative_since(s: &str) -> Option<i64> {
+    use chrono::Months;
+    let s = s.trim().to_ascii_lowercase();
+    let s = s.strip_suffix(" ago").unwrap_or(&s);
+    let mut parts = s.split_whitespace();
+    let n: i64 = parts.next()?.parse().ok()?;
+    if n < 0 {
+        return None;
+    }
+    let unit = parts.next()?;
+    match unit.trim_end_matches('s') {
+        "second" => Some(n),
+        "minute" | "min" => n.checked_mul(60),
+        "hour" => n.checked_mul(3600),
+        "day" => n.checked_mul(86_400),
+        "week" => n.checked_mul(7 * 86_400),
+        // Month/year: use calendar-aware subtraction so the cutoff matches the
+        // user's intent (e.g. "1 month ago" on March 31 → Feb 28/29, not -30d).
+        "month" => {
+            let now = chrono::Utc::now();
+            now.checked_sub_months(Months::new(n.try_into().ok()?))
+                .map(|then| (now - then).num_seconds())
+        }
+        "year" => {
+            let months = n.checked_mul(12)?;
+            let now = chrono::Utc::now();
+            now.checked_sub_months(Months::new(months.try_into().ok()?))
+                .map(|then| (now - then).num_seconds())
+        }
+        _ => None,
+    }
 }
 
 /// POST /api/v1/projects/{id}/git/checkout
@@ -348,7 +496,19 @@ pub async fn checkout(
 pub async fn pull(Path(id): Path<String>) -> Result<Json<GitOpResponse>, StatusCode> {
     let project_path = find_project_path(&id)?;
 
-    match git_cmd(&project_path, &["pull"]) {
+    // Get current branch name
+    let current_branch = match git::current_branch(&project_path) {
+        Ok(branch) => branch,
+        Err(e) => {
+            return Ok(Json(GitOpResponse {
+                success: false,
+                message: format!("Failed to get current branch: {}", e),
+            }));
+        }
+    };
+
+    // Pull with explicit remote and branch: git pull origin <current_branch>
+    match git_cmd(&project_path, &["pull", "origin", &current_branch]) {
         Ok(output) => Ok(Json(GitOpResponse {
             success: true,
             message: if output.is_empty() {
@@ -382,10 +542,7 @@ pub async fn push(Path(id): Path<String>) -> Result<Json<GitOpResponse>, StatusC
 
     // Push with explicit branch and --set-upstream to handle new branches
     // This is equivalent to: git push origin $(git_current_branch)
-    match git_cmd(
-        &project_path,
-        &["push", "--set-upstream", "origin", &current_branch],
-    ) {
+    match git_cmd(&project_path, &["push", "-u", "origin", &current_branch]) {
         Ok(output) => Ok(Json(GitOpResponse {
             success: true,
             message: if output.is_empty() {

@@ -1,30 +1,43 @@
 // API exports
 
-export { apiClient, ApiClient } from './client';
 export type { ApiError } from './client';
 
-export { getConfig, patchConfig, listApplications, getAppIconUrl } from './config';
-export type { Config, ConfigPatch, ThemeConfig, LayoutConfig, WebConfig, AppInfo } from './config';
+export { getConfig, patchConfig, listApplications, getAppIconUrl, previewHookSound } from './config';
+export type { AppInfo, CustomAgentServer, CustomThemeConfig } from './config';
 
-export { checkAllDependencies, checkDependency } from './env';
-export type { DependencyStatus, EnvCheckResponse } from './env';
+export { listBaseAgents } from './agents';
+export type { BaseAgent } from './agents';
 
-export { listProjects, getProject, addProject, deleteProject, getProjectStats, getBranches, openIDE, openTerminal } from './projects';
+export {
+  listCustomAgents,
+  createCustomAgent,
+  updateCustomAgent,
+  deleteCustomAgent,
+} from './customAgent';
+export type {
+  CustomAgent as CustomAgentPersona,
+  CustomAgentInput,
+  CustomAgentPatch,
+} from './customAgent';
+
+export { checkAllDependencies, checkCommands } from './env';
+
+export { listProjects, getProject, addProject, deleteProject, renameProject, getProjectStats, getBranches, getRemotes, openIDE, openTerminal, initGitRepo, createNewProject, cloneProject, listResources, uploadResource, deleteResource, previewResource, resourceDownloadUrl, getInstructions, updateInstructions, getMemory, updateMemory, listResourceWorkdirs, addResourceWorkdir, deleteResourceWorkdir, openResourceWorkdir, createResourceFolder, moveResource, createResourceLink, updateResourceLink } from './projects';
 export type {
   ProjectListItem,
-  ProjectListResponse,
   ProjectResponse,
-  AddProjectRequest,
   ProjectStatsResponse,
-  BranchInfo,
-  BranchesResponse,
-  OpenResponse,
+  ResourceFile,
+  WorkDirectoryEntry,
 } from './projects';
 
 export {
   listTasks,
-  getTask,
   createTask,
+  renameTask,
+  activateTask,
+  lookupSymbol,
+  reindexSymbols,
   archiveTask,
   recoverTask,
   deleteTask,
@@ -38,44 +51,66 @@ export {
   getDiff,
   getCommits,
   getReviewComments,
-  replyReviewComment,
   getTaskStats,
   getTaskFiles,
+  getTaskDirEntries,
   getFileContent,
   writeFileContent,
   createFile,
   createDirectory,
   deleteFileOrDir,
-  copyFile,
+  moveFileOrDir,
+  listChats,
+  createChat,
+  updateChatTitle,
+  sendGraphChatMessage,
+  getTaskGraph,
+  spawnGraphNode,
+  addGraphEdge,
+  updateGraphChatDuty,
+  updateGraphEdgePurpose,
+  deleteGraphEdge,
+  remindGraphEdge,
+  getMentionCandidates,
+  deleteChat,
+  forkChat,
+  uploadChatAttachment,
+  getChatHistory,
+  takeControl,
+  readFile,
+  listArtifacts,
+  previewArtifact,
+  artifactDownloadUrl,
+  deleteArtifact,
+  uploadArtifacts,
+  createArtifactLink,
+  updateArtifactLink,
+  syncArtifactToResource,
+  listArtifactWorkdirs,
+  addArtifactWorkdir,
+  deleteArtifactWorkdir,
+  openArtifactWorkdir,
 } from './tasks';
 export type {
-  CommitResponse,
   TaskResponse,
-  TaskListResponse,
-  CreateTaskRequest,
-  TaskFilter,
-  NotesResponse,
-  UpdateNotesRequest,
-  CommitRequest,
-  GitOperationResponse,
-  DiffFileEntry,
+  SymbolCandidate,
   DiffResponse,
-  CommitEntry,
   CommitsResponse,
   ReviewCommentEntry,
-  ReviewCommentsResponse,
-  ReplyCommentRequest,
-  RebaseToRequest,
-  FilesResponse,
-  FileContentResponse,
-  WriteFileRequest,
-  FileEditEntry,
-  ActivityEntry,
   TaskStatsResponse,
-  FsOperationResponse,
-  CreateFileRequest,
-  CreateDirectoryRequest,
-  CopyFileRequest,
+  ChatSessionResponse,
+  ArtifactFile,
+  ArtifactsResponse,
+  ArtifactWorkDirectoryEntry,
+  DirEntry,
+  MentionAgent,
+  MentionOutgoing,
+  MentionPendingReply,
+  MentionCandidatesResponse,
+  GraphResponse,
+  GraphNodeResponse,
+  GraphEdgeResponse,
+  GraphPendingMessageInfo,
 } from './tasks';
 
 export {
@@ -86,7 +121,6 @@ export {
   gitPull,
   gitPush,
   gitFetch,
-  gitStash,
   gitCommit,
   createBranch,
   deleteBranch,
@@ -95,17 +129,69 @@ export {
 export type {
   RepoStatusResponse,
   BranchDetailInfo,
-  BranchesDetailResponse,
   RepoCommitEntry,
-  RepoCommitsResponse,
-  GitOpResponse,
 } from './git';
 
-export { getFullDiff, createComment, deleteComment } from './review';
-export type { DiffLine, DiffHunk, DiffFile, FullDiffResult } from './review';
 
-export { listAllHooks, dismissHook } from './hooks';
-export type { HookEntryResponse, HooksListResponse } from './hooks';
+export { getVersion, checkUpdate, startAppUpdate, getAppUpdateProgress, installAppUpdate } from './version';
+export type { UpdateCheckResponse, AppUpdateProgress } from './version';
 
-export { getVersion, checkUpdate } from './version';
-export type { VersionResponse, UpdateCheckResponse } from './version';
+export { getAgentUsage } from './agentUsage';
+export type { AgentUsage, UsageWindow, ExtraInfo } from './agentUsage';
+
+export {
+  listProviders,
+  createProvider,
+  updateProvider,
+  deleteProvider,
+  verifyProvider,
+  getAudioSettings,
+  saveAudioGlobal,
+  saveAudioProject,
+  transcribeAudio,
+} from './ai';
+export type { ProviderResponse, TranscribeResult } from './ai';
+
+export {
+  getAgentDefs,
+  toggleAgentEnabled,
+  addAgent,
+  updateAgent,
+  deleteAgent,
+  listSources,
+  addSource,
+  updateSource,
+  deleteSource,
+  syncSource,
+  syncAllSources,
+  exploreSkills,
+  getSkillDetail,
+  listInstalled,
+  installSkill,
+  checkSourceUpdates,
+} from './skills';
+export type {
+  AgentDef,
+  SkillSource,
+  SkillSummary,
+  SkillDetail,
+  InstalledSkill,
+} from './skills';
+
+export { renderD2 } from './render';
+export { fetchUrlMetadata } from './url';
+export type { UrlMetadata } from './url';
+export type { RenderD2Error } from './render';
+
+export * from './sketches';
+export type { DisplayItem } from './studio-types';
+
+export {
+  listTaskGroups,
+  createTaskGroup,
+  updateTaskGroup,
+  deleteTaskGroup,
+  upsertTaskSlot,
+  removeTaskSlot,
+  setSlots,
+} from './taskgroups';

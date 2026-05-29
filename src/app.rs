@@ -4,7 +4,6 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use ratatui::widgets::ListState;
 
 use crate::async_ops_state::AsyncOpsState;
@@ -14,19 +13,16 @@ use crate::git;
 use crate::hooks::{self, HookEntry, HooksFile};
 use crate::model::{loader, ProjectInfo, ProjectTab, WorkspaceState, Worktree, WorktreeStatus};
 use crate::notification_state::NotificationState;
-use crate::session;
+use crate::session::{self, SessionType};
 use crate::storage::{
-    self, comments,
-    config::Multiplexer,
-    notes,
-    tasks::{self, Task, TaskStatus},
+    self, comments, notes,
+    tasks::{self},
     workspace::project_hash,
 };
 use crate::theme::{detect_system_theme, get_theme_colors, Theme};
 use crate::tmux;
 use crate::tmux::layout::{
-    self as layout_mod, parse_custom_layout_tree, CustomLayout, LayoutNode, PaneRole,
-    SplitDirection, TaskLayout,
+    self as layout_mod, CustomLayout, LayoutNode, PaneRole, SplitDirection, TaskLayout,
 };
 use crate::ui::components::action_palette::{ActionPaletteData, ActionType};
 use crate::ui::components::add_project_dialog::AddProjectData;
@@ -88,9 +84,9 @@ pub struct ProjectState {
     /// 当前选中的 Tab
     pub current_tab: ProjectTab,
     /// 列表选择状态（每个 Tab 独立维护）
-    pub list_states: [ListState; 3], // Current, Other, Archived
+    pub list_states: [ListState; 2], // Active, Archived
     /// 各 Tab 的 Worktree 列表
-    pub worktrees: [Vec<Worktree>; 3],
+    pub worktrees: [Vec<Worktree>; 2],
     /// 项目路径
     pub project_path: String,
     /// 项目 key（路径的 hash，用于存储）
@@ -99,8 +95,8 @@ pub struct ProjectState {
     pub search_mode: bool,
     /// 搜索输入
     pub search_query: String,
-    /// 每个 Tab 的过滤索引 [Current, Other, Archived]
-    filtered_indices: [Vec<usize>; 3],
+    /// 每个 Tab 的过滤索引 [Active, Archived]
+    filtered_indices: [Vec<usize>; 2],
     /// 预览面板是否可见
     pub preview_visible: bool,
     /// 当前 sub-tab
@@ -117,6 +113,10 @@ pub struct ProjectState {
     pub stats_scroll: u16,
     /// 待打开外部编辑器的 notes 文件路径
     pub pending_notes_edit: Option<String>,
+    /// 项目目录是否还存在(false = "missing")
+    pub exists: bool,
+    /// git 状态是否可用(是 git repo 且有至少一个 commit)
+    pub is_git_usable: bool,
 }
 
 impl ProjectState {
@@ -125,16 +125,19 @@ impl ProjectState {
         let project_key = project_hash(project_path);
 
         // 从 Task 元数据加载真实数据
-        let (current, other, archived) = loader::load_worktrees(project_path);
+        // 注意: load_worktrees 不再包含 Local Task,需要单独加载后在视图层合并,
+        // 保留 "Local Task 始终第一项" 的 TUI UX。
+        let worktrees = loader::load_worktrees(project_path);
+        let local = loader::load_local_task(project_path);
+        let active = Self::merge_local_first(local, worktrees);
 
-        let mut current_state = ListState::default();
-        if !current.is_empty() {
-            current_state.select(Some(0));
-        }
+        // TUI 过滤：移除只有 Chat 模式的任务（TUI 不支持）
+        let active = Self::filter_tui_tasks(active);
+        let archived = Vec::new();
 
-        let mut other_state = ListState::default();
-        if !other.is_empty() {
-            other_state.select(Some(0));
+        let mut active_state = ListState::default();
+        if !active.is_empty() {
+            active_state.select(Some(0));
         }
 
         let mut archived_state = ListState::default();
@@ -143,19 +146,21 @@ impl ProjectState {
         }
 
         // 初始化过滤索引（全部显示）
-        let current_indices: Vec<usize> = (0..current.len()).collect();
-        let other_indices: Vec<usize> = (0..other.len()).collect();
+        let active_indices: Vec<usize> = (0..active.len()).collect();
         let archived_indices: Vec<usize> = (0..archived.len()).collect();
 
+        let exists = Path::new(project_path).exists();
+        let is_git_usable = exists && git::is_git_usable(project_path);
+
         Self {
-            current_tab: ProjectTab::Current,
-            list_states: [current_state, other_state, archived_state],
-            worktrees: [current, other, archived],
+            current_tab: ProjectTab::Active,
+            list_states: [active_state, archived_state],
+            worktrees: [active, archived],
             project_path: project_path.to_string(),
             project_key,
             search_mode: false,
             search_query: String::new(),
-            filtered_indices: [current_indices, other_indices, archived_indices],
+            filtered_indices: [active_indices, archived_indices],
             preview_visible: true,
             preview_sub_tab: PreviewSubTab::Stats,
             panel_data: PanelData::default(),
@@ -164,15 +169,41 @@ impl ProjectState {
             diff_scroll: 0,
             stats_scroll: 0,
             pending_notes_edit: None,
+            exists,
+            is_git_usable,
         }
+    }
+
+    /// TUI 过滤：现在所有任务都支持 Terminal（通过 multiplexer 字段）
+    fn filter_tui_tasks(tasks: Vec<Worktree>) -> Vec<Worktree> {
+        // 不再需要过滤，所有任务都可以在 TUI 中使用
+        tasks
+    }
+
+    /// 把 Local Task 合并到 worktree 列表最前面(视图层,保留 TUI UX)
+    fn merge_local_first(local: Option<Worktree>, mut worktrees: Vec<Worktree>) -> Vec<Worktree> {
+        if let Some(local) = local {
+            worktrees.insert(0, local);
+        }
+        worktrees
     }
 
     /// 刷新数据
     pub fn refresh(&mut self) {
         git::cache::clear_all();
-        let (current, other, _) = loader::load_worktrees(&self.project_path);
+        let worktrees = loader::load_worktrees(&self.project_path);
+        let local = loader::load_local_task(&self.project_path);
+        let active = Self::merge_local_first(local, worktrees);
+
+        // TUI 过滤：移除只有 Chat 模式的任务
+        let active = Self::filter_tui_tasks(active);
         let archived = loader::load_archived_worktrees(&self.project_path);
-        self.worktrees = [current, other, archived];
+        let archived = Self::filter_tui_tasks(archived);
+        self.worktrees = [active, archived];
+
+        // 刷新 existence / git 可用性(用户可能中途 `git init` 或删除目录)
+        self.exists = Path::new(&self.project_path).exists();
+        self.is_git_usable = self.exists && git::is_git_usable(&self.project_path);
 
         // 清空搜索状态并重置过滤索引
         self.search_mode = false;
@@ -197,16 +228,16 @@ impl ProjectState {
         &self.list_states[self.current_tab.index()]
     }
 
-    /// 活跃任务数量（Current + Other，不包含 Archived）
+    /// 活跃任务数量（不包含 Archived）
     pub fn active_task_count(&self) -> usize {
-        self.worktrees[0].len() + self.worktrees[1].len()
+        self.worktrees[0].len()
     }
 
     /// 切换到下一个 Tab
     pub fn next_tab(&mut self) {
         self.current_tab = self.current_tab.next();
         // 懒加载 Archived tab
-        if self.current_tab == ProjectTab::Archived && self.worktrees[2].is_empty() {
+        if self.current_tab == ProjectTab::Archived && self.worktrees[1].is_empty() {
             self.load_archived();
         }
         self.ensure_selection();
@@ -214,13 +245,9 @@ impl ProjectState {
 
     /// 切换到上一个 Tab
     pub fn prev_tab(&mut self) {
-        self.current_tab = match self.current_tab {
-            ProjectTab::Current => ProjectTab::Archived,
-            ProjectTab::Other => ProjectTab::Current,
-            ProjectTab::Archived => ProjectTab::Other,
-        };
+        self.current_tab = self.current_tab.prev();
         // 懒加载 Archived tab
-        if self.current_tab == ProjectTab::Archived && self.worktrees[2].is_empty() {
+        if self.current_tab == ProjectTab::Archived && self.worktrees[1].is_empty() {
             self.load_archived();
         }
         self.ensure_selection();
@@ -229,7 +256,7 @@ impl ProjectState {
     /// 切换到指定 Tab（鼠标点击用）
     pub fn switch_to_tab(&mut self, tab: ProjectTab) {
         self.current_tab = tab;
-        if tab == ProjectTab::Archived && self.worktrees[2].is_empty() {
+        if tab == ProjectTab::Archived && self.worktrees[1].is_empty() {
             self.load_archived();
         }
         self.ensure_selection();
@@ -351,7 +378,7 @@ impl ProjectState {
 
     /// 懒加载归档任务
     fn load_archived(&mut self) {
-        self.worktrees[2] = loader::load_archived_worktrees(&self.project_path);
+        self.worktrees[1] = loader::load_archived_worktrees(&self.project_path);
     }
 
     /// 确保当前 Tab 有选中项
@@ -623,8 +650,8 @@ pub struct MonitorState {
     pub project_key: String,
     /// 待打开外部编辑器的 notes 文件路径
     pub pending_notes_edit: Option<String>,
-    /// 当前 session 使用的 multiplexer
-    pub multiplexer: Multiplexer,
+    /// 当前 session 使用的 session type
+    pub session_type: SessionType,
 }
 
 impl Default for MonitorState {
@@ -648,7 +675,7 @@ impl Default for MonitorState {
             project_path: String::new(),
             project_key: String::new(),
             pending_notes_edit: None,
-            multiplexer: Multiplexer::default(),
+            session_type: SessionType::Tmux,
         }
     }
 }
@@ -671,9 +698,9 @@ impl MonitorState {
 
         // 检测当前 multiplexer：ZELLIJ 环境变量存在 → Zellij，否则 → Tmux
         let multiplexer = if std::env::var("ZELLIJ").is_ok() {
-            Multiplexer::Zellij
+            SessionType::Zellij
         } else {
-            Multiplexer::Tmux
+            SessionType::Tmux
         };
 
         let mut state = Self {
@@ -695,7 +722,7 @@ impl MonitorState {
             project_path,
             project_key,
             pending_notes_edit: None,
-            multiplexer,
+            session_type: multiplexer,
         };
 
         // 加载初始数据
@@ -820,7 +847,7 @@ impl MonitorState {
 #[derive(Debug, Clone)]
 pub struct PendingAttach {
     pub session: String,
-    pub multiplexer: Multiplexer,
+    pub session_type: SessionType,
     pub working_dir: String,
     pub env: tmux::SessionEnv,
     pub layout_path: Option<String>,
@@ -888,8 +915,12 @@ pub enum PendingAction {
     Reset { task_id: String },
     /// Checkout - 在主仓库 checkout 到选择的分支
     Checkout,
+    /// NewTaskTarget - 在新建任务时选择 target branch
+    NewTaskTarget,
     /// Exit - 退出 tmux session
     ExitSession,
+    /// Initialize Git on the current project, then open the New Task dialog
+    InitGitThenNewTask,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -902,7 +933,10 @@ struct ArchivePreflight {
 
 impl ArchivePreflight {
     fn needs_confirm(&self) -> bool {
-        self.worktree_dirty || !self.branch_merged || self.dirty_check_failed || self.merge_check_failed
+        self.worktree_dirty
+            || !self.branch_merged
+            || self.dirty_check_failed
+            || self.merge_check_failed
     }
 }
 
@@ -916,8 +950,31 @@ impl App {
     pub fn new() -> Self {
         // 加载配置
         let config = storage::config::load_config();
-        let theme = Theme::from_name(&config.theme.name);
         let last_system_dark = detect_system_theme();
+        // 优先按 mode + 对应 slot 解析(Web 端写的就是 mode/light_theme/dark_theme,
+        // 完全不写 name); auto 时用终端 dark/light 偏好选 slot,与 Web 行为对齐;
+        // 都缺失时退回 legacy name 字段。
+        let theme = match config.theme.mode.as_str() {
+            "light" if !config.theme.light_theme.is_empty() => {
+                Theme::from_name(&config.theme.light_theme)
+            }
+            "dark" if !config.theme.dark_theme.is_empty() => {
+                Theme::from_name(&config.theme.dark_theme)
+            }
+            "auto" => {
+                let slot = if last_system_dark {
+                    &config.theme.dark_theme
+                } else {
+                    &config.theme.light_theme
+                };
+                if slot.is_empty() {
+                    Theme::Auto
+                } else {
+                    Theme::from_name(slot)
+                }
+            }
+            _ => Theme::from_name(&config.theme.name),
+        };
         let colors = get_theme_colors(theme);
 
         // 检查更新
@@ -942,8 +999,10 @@ impl App {
         // 判断是否在 Monitor 模式（GROVE_TASK_ID 存在）
         let is_monitor = std::env::var("GROVE_TASK_ID").is_ok();
 
-        // 判断是否在 git 仓库中
-        let is_in_git_repo = git::is_git_repo(".");
+        // 判断是否在可用的 git 仓库中(有 .git 且至少有一个 commit)
+        // 只有 .git 没 commit 的半拉子状态不算 —— 此时 current_branch 等都会失败,
+        // 降级到 Workspace 模式让用户看到所有项目,避免卡在 "unknown" 状态
+        let is_in_git_repo = git::is_git_usable(".");
 
         let (mode, project, workspace, target_branch) = if is_monitor {
             // Monitor 模式 - 从环境变量读取
@@ -1061,23 +1120,7 @@ impl App {
                 ui_state
             },
             dialogs: DialogState::new(),
-            config: ConfigState {
-                multiplexer: config.multiplexer.clone(),
-                task_layout: TaskLayout::from_name(&config.layout.default)
-                    .unwrap_or(TaskLayout::Single),
-                agent_command: config.layout.agent_command.clone().unwrap_or_default(),
-                custom_layout: config
-                    .layout
-                    .custom
-                    .as_ref()
-                    .and_then(|c| {
-                        parse_custom_layout_tree(
-                            &c.tree,
-                            config.layout.selected_custom_id.as_deref(),
-                        )
-                    })
-                    .map(|root| CustomLayout { root }),
-            },
+            config: ConfigState::from_config(&config),
             async_ops: AsyncOpsState::with_target_branch(target_branch),
             notification,
             update_info: Some(update_info),
@@ -1225,11 +1268,34 @@ impl App {
 
     /// 保存主题配置到文件
     fn save_theme_config(&self) {
-        use storage::config::{load_config, save_config, ThemeConfig};
+        use storage::config::{load_config, save_config};
         let mut config = load_config();
-        config.theme = ThemeConfig {
-            name: self.ui.theme.label().to_string(),
-        };
+        let theme = self.ui.theme;
+        // 保留 light_theme / dark_theme / custom_themes（旧实现用
+        // `..Default::default()` 把这些字段全抹掉）。
+        // 对应 Web ThemeContext 的 light_theme / dark_theme / mode 三字段：
+        //   Auto         → mode=auto（不动 slot）
+        //   光系主题      → mode=light + light_theme=&lt;id&gt;
+        //   暗系主题      → mode=dark  + dark_theme=&lt;id&gt;
+        // 旧版本只更新 name，但 Web ThemeContext 根本不读 name，所以 TUI 改
+        // 主题在 Web 端不会生效。
+        config.theme.name = theme.label().to_string();
+        match theme {
+            Theme::Auto => {
+                config.theme.mode = "auto".to_string();
+            }
+            t => {
+                if let Some(id) = t.web_id() {
+                    if t.is_light() {
+                        config.theme.mode = "light".to_string();
+                        config.theme.light_theme = id.to_string();
+                    } else {
+                        config.theme.mode = "dark".to_string();
+                        config.theme.dark_theme = id.to_string();
+                    }
+                }
+            }
+        }
         let _ = save_config(&config);
     }
 
@@ -1245,6 +1311,22 @@ impl App {
 
     /// 打开 New Task 弹窗
     pub fn open_new_task_dialog(&mut self) {
+        // 非 git 项目: 先弹一个确认对话框引导 init git
+        if !self.project.is_git_usable {
+            let name = Path::new(&self.project.project_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("this project")
+                .to_string();
+            self.dialogs.confirm_dialog = Some(
+                crate::ui::components::confirm_dialog::ConfirmType::InitGitForNewTask {
+                    project_name: name,
+                },
+            );
+            self.async_ops.pending_action = Some(PendingAction::InitGitThenNewTask);
+            return;
+        }
+
         // 刷新目标分支
         if let Ok(branch) = git::current_branch(&self.project.project_path) {
             self.async_ops.target_branch = branch;
@@ -1257,6 +1339,23 @@ impl App {
     pub fn close_new_task_dialog(&mut self) {
         self.dialogs.show_new_task_dialog = false;
         self.dialogs.new_task_input.clear();
+    }
+
+    /// 在 New Task 弹窗中打开分支选择器
+    pub fn new_task_open_branch_selector(&mut self) {
+        let branches = match self.list_user_branches() {
+            Ok(b) => b,
+            Err(e) => {
+                self.show_toast(format!("Failed to list branches: {}", e));
+                return;
+            }
+        };
+        let current_target = self.async_ops.target_branch.clone();
+        self.async_ops.pending_action = Some(PendingAction::NewTaskTarget);
+        self.dialogs.branch_selector = Some(BranchSelectorData::new_task_target(
+            branches,
+            current_target,
+        ));
     }
 
     /// New Task 输入字符
@@ -1277,72 +1376,48 @@ impl App {
             return;
         }
 
-        // 1. 获取项目信息
         let repo_root = self.project.project_path.clone();
-
         let project_key = project_hash(&repo_root);
+        let autolink_patterns = crate::storage::config::load_config().auto_link.patterns;
 
-        // 2. 生成标识符
-        let slug = tasks::to_slug(&name);
-        let branch = tasks::generate_branch_name(&name);
-
-        // 3. 计算路径（使用 project_key 作为目录名）
-        let worktree_path = match storage::ensure_worktree_dir(&project_key) {
-            Ok(dir) => dir.join(&slug),
+        // Phase 1: Core operation
+        let result = match crate::operations::tasks::create_task(
+            &repo_root,
+            &project_key,
+            name.clone(),
+            self.async_ops.target_branch.clone(),
+            &self.config.default_session_type(),
+            &autolink_patterns,
+            "user",
+        ) {
+            Ok(r) => r,
             Err(e) => {
-                self.show_toast(format!("Failed to create dir: {}", e));
+                self.show_toast(format!("Failed to create task: {}", e));
                 self.close_new_task_dialog();
                 return;
             }
         };
 
-        // 4. 创建 git worktree
-        if let Err(e) = git::create_worktree(
-            &repo_root,
-            &branch,
-            &worktree_path,
-            &self.async_ops.target_branch,
-        ) {
-            self.show_toast(format!("Git error: {}", e));
-            self.close_new_task_dialog();
-            return;
-        }
-
-        // 5. 保存 task 元数据
-        let now = Utc::now();
-        let sname = session::session_name(&project_key, &slug);
-        let task = Task {
-            id: slug.clone(),
-            name: name.clone(),
-            branch: branch.clone(),
-            target: self.async_ops.target_branch.clone(),
-            worktree_path: worktree_path.to_string_lossy().to_string(),
-            created_at: now,
-            updated_at: now,
-            status: TaskStatus::Active,
-            multiplexer: self.config.multiplexer.to_string(),
-            session_name: sname.clone(),
-        };
-
-        if let Err(e) = tasks::add_task(&project_key, task) {
-            // 只是警告，worktree 已创建
-            eprintln!("Warning: Failed to save task: {}", e);
-        }
-
-        // 6. 创建 session（使用 project_key 保持一致）
-        let session = sname;
-        let wt_dir = worktree_path.to_str().unwrap_or(".").to_string();
+        // Phase 2: TUI-specific session creation
+        let slug = result.task.id.clone();
+        let session = result.task.session_name.clone();
+        let wt_dir = result.worktree_path.clone();
+        let worktree_path = std::path::PathBuf::from(&wt_dir);
         let session_env = self.build_session_env(
-            &slug,
-            &name,
-            &branch,
-            &self.async_ops.target_branch.clone(),
-            &worktree_path.to_string_lossy(),
+            &result.task.id,
+            &result.task.name,
+            &result.task.branch,
+            &result.task.target,
+            &result.worktree_path,
         );
+
+        // Resolve session type from task
+        let task_session_type = session::resolve_session_type(&result.task.multiplexer);
+
         if let Err(e) = session::create_session(
-            &self.config.multiplexer,
+            &task_session_type,
             &session,
-            &wt_dir,
+            &result.worktree_path,
             Some(&session_env),
         ) {
             self.show_toast(format!("Session error: {}", e));
@@ -1352,8 +1427,8 @@ impl App {
 
         // 7. 应用布局
         let mut layout_path: Option<String> = None;
-        match self.config.multiplexer {
-            Multiplexer::Tmux => {
+        match task_session_type {
+            SessionType::Tmux => {
                 if self.config.task_layout != TaskLayout::Single {
                     if let Err(e) = tmux::layout::apply_layout(
                         &session,
@@ -1366,7 +1441,7 @@ impl App {
                     }
                 }
             }
-            Multiplexer::Zellij => {
+            SessionType::Zellij => {
                 // Zellij: 始终生成 KDL layout 以注入环境变量
                 let kdl = crate::zellij::layout::generate_kdl(
                     &self.config.task_layout,
@@ -1378,6 +1453,9 @@ impl App {
                     Ok(path) => layout_path = Some(path),
                     Err(e) => self.show_toast(format!("Layout: {}", e)),
                 }
+            }
+            SessionType::Acp => {
+                // ACP: 不需要布局，通过 chat 界面交互
             }
         }
 
@@ -1394,7 +1472,7 @@ impl App {
         // 10. 标记需要 attach（主循环会暂停 TUI，attach 完成后恢复）
         self.async_ops.pending_attach = Some(PendingAttach {
             session,
-            multiplexer: self.config.multiplexer.clone(),
+            session_type: task_session_type,
             working_dir: wt_dir,
             env: session_env,
             layout_path,
@@ -1458,63 +1536,32 @@ impl App {
         let wt_branch = wt.branch.clone();
         let wt_target = wt.target.clone();
         let wt_path = wt.path.clone();
-        let slug = slug_from_path(&wt_path);
 
-        // 从 task 记录获取 multiplexer 和 session_name
+        // 从 task 记录获取 task 数据
         let task_data = tasks::get_task(&self.project.project_key, &wt_id)
             .ok()
             .flatten();
-        let task_mux = task_data
-            .as_ref()
-            .map(|t| t.multiplexer.clone())
-            .unwrap_or_default();
-        let task_session_name = task_data
-            .as_ref()
-            .map(|t| t.session_name.clone())
-            .unwrap_or_default();
-        let mux = session::resolve_multiplexer(&task_mux, &self.config.multiplexer);
-        let session =
-            session::resolve_session_name(&task_session_name, &self.project.project_key, &slug);
+        let Some(task) = task_data else {
+            self.show_toast("Task not found");
+            return;
+        };
 
-        // 4. 如果 session 不存在，创建它
-        let mut layout_path: Option<String> = None;
-        if !session::session_exists(&mux, &session) {
-            let session_env =
-                self.build_session_env(&wt_id, &wt_task_name, &wt_branch, &wt_target, &wt_path);
-            if let Err(e) = session::create_session(&mux, &session, &wt_path, Some(&session_env)) {
+        // 4. 使用共享的 create_task_session（读 config、检查存在、创建、持久化）
+        let session_info = match crate::operations::tasks::create_task_session(
+            &self.project.project_key,
+            &task,
+            &self.project.project_path,
+        ) {
+            Ok(info) => info,
+            Err(e) => {
                 self.show_toast(format!("Session error: {}", e));
                 return;
             }
+        };
 
-            // 应用布局
-            match mux {
-                Multiplexer::Tmux => {
-                    if self.config.task_layout != TaskLayout::Single {
-                        if let Err(e) = tmux::layout::apply_layout(
-                            &session,
-                            &wt_path,
-                            &self.config.task_layout,
-                            &self.config.agent_command,
-                            self.config.custom_layout.as_ref(),
-                        ) {
-                            self.show_toast(format!("Layout: {}", e));
-                        }
-                    }
-                }
-                Multiplexer::Zellij => {
-                    let kdl = crate::zellij::layout::generate_kdl(
-                        &self.config.task_layout,
-                        &self.config.agent_command,
-                        self.config.custom_layout.as_ref(),
-                        &session_env.shell_export_prefix(),
-                    );
-                    match crate::zellij::layout::write_session_layout(&session, &kdl) {
-                        Ok(path) => layout_path = Some(path),
-                        Err(e) => self.show_toast(format!("Layout: {}", e)),
-                    }
-                }
-            }
-        }
+        let mux = session_info.session_type;
+        let session = session_info.session_name;
+        let layout_path = session_info.layout_path;
 
         // 5. 清除该任务的通知标记
         self.remove_notification(&wt_id);
@@ -1524,7 +1571,7 @@ impl App {
             self.build_session_env(&wt_id, &wt_task_name, &wt_branch, &wt_target, &wt_path);
         self.async_ops.pending_attach = Some(PendingAttach {
             session,
-            multiplexer: mux,
+            session_type: mux,
             working_dir: wt_path,
             env: session_env,
             layout_path,
@@ -1649,12 +1696,8 @@ impl App {
 
         let repo_path = self.project.project_path.clone();
 
-        let preflight = self.archive_preflight(
-            &repo_path,
-            &task.worktree_path,
-            &task.branch,
-            &task.target,
-        );
+        let preflight =
+            self.archive_preflight(&repo_path, &task.worktree_path, &task.branch, &task.target);
 
         if !preflight.needs_confirm() {
             self.do_archive(task_id);
@@ -1698,7 +1741,10 @@ impl App {
         };
 
         result.branch_merged = match git::is_merged(repo_path, branch, target) {
-            Ok(v) => v,
+            Ok(v) => {
+                // Fallback: if is-ancestor says not merged, check diff for squash merge
+                v || git::is_diff_empty(repo_path, branch, target).unwrap_or(false)
+            }
             Err(e) => {
                 result.merge_check_failed = true;
                 self.show_toast(format!("Git error: {}", e));
@@ -1734,8 +1780,7 @@ impl App {
 
         let repo_path = self.project.project_path.clone();
 
-        let preflight =
-            self.archive_preflight(&repo_path, &worktree_path, &branch, &target);
+        let preflight = self.archive_preflight(&repo_path, &worktree_path, &branch, &target);
 
         if !preflight.needs_confirm() {
             self.do_archive(&task_id);
@@ -1767,50 +1812,41 @@ impl App {
             self.project.project_path.clone()
         };
 
-        // 1. 获取 worktree 路径并删除
-        if let Ok(Some(task)) = tasks::get_task(&project_key, task_id) {
-            if Path::new(&task.worktree_path).exists() {
-                let _ = git::remove_worktree(&project_path, &task.worktree_path);
-            }
-        }
-
-        // 2. 移动到 archived.toml（在 kill session 之前！）
-        if let Err(e) = tasks::archive_task(&project_key, task_id) {
-            self.show_toast(format!("Archive failed: {}", e));
-            return;
-        }
-
-        // 3. 删除 hook 通知
-        hooks::remove_task_hook(&project_key, task_id);
-        self.remove_notification(task_id);
-
-        // 4. 关闭 session（放在最后，避免 monitor 进程被提前终止）
-        let archived_task = tasks::get_archived_task(&project_key, task_id)
-            .ok()
-            .flatten();
-        let task_mux_str = archived_task
+        // Get task info before archive
+        let task_info = tasks::get_task(&project_key, task_id).ok().flatten();
+        let task_mux_str = task_info
             .as_ref()
             .map(|t| t.multiplexer.clone())
             .unwrap_or_default();
-        let task_session_name = archived_task
+        let task_session_name = task_info
             .as_ref()
             .map(|t| t.session_name.clone())
             .unwrap_or_default();
-        let task_mux = session::resolve_multiplexer(&task_mux_str, &self.config.multiplexer);
-        let session = session::resolve_session_name(&task_session_name, &project_key, task_id);
-        let _ = session::kill_session(&task_mux, &session);
-        // Clean up zellij layout file if applicable
-        if task_mux == Multiplexer::Zellij {
-            crate::zellij::layout::remove_session_layout(&session);
-        }
 
-        // 5. 刷新数据
-        if self.mode == AppMode::Monitor {
-            self.should_quit = true;
-        } else {
-            self.project.refresh();
+        // Call shared operation
+        match crate::operations::tasks::archive_task(
+            &project_path,
+            &project_key,
+            task_id,
+            &task_mux_str,
+            &task_session_name,
+        ) {
+            Ok(_) => {
+                // TUI-specific: remove notification
+                self.remove_notification(task_id);
+
+                // Refresh data
+                if self.mode == AppMode::Monitor {
+                    self.should_quit = true;
+                } else {
+                    self.project.refresh();
+                }
+                self.show_toast("Task archived");
+            }
+            Err(e) => {
+                self.show_toast(format!("Archive failed: {}", e));
+            }
         }
-        self.show_toast("Task archived");
     }
 
     // ========== Clean 功能 ==========
@@ -1832,9 +1868,10 @@ impl App {
         let target = wt.target.clone();
         let is_archived = wt.archived;
 
-        // 检查是否已 merge
-        let is_merged =
-            git::is_merged(&self.project.project_path, &branch, &target).unwrap_or(false);
+        // 检查是否已 merge (含 squash merge 兜底)
+        let is_merged = git::is_merged(&self.project.project_path, &branch, &target)
+            .unwrap_or(false)
+            || git::is_diff_empty(&self.project.project_path, &branch, &target).unwrap_or(false);
 
         self.async_ops.pending_action = Some(PendingAction::Clean {
             task_id,
@@ -1868,11 +1905,11 @@ impl App {
             .as_ref()
             .map(|t| t.session_name.clone())
             .unwrap_or_default();
-        let task_mux = session::resolve_multiplexer(&task_mux_str, &self.config.multiplexer);
+        let task_mux = session::resolve_session_type(&task_mux_str);
         let session =
             session::resolve_session_name(&task_session_name, &self.project.project_key, task_id);
         let _ = session::kill_session(&task_mux, &session);
-        if task_mux == Multiplexer::Zellij {
+        if task_mux == SessionType::Zellij {
             crate::zellij::layout::remove_session_layout(&session);
         }
 
@@ -1913,10 +1950,9 @@ impl App {
         hooks::remove_task_hook(&self.project.project_key, task_id);
         self.remove_notification(task_id);
 
-        // 6.5 清理关联数据 (notes, review comments, activity)
-        let _ = notes::delete_notes(&self.project.project_key, task_id);
-        let _ = comments::delete_review_data(&self.project.project_key, task_id);
-        let _ = crate::watcher::clear_edit_history(&self.project.project_key, task_id);
+        // 6.5 清理关联数据 (notes, review comments, activity, symbol cache)
+        let _ = storage::delete_task_data(&self.project.project_key, task_id);
+        crate::symbols::on_task_deleted(&self.project.project_key, task_id);
 
         // 7. 刷新数据
         self.project.refresh();
@@ -1958,8 +1994,8 @@ impl App {
 
     /// 执行 Reset
     fn do_reset(&mut self, task_id: &str) {
-        // 1. 获取 task 信息
-        let task = match tasks::get_task(&self.project.project_key, task_id) {
+        // Get task info before reset
+        let task_info = match tasks::get_task(&self.project.project_key, task_id) {
             Ok(Some(t)) => t,
             _ => {
                 self.show_toast("Task not found");
@@ -1967,73 +2003,51 @@ impl App {
             }
         };
 
-        // 2. Kill session (用旧 task 的 multiplexer)
-        let old_mux = session::resolve_multiplexer(&task.multiplexer, &self.config.multiplexer);
-        let session =
-            session::resolve_session_name(&task.session_name, &self.project.project_key, task_id);
-        let _ = session::kill_session(&old_mux, &session);
-        if old_mux == Multiplexer::Zellij {
-            crate::zellij::layout::remove_session_layout(&session);
-        }
-
-        // 3. Remove worktree (如果存在)
-        if Path::new(&task.worktree_path).exists() {
-            if let Err(e) = git::remove_worktree(&self.project.project_path, &task.worktree_path) {
-                self.show_toast(format!("Failed to remove worktree: {}", e));
+        // Call shared operation
+        let result = match crate::operations::tasks::reset_task(
+            &self.project.project_path,
+            &self.project.project_key,
+            task_id,
+            &task_info.multiplexer,
+            &task_info.session_name,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                self.show_toast(format!("Reset failed: {}", e));
                 return;
             }
-        }
+        };
 
-        // 4. Delete branch
-        if let Err(e) = git::delete_branch(&self.project.project_path, &task.branch) {
-            self.show_toast(format!("Failed to delete branch: {}", e));
-            return;
-        }
-
-        // 4.5 Clear all task-related data (Notes, AI data, Stats)
-        let _ = notes::delete_notes(&self.project.project_key, task_id);
-        let _ = comments::delete_review_data(&self.project.project_key, task_id);
-        let _ = crate::watcher::clear_edit_history(&self.project.project_key, task_id);
-
-        // 5. 重新创建 branch 和 worktree (从 target)
-        let worktree_path = Path::new(&task.worktree_path);
-        if let Err(e) = git::create_worktree(
-            &self.project.project_path,
-            &task.branch,
-            worktree_path,
-            &task.target,
-        ) {
-            self.show_toast(format!("Failed to recreate worktree: {}", e));
-            return;
-        }
-
-        // 6. 更新 task metadata (updated_at)
-        if let Err(e) = tasks::touch_task(&self.project.project_key, task_id) {
-            // 只是警告，不中断流程
-            eprintln!("Warning: Failed to update task: {}", e);
-        }
-
-        // 7. 创建新 session（使用当前全局 multiplexer）
-        let session_env = self.build_session_env(
-            &task.id,
-            &task.name,
-            &task.branch,
-            &task.target,
-            &task.worktree_path,
+        // TUI-specific: Create new session
+        let session = session::resolve_session_name(
+            &result.task.session_name,
+            &self.project.project_key,
+            task_id,
         );
+        let session_env = self.build_session_env(
+            &result.task.id,
+            &result.task.name,
+            &result.task.branch,
+            &result.task.target,
+            &result.task.worktree_path,
+        );
+
+        // Resolve session type from task
+        let task_session_type = session::resolve_session_type(&result.task.multiplexer);
+
         if let Err(e) = session::create_session(
-            &self.config.multiplexer,
+            &task_session_type,
             &session,
-            &task.worktree_path,
+            &result.task.worktree_path,
             Some(&session_env),
         ) {
             self.show_toast(format!("Failed to create session: {}", e));
             return;
         }
 
-        // 7.5 生成 zellij layout（始终生成以注入环境变量）
+        // Generate zellij layout if applicable
         let mut layout_path: Option<String> = None;
-        if self.config.multiplexer == Multiplexer::Zellij {
+        if matches!(task_session_type, SessionType::Zellij) {
             let kdl = crate::zellij::layout::generate_kdl(
                 &self.config.task_layout,
                 &self.config.agent_command,
@@ -2045,15 +2059,13 @@ impl App {
             }
         }
 
-        // 8. 刷新数据
+        // Refresh and auto-attach
         self.project.refresh();
         self.show_toast("Task reset");
-
-        // 9. 自动进入 session
         self.async_ops.pending_attach = Some(PendingAttach {
             session,
-            multiplexer: self.config.multiplexer.clone(),
-            working_dir: task.worktree_path.clone(),
+            session_type: task_session_type,
+            working_dir: result.task.worktree_path.clone(),
             env: session_env,
             layout_path,
         });
@@ -2073,6 +2085,7 @@ impl App {
                 } => self.do_clean(&task_id, is_archived),
                 PendingAction::RebaseTo { .. } => {} // RebaseTo 不使用确认弹窗
                 PendingAction::Checkout => {}        // Checkout 不使用确认弹窗
+                PendingAction::NewTaskTarget => {}   // NewTaskTarget 不使用确认弹窗
                 PendingAction::Recover { task_id } => self.recover_worktree(&task_id),
                 PendingAction::Sync {
                     task_id,
@@ -2108,8 +2121,22 @@ impl App {
                         &self.monitor.project_key,
                         &self.monitor.task_id,
                     );
-                    let _ = session::kill_session(&self.monitor.multiplexer, &session);
+                    let _ = session::kill_session(&self.monitor.session_type, &session);
                     self.should_quit = true;
+                }
+                PendingAction::InitGitThenNewTask => {
+                    let path = self.project.project_path.clone();
+                    match crate::operations::projects::init_git_repo(&path) {
+                        Ok(()) => {
+                            self.project.is_git_usable = true;
+                            self.project.refresh();
+                            self.workspace.reload_projects();
+                            self.dialogs.show_new_task_dialog = true;
+                        }
+                        Err(e) => {
+                            self.show_toast(format!("Failed to initialize Git: {}", e));
+                        }
+                    }
                 }
             }
         }
@@ -2190,76 +2217,92 @@ impl App {
 
     /// 恢复归档的任务
     fn recover_worktree(&mut self, task_id: &str) {
-        // 获取 task 信息
-        let task = match tasks::get_archived_task(&self.project.project_key, task_id) {
-            Ok(Some(t)) => t,
-            _ => {
-                self.show_toast("Task not found");
+        // Call shared operation
+        let result = match crate::operations::tasks::recover_task(
+            &self.project.project_path,
+            &self.project.project_key,
+            task_id,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                self.show_toast(format!("Recover failed: {}", e));
                 return;
             }
         };
 
-        // 检查 branch 是否还存在
-        if !git::branch_exists(&self.project.project_path, &task.branch) {
-            self.show_toast("Branch deleted - cannot recover");
-            return;
-        }
-
-        // 重新创建 worktree
-        let worktree_path = Path::new(&task.worktree_path);
-        if let Err(e) = git::create_worktree_from_branch(
-            &self.project.project_path,
-            &task.branch,
-            worktree_path,
-        ) {
-            self.show_toast(format!("Git error: {}", e));
-            return;
-        }
-
-        // 移回 tasks.toml
-        if let Err(e) = tasks::recover_task(&self.project.project_key, task_id) {
-            self.show_toast(format!("Recover failed: {}", e));
-            return;
-        }
-
-        // 创建 session (使用当前全局 multiplexer)
-        let session =
-            session::resolve_session_name(&task.session_name, &self.project.project_key, task_id);
-        let session_env = self.build_session_env(
-            &task.id,
-            &task.name,
-            &task.branch,
-            &task.target,
-            &task.worktree_path,
+        // TUI-specific: Create session
+        let session = session::resolve_session_name(
+            &result.task.session_name,
+            &self.project.project_key,
+            task_id,
         );
+        let session_env = self.build_session_env(
+            &result.task.id,
+            &result.task.name,
+            &result.task.branch,
+            &result.task.target,
+            &result.task.worktree_path,
+        );
+
+        // Resolve session type from task
+        let task_session_type = session::resolve_session_type(&result.task.multiplexer);
+
         if let Err(e) = session::create_session(
-            &self.config.multiplexer,
+            &task_session_type,
             &session,
-            task.worktree_path.as_str(),
+            result.task.worktree_path.as_str(),
             Some(&session_env),
         ) {
             self.show_toast(format!("Session error: {}", e));
             return;
         }
 
-        // 刷新数据并进入
+        // Refresh and auto-attach
         self.project.refresh();
         self.show_toast("Task recovered");
         self.async_ops.pending_attach = Some(PendingAttach {
             session,
-            multiplexer: self.config.multiplexer.clone(),
-            working_dir: task.worktree_path.clone(),
+            session_type: task_session_type,
+            working_dir: result.task.worktree_path.clone(),
             env: session_env,
             layout_path: None,
         });
+    }
+
+    // ========== Branch Helpers ==========
+
+    /// 获取用户分支列表（过滤掉 Grove 管理的 worktree 分支，保留 Local Task 的分支）
+    fn list_user_branches(&self) -> Result<Vec<String>, crate::error::GroveError> {
+        use std::collections::HashSet;
+        let all_branches = git::list_branches(&self.project.project_path)?;
+
+        // 收集 Grove 管理的分支（跳过 Local Task，它的 branch 是用户的真实分支）
+        let mut grove_branches = HashSet::new();
+        if let Ok(active) = tasks::load_tasks(&self.project.project_key) {
+            for t in active {
+                if !t.is_local {
+                    grove_branches.insert(t.branch);
+                }
+            }
+        }
+        if let Ok(archived) = tasks::load_archived_tasks(&self.project.project_key) {
+            for t in archived {
+                grove_branches.insert(t.branch);
+            }
+        }
+
+        Ok(all_branches
+            .into_iter()
+            .filter(|b| !grove_branches.contains(b))
+            .collect())
     }
 
     // ========== Checkout 功能 ==========
 
     /// 打开 Checkout 分支选择器（在主仓库执行 checkout）
     pub fn open_checkout_selector(&mut self) {
-        // 获取所有分支
-        let branches = match git::list_branches(&self.project.project_path) {
+        // 获取用户分支（过滤 Grove 管理的分支）
+        let branches = match self.list_user_branches() {
             Ok(b) => b,
             Err(e) => {
                 self.show_toast(format!("Failed to list branches: {}", e));
@@ -2296,8 +2339,8 @@ impl App {
         let task_name = wt.task_name.clone();
         let current_target = wt.target.clone();
 
-        // 获取所有分支
-        let branches = match git::list_branches(&self.project.project_path) {
+        // 获取用户分支（过滤 Grove 管理的分支）
+        let branches = match self.list_user_branches() {
             Ok(b) => b,
             Err(e) => {
                 self.show_toast(format!("Failed to list branches: {}", e));
@@ -2367,6 +2410,10 @@ impl App {
                     self.show_toast(format!("Target changed to {}", branch));
                 }
             }
+            Some(PendingAction::NewTaskTarget) => {
+                // 设置 target branch 并保持 New Task 弹窗打开
+                self.async_ops.target_branch = branch;
+            }
             Some(PendingAction::Checkout) => {
                 // 在主仓库执行 checkout
                 match git::has_uncommitted_changes(&self.project.project_path) {
@@ -2381,8 +2428,10 @@ impl App {
                                     "branch:{}",
                                     self.project.project_path
                                 ));
-                                self.project.refresh();
+
                                 self.show_toast(format!("Switched to {}", branch));
+
+                                self.project.refresh();
                             }
                             Err(e) => {
                                 self.show_toast(format!("Checkout failed: {}", e));
@@ -2482,20 +2531,15 @@ impl App {
 
     /// 执行 Sync
     fn do_sync(&mut self, task_id: &str) {
-        // 获取 task 信息
-        let task = match tasks::get_task(&self.project.project_key, task_id) {
-            Ok(Some(t)) => t,
-            _ => {
-                self.show_toast("Task not found");
-                return;
-            }
-        };
-
-        // 执行 rebase
-        match git::rebase(&task.worktree_path, &task.target) {
-            Ok(()) => {
+        // Call shared operation
+        match crate::operations::tasks::sync_task(
+            &self.project.project_path,
+            &self.project.project_key,
+            task_id,
+        ) {
+            Ok(target) => {
                 self.project.refresh();
-                self.show_toast(format!("Synced with {}", task.target));
+                self.show_toast(format!("Synced with {}", target));
             }
             Err(e) => {
                 let error_msg = e.to_string();
@@ -2629,59 +2673,50 @@ impl App {
 
     /// 执行 Merge（后台线程）
     fn do_merge(&mut self, task_id: &str, method: MergeMethod) {
-        // 获取 task 信息
-        let task = match tasks::get_task(&self.project.project_key, task_id) {
-            Ok(Some(t)) => t,
-            _ => {
-                self.show_toast("Task not found");
-                return;
-            }
-        };
-
         // 设置 loading 状态
         self.async_ops.loading_message = Some("Merging...".to_string());
 
         // 准备后台线程需要的数据
         let repo_path = self.project.project_path.clone();
-        let branch = task.branch.clone();
-        let task_name = task.name.clone();
+        let project_key = self.project.project_key.clone();
         let task_id = task_id.to_string();
 
-        // 加载 notes（失败不阻塞 merge）
-        let notes_content = notes::load_notes(&self.project.project_key, &task_id)
-            .ok()
-            .filter(|s| !s.trim().is_empty());
+        // 将 UI MergeMethod 转换为 operations MergeMethod
+        let ops_method = match method {
+            MergeMethod::Squash => crate::operations::tasks::MergeMethod::Squash,
+            MergeMethod::MergeCommit => crate::operations::tasks::MergeMethod::MergeCommit,
+        };
 
         let (tx, rx) = mpsc::channel();
         self.async_ops.bg_result_rx = Some(rx);
 
         std::thread::spawn(move || {
-            let result = match method {
-                MergeMethod::Squash => {
-                    // Squash merge + commit; rollback on any failure
-                    let msg = git::build_commit_message(&task_name, notes_content.as_deref());
-                    git::merge_squash(&repo_path, &branch).and_then(|()| {
-                        git::commit(&repo_path, &msg).inspect_err(|_| {
-                            let _ = git::reset_merge(&repo_path);
-                        })
-                    })
-                }
-                MergeMethod::MergeCommit => {
-                    let title = format!("Merge: {}", task_name);
-                    let msg = git::build_commit_message(&title, notes_content.as_deref());
-                    git::merge_no_ff(&repo_path, &branch, &msg)
-                }
-            };
-
-            let bg_result = match result {
-                Ok(()) => BgResult::MergeOk { task_id, task_name },
-                Err(e) => {
-                    // Rollback merge state on any error (including conflicts)
-                    let _ = git::reset_merge(&repo_path);
-                    BgResult::MergeErr(e.to_string())
-                }
-            };
-            let _ = tx.send(bg_result);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Call shared operation
+                let bg_result = match crate::operations::tasks::merge_task(
+                    &repo_path,
+                    &project_key,
+                    &task_id,
+                    ops_method,
+                ) {
+                    Ok(result) => BgResult::MergeOk {
+                        task_id: result.task_id,
+                        task_name: result.task_name,
+                    },
+                    Err(e) => BgResult::MergeErr(e.to_string()),
+                };
+                let _ = tx.send(bg_result);
+            }));
+            if let Err(e) = result {
+                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                eprintln!("[Grove] Merge thread panicked: {}", msg);
+            }
         });
     }
 
@@ -2736,6 +2771,95 @@ impl App {
         }
     }
 
+    // ========== New Project 功能 ==========
+
+    /// 打开 New Project 对话框
+    pub fn open_new_project_dialog(&mut self) {
+        self.dialogs.new_project_dialog = Some(crate::dialogs::NewProjectData::new());
+    }
+
+    /// 关闭 New Project 对话框
+    pub fn close_new_project_dialog(&mut self) {
+        self.dialogs.new_project_dialog = None;
+    }
+
+    /// New Project - 输入字符
+    pub fn new_project_input_char(&mut self, c: char) {
+        if let Some(ref mut data) = self.dialogs.new_project_dialog {
+            data.input_char(c);
+        }
+    }
+
+    /// New Project - 删除字符
+    pub fn new_project_delete_char(&mut self) {
+        if let Some(ref mut data) = self.dialogs.new_project_dialog {
+            data.delete_char();
+        }
+    }
+
+    /// New Project - Tab 切换焦点
+    pub fn new_project_toggle_focus(&mut self) {
+        if let Some(ref mut data) = self.dialogs.new_project_dialog {
+            data.toggle_focus();
+        }
+    }
+
+    /// New Project - 切换 init_git 复选框
+    pub fn new_project_toggle_init_git(&mut self) {
+        if let Some(ref mut data) = self.dialogs.new_project_dialog {
+            data.toggle_init_git();
+        }
+    }
+
+    /// New Project - 确认创建
+    pub fn new_project_confirm(&mut self) {
+        let (expanded, init_git) = match &self.dialogs.new_project_dialog {
+            Some(data) => (data.expanded_path(), data.init_git),
+            None => return,
+        };
+
+        if expanded.is_empty() {
+            if let Some(ref mut data) = self.dialogs.new_project_dialog {
+                data.set_error("Path cannot be empty");
+            }
+            return;
+        }
+
+        // 拆分 parent + name
+        let path_obj = Path::new(&expanded);
+        let name = match path_obj.file_name().and_then(|n| n.to_str()) {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => {
+                if let Some(ref mut data) = self.dialogs.new_project_dialog {
+                    data.set_error("Invalid path: cannot derive project name");
+                }
+                return;
+            }
+        };
+        let parent = match path_obj.parent().and_then(|p| p.to_str()) {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => {
+                if let Some(ref mut data) = self.dialogs.new_project_dialog {
+                    data.set_error("Invalid path: missing parent directory");
+                }
+                return;
+            }
+        };
+
+        match crate::operations::projects::create_new_project(&parent, &name, init_git) {
+            Ok(_) => {
+                self.close_new_project_dialog();
+                self.workspace.reload_projects();
+                self.show_toast(format!("Created: {}", name));
+            }
+            Err(e) => {
+                if let Some(ref mut data) = self.dialogs.new_project_dialog {
+                    data.set_error(format!("{}", e));
+                }
+            }
+        }
+    }
+
     /// Add Project - 确认添加
     pub fn add_project_confirm(&mut self) {
         let path = match &self.dialogs.add_project_dialog {
@@ -2758,13 +2882,7 @@ impl App {
             return;
         }
 
-        // 验证是否是 git 仓库
-        if !git::is_git_repo(&path) {
-            if let Some(ref mut data) = self.dialogs.add_project_dialog {
-                data.set_error("Not a git repository");
-            }
-            return;
-        }
+        // 非 git 仓库也允许注册,后续通过 Web UI 可引导初始化
 
         // 验证是否已注册(add_project 内部会处理 worktree)
         if storage::workspace::is_project_registered(&path).unwrap_or(false) {
@@ -2832,12 +2950,11 @@ impl App {
         let archived_tasks = tasks::load_archived_tasks(&project_key).unwrap_or_default();
 
         // 2. 清理所有任务
-        let global_mux = storage::config::load_config().multiplexer;
         for task in active_tasks.iter().chain(archived_tasks.iter()) {
             // 关闭 session（根据 task 的 multiplexer 类型）
-            let task_mux = session::resolve_multiplexer(&task.multiplexer, &global_mux);
+            let task_session_type = session::resolve_session_type(&task.multiplexer);
             let session = session::resolve_session_name(&task.session_name, &project_key, &task.id);
-            let _ = session::kill_session(&task_mux, &session);
+            let _ = session::kill_session(&task_session_type, &session);
 
             // 删除 worktree (如果存在)
             if Path::new(&task.worktree_path).exists() {
@@ -2876,34 +2993,38 @@ impl App {
             return;
         }
 
+        // 检查是否为 Local Task
+        let is_local = self
+            .project
+            .selected_worktree()
+            .map(|wt| wt.is_local)
+            .unwrap_or(false);
+
         // 根据当前 Tab 决定可用 actions
-        let actions = match self.project.current_tab {
-            ProjectTab::Archived => vec![ActionType::Clean, ActionType::Recover],
-            ProjectTab::Current => vec![
-                // Edit
-                ActionType::Commit,
-                ActionType::Review,
-                // Branch
-                ActionType::RebaseTo,
-                ActionType::Sync,
-                ActionType::Merge,
-                // Session
-                ActionType::Archive,
-                ActionType::Clean,
-                ActionType::Reset,
-            ],
-            ProjectTab::Other => vec![
-                // Edit
-                ActionType::Commit,
-                ActionType::Review,
-                // Branch
-                ActionType::RebaseTo,
-                ActionType::Sync,
-                // Session
-                ActionType::Archive,
-                ActionType::Clean,
-                ActionType::Reset,
-            ],
+        let actions = if is_local {
+            // Local Task: 仅 Commit 和 Review(非 git 项目禁用 Commit)
+            if self.project.is_git_usable {
+                vec![ActionType::Commit, ActionType::Review]
+            } else {
+                vec![ActionType::Review]
+            }
+        } else {
+            match self.project.current_tab {
+                ProjectTab::Archived => vec![ActionType::Clean, ActionType::Recover],
+                ProjectTab::Active => vec![
+                    // Edit
+                    ActionType::Commit,
+                    ActionType::Review,
+                    // Branch
+                    ActionType::RebaseTo,
+                    ActionType::Sync,
+                    ActionType::Merge,
+                    // Session
+                    ActionType::Archive,
+                    ActionType::Clean,
+                    ActionType::Reset,
+                ],
+            }
         };
 
         self.dialogs.action_palette = Some(ActionPaletteData::new(actions));
@@ -3036,7 +3157,8 @@ impl App {
         let config = storage::config::load_config();
         self.dialogs.config_panel = Some(ConfigPanelData::with_multiplexer(
             &config.layout,
-            &config.multiplexer,
+            &config.terminal_multiplexer,
+            &config.auto_link,
         ));
     }
 
@@ -3046,7 +3168,7 @@ impl App {
             match panel.step {
                 ConfigStep::Main => {
                     if panel.main_selected == 0 {
-                        panel.main_selected = 4;
+                        panel.main_selected = 5;
                     } else {
                         panel.main_selected -= 1;
                     }
@@ -3078,7 +3200,14 @@ impl App {
                 ConfigStep::HookWizard => {
                     panel.hook_data.select_prev();
                 }
+                ConfigStep::AutoLinkConfig => {
+                    // Navigate through pattern list
+                    if !panel.autolink_patterns.is_empty() && panel.autolink_selected > 0 {
+                        panel.autolink_selected -= 1;
+                    }
+                }
                 ConfigStep::EditAgentCommand
+                | ConfigStep::AutoLinkEdit
                 | ConfigStep::CustomPaneCommand
                 | ConfigStep::McpConfig => {}
             }
@@ -3090,7 +3219,7 @@ impl App {
         if let Some(ref mut panel) = self.dialogs.config_panel {
             match panel.step {
                 ConfigStep::Main => {
-                    panel.main_selected = (panel.main_selected + 1) % 5;
+                    panel.main_selected = (panel.main_selected + 1) % 6;
                 }
                 ConfigStep::SelectLayout => {
                     let count = TaskLayout::all().len() + 1;
@@ -3105,7 +3234,15 @@ impl App {
                 ConfigStep::HookWizard => {
                     panel.hook_data.select_next();
                 }
+                ConfigStep::AutoLinkConfig => {
+                    // Navigate through pattern list
+                    if !panel.autolink_patterns.is_empty() {
+                        panel.autolink_selected =
+                            (panel.autolink_selected + 1) % panel.autolink_patterns.len();
+                    }
+                }
                 ConfigStep::EditAgentCommand
+                | ConfigStep::AutoLinkEdit
                 | ConfigStep::CustomPaneCommand
                 | ConfigStep::McpConfig => {}
             }
@@ -3122,12 +3259,13 @@ impl App {
                         0 => panel.step = ConfigStep::EditAgentCommand,
                         1 => panel.step = ConfigStep::SelectLayout,
                         2 => panel.step = ConfigStep::SelectMultiplexer,
-                        3 => {
+                        3 => panel.step = ConfigStep::AutoLinkConfig,
+                        4 => {
                             panel.step = ConfigStep::HookWizard;
                             panel.hook_data =
                                 crate::ui::components::hook_panel::HookConfigData::new();
                         }
-                        4 => panel.step = ConfigStep::McpConfig,
+                        5 => panel.step = ConfigStep::McpConfig,
                         _ => {}
                     }
                 }
@@ -3137,6 +3275,16 @@ impl App {
                 if let Some(ref mut panel) = self.dialogs.config_panel {
                     panel.step = ConfigStep::Main;
                 }
+            }
+            Some(ConfigStep::AutoLinkConfig) => {
+                // AutoLink 配置页面 - Enter 返回主菜单
+                if let Some(ref mut panel) = self.dialogs.config_panel {
+                    panel.step = ConfigStep::Main;
+                }
+            }
+            Some(ConfigStep::AutoLinkEdit) => {
+                // AutoLink 编辑/添加页面 - 保存并返回
+                self.config_save_autolink_edit();
             }
             Some(ConfigStep::EditAgentCommand) => {
                 self.config_save_agent_command();
@@ -3208,7 +3356,8 @@ impl App {
             }
             Some(ConfigStep::SelectLayout)
             | Some(ConfigStep::EditAgentCommand)
-            | Some(ConfigStep::SelectMultiplexer) => {
+            | Some(ConfigStep::SelectMultiplexer)
+            | Some(ConfigStep::AutoLinkConfig) => {
                 if let Some(ref mut panel) = self.dialogs.config_panel {
                     panel.step = ConfigStep::Main;
                 }
@@ -3246,6 +3395,12 @@ impl App {
                     panel.custom_cmd_cursor = 0;
                 }
             }
+            Some(ConfigStep::AutoLinkEdit) => {
+                // 返回 AutoLink 配置页面
+                if let Some(ref mut panel) = self.dialogs.config_panel {
+                    panel.step = ConfigStep::AutoLinkConfig;
+                }
+            }
             Some(ConfigStep::HookWizard) => {
                 let hook_step = self.dialogs.config_panel.as_ref().map(|p| p.hook_data.step);
 
@@ -3280,6 +3435,62 @@ impl App {
         if let Some(ref mut panel) = self.dialogs.config_panel {
             panel.agent_input.pop();
             panel.agent_cursor = panel.agent_input.len();
+        }
+    }
+
+    /// Config Panel - AutoLink 添加新模式
+    pub fn config_autolink_add(&mut self) {
+        if let Some(ref mut panel) = self.dialogs.config_panel {
+            panel.autolink_input.clear();
+            panel.autolink_cursor = 0;
+            panel.autolink_editing = None;
+            panel.step = ConfigStep::AutoLinkEdit;
+        }
+    }
+
+    /// Config Panel - AutoLink 编辑选中的模式
+    pub fn config_autolink_edit(&mut self) {
+        if let Some(ref mut panel) = self.dialogs.config_panel {
+            let idx = panel.autolink_selected;
+            if idx < panel.autolink_patterns.len() {
+                panel.autolink_input = panel.autolink_patterns[idx].clone();
+                panel.autolink_cursor = panel.autolink_input.len();
+                panel.autolink_editing = Some(idx);
+                panel.step = ConfigStep::AutoLinkEdit;
+            }
+        }
+    }
+
+    /// Config Panel - AutoLink 删除选中的模式
+    pub fn config_autolink_delete(&mut self) {
+        if let Some(ref mut panel) = self.dialogs.config_panel {
+            let idx = panel.autolink_selected;
+            if idx < panel.autolink_patterns.len() {
+                panel.autolink_patterns.remove(idx);
+                if panel.autolink_selected >= panel.autolink_patterns.len()
+                    && panel.autolink_selected > 0
+                {
+                    panel.autolink_selected -= 1;
+                }
+                // 保存到配置
+                self.config_save_autolink();
+            }
+        }
+    }
+
+    /// Config Panel - AutoLink 输入字符
+    pub fn config_autolink_input_char(&mut self, c: char) {
+        if let Some(ref mut panel) = self.dialogs.config_panel {
+            panel.autolink_input.push(c);
+            panel.autolink_cursor = panel.autolink_input.len();
+        }
+    }
+
+    /// Config Panel - AutoLink 删除字符
+    pub fn config_autolink_delete_char(&mut self) {
+        if let Some(ref mut panel) = self.dialogs.config_panel {
+            panel.autolink_input.pop();
+            panel.autolink_cursor = panel.autolink_input.len();
         }
     }
 
@@ -3356,36 +3567,104 @@ impl App {
             .map(|p| p.multiplexer_selected)
             .unwrap_or(0);
 
-        let mux = if selected == 1 {
-            Multiplexer::Zellij
-        } else {
-            Multiplexer::Tmux
-        };
-
-        // 检查是否已安装
-        let installed = match mux {
-            Multiplexer::Tmux => crate::check::check_tmux_available(),
-            Multiplexer::Zellij => crate::check::check_zellij_available(),
-        };
-
-        if !installed {
-            self.show_toast(format!("{} is not installed", mux));
-            return;
-        }
-
-        // 更新内存状态
-        self.config.multiplexer = mux.clone();
-
         // 保存到文件
         let mut config = storage::config::load_config();
-        config.multiplexer = mux.clone();
+
+        match selected {
+            1 => {
+                // Zellij
+                if !crate::check::check_zellij_available() {
+                    self.show_toast("Zellij is not installed");
+                    return;
+                }
+                config.terminal_multiplexer = storage::config::TerminalMultiplexer::Zellij;
+                config.enable_terminal = true;
+                config.enable_chat = false;
+                self.config.terminal_multiplexer = storage::config::TerminalMultiplexer::Zellij;
+                self.config.enable_terminal = true;
+                self.config.enable_chat = false;
+            }
+            2 => {
+                // ACP (Chat)
+                config.enable_chat = true;
+                config.enable_terminal = false;
+                self.config.enable_chat = true;
+                self.config.enable_terminal = false;
+            }
+            _ => {
+                // Tmux
+                if !crate::check::check_tmux_available() {
+                    self.show_toast("Tmux is not installed");
+                    return;
+                }
+                config.terminal_multiplexer = storage::config::TerminalMultiplexer::Tmux;
+                config.enable_terminal = true;
+                config.enable_chat = false;
+                self.config.terminal_multiplexer = storage::config::TerminalMultiplexer::Tmux;
+                self.config.enable_terminal = true;
+                self.config.enable_chat = false;
+            }
+        }
+
         let _ = storage::config::save_config(&config);
 
         // 返回主菜单
         if let Some(ref mut panel) = self.dialogs.config_panel {
             panel.step = ConfigStep::Main;
         }
-        self.show_toast(format!("Multiplexer: {}", mux));
+
+        let mode_name = match selected {
+            1 => "Zellij",
+            2 => "Chat (ACP)",
+            _ => "Tmux",
+        };
+        self.show_toast(format!("Mode: {}", mode_name));
+    }
+
+    /// Config Panel - 保存 AutoLink 配置
+    fn config_save_autolink(&mut self) {
+        let patterns = self
+            .dialogs
+            .config_panel
+            .as_ref()
+            .map(|p| p.autolink_patterns.clone())
+            .unwrap_or_default();
+
+        // 保存到文件
+        let mut config = storage::config::load_config();
+        config.auto_link.patterns = patterns;
+        let _ = storage::config::save_config(&config);
+
+        self.show_toast("AutoLink saved");
+    }
+
+    /// Config Panel - 保存 AutoLink 编辑并返回
+    fn config_save_autolink_edit(&mut self) {
+        if let Some(ref mut panel) = self.dialogs.config_panel {
+            let pattern = panel.autolink_input.trim().to_string();
+
+            if pattern.is_empty() {
+                // 空模式直接返回不保存
+                panel.step = ConfigStep::AutoLinkConfig;
+                return;
+            }
+
+            if let Some(idx) = panel.autolink_editing {
+                // 编辑现有模式
+                if idx < panel.autolink_patterns.len() {
+                    panel.autolink_patterns[idx] = pattern;
+                }
+            } else {
+                // 添加新模式
+                panel.autolink_patterns.push(pattern);
+            }
+
+            // 返回 AutoLink 配置页面
+            panel.step = ConfigStep::AutoLinkConfig;
+        }
+
+        // 保存到配置文件
+        self.config_save_autolink();
     }
 
     /// Custom Choose 确认选择
@@ -3609,12 +3888,8 @@ impl App {
 
                 let repo_path = self.monitor.project_path.clone();
 
-                let preflight = self.archive_preflight(
-                    &repo_path,
-                    &worktree_path,
-                    &branch,
-                    &target,
-                );
+                let preflight =
+                    self.archive_preflight(&repo_path, &worktree_path, &branch, &target);
 
                 if !preflight.needs_confirm() {
                     self.do_archive(&task_id);
@@ -3649,15 +3924,18 @@ impl App {
                 self.open_diff_review_monitor();
             }
             MonitorAction::Leave => {
-                match self.monitor.multiplexer {
-                    Multiplexer::Tmux => {
+                match self.monitor.session_type {
+                    SessionType::Tmux => {
                         let _ = std::process::Command::new("tmux")
                             .args(["detach-client"])
                             .status();
                     }
-                    Multiplexer::Zellij => {
+                    SessionType::Zellij => {
                         // Zellij 没有编程式 detach 接口，提示用户手动脱离
                         self.show_toast("Use Ctrl+o → d to detach from Zellij session");
+                    }
+                    SessionType::Acp => {
+                        self.show_toast("ACP mode uses web chat interface");
                     }
                 }
             }
@@ -3713,13 +3991,6 @@ impl Default for App {
 
 /// 从 worktree 路径提取 task slug
 /// ~/.grove/worktrees/project/oauth-login -> oauth-login
-fn slug_from_path(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default()
-}
-
 /// 加载所有项目的通知数据（自动清理不存在的 task）
 fn load_all_project_notifications(
     projects: &[ProjectInfo],

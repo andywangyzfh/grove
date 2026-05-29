@@ -1,42 +1,503 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { Sidebar } from "./components/Layout/Sidebar";
+import { MobileHeader } from "./components/Layout/MobileHeader";
+import { MobileDrawer } from "./components/Layout/MobileDrawer";
+import { NotificationPopover } from "./components/Layout/NotificationPopover";
 import { SettingsPage } from "./components/Config";
 import { DashboardPage } from "./components/Dashboard";
-import { TasksPage } from "./components/Tasks";
 import { BlitzPage } from "./components/Blitz";
+import { TasksPage } from "./components/Tasks/TasksPage";
+import { ResourcePage } from "./components/Studio";
+import { WorkPage } from "./components/Work";
 import { ProjectsPage } from "./components/Projects";
+import { MissingProjectState } from "./components/Projects/MissingProjectState";
 import { AddProjectDialog } from "./components/Projects/AddProjectDialog";
 import { WelcomePage } from "./components/Welcome";
 import { DiffReviewPage } from "./components/Review";
+import { HelpOverlay } from "./components/Tasks/HelpOverlay";
+import { SkillsPage } from "./components/Skills";
+import { AIPage, GlobalAudioRecorder } from "./components/AI";
+import { AutomationPage } from "./components/Automation/AutomationPage";
+import { ProjectStatsPage } from "./components/Stats/ProjectStatsPage";
 import { UpdateBanner } from "./components/ui/UpdateBanner";
-import { ThemeProvider, ProjectProvider, TerminalThemeProvider, NotificationProvider, useProject } from "./context";
+import { CommandPalette } from "./components/ui/CommandPalette";
+import { ProjectCommandPalette } from "./components/ui/ProjectCommandPalette";
+import { TaskCommandPalette } from "./components/ui/TaskCommandPalette";
+import { ThemeProvider, BannerProvider, ProjectProvider, TerminalThemeProvider, NotificationProvider, ConfigProvider, CommandPaletteProvider, PreviewCommentProvider, useProject, useCommandPalette, useTheme, useConfig } from "./context";
+import { ConfirmDialog } from "./components/Dialogs";
+import { useReportDebugId } from "./perf/debugIdsStore";
+import { AuthGate } from "./components/AuthGate";
+import { OptionalPerfProfiler } from "./perf/profilerShim";
+import type { Task } from "./data/types";
 import { mockConfig } from "./data/mockData";
+import { getConfig, patchConfig, checkCommands, openIDE, openTerminal } from "./api";
+import { agentOptions } from "./components/ui";
+import { useIsMobile, useHotkeys, buildCommands, useAddLibraryHashHandler } from "./hooks";
+import type { UseCommandsOptions } from "./hooks/useCommands";
+import { REPO_NAV_IDS, STUDIO_NAV_IDS } from "./data/nav";
 
 export type TasksMode = "zen" | "blitz";
 
+// Main sidebar nav items for Cmd+1-6 and Option+Cmd+Up/Down cycling.
+// "settings" and "projects" are excluded as they are utility pages, not part of the main nav cycle.
 function AppContent() {
+  "use no memo";
+  // AppContent uses two dynamic `import()` calls for code-splitting heavy
+  // panels. React Compiler 1.0 can't lower dynamic imports, so we opt
+  // this root component out. Affected children are still memoized normally.
+
+  // Handle libraries.excalidraw.com "Add to Excalidraw" callback once at
+  // load: if the URL hash carries `addLibrary=`, fetch the library, ask the
+  // user to confirm via ConfirmDialog (rendered below), then install and
+  // broadcast to peer tabs. Runs on any landing page — the callback tab
+  // can't be guaranteed to land on a sketch view.
+  const addLibrary = useAddLibraryHashHandler();
+
   const [activeItem, setActiveItem] = useState("dashboard");
   const [tasksMode, setTasksMode] = useState<TasksMode>("zen");
+  const [tasksExitSignal, setTasksExitSignal] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // Auto-collapse sidebar when the viewport is too narrow to host an expanded
+  // sidebar (256px) plus the workspace's minimum content width. Keeps the
+  // chat composer / panel system from being squeezed below their min-widths.
+  // User's explicit collapse preference still takes precedence; we only force
+  // collapse in the auto direction.
+  const [viewportTooNarrowForSidebar, setViewportTooNarrowForSidebar] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const SIDEBAR_EXPANDED_PX = 256;
+    const CONTENT_MIN_PX = 900;
+    const THRESHOLD = SIDEBAR_EXPANDED_PX + CONTENT_MIN_PX;
+    const update = () => setViewportTooNarrowForSidebar(window.innerWidth < THRESHOLD);
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+
+  // Approximate native macOS "scroll bars: when scrolling" behavior. Listen
+  // for any scroll event in capture phase and flip a body class so the
+  // .blitz-area scrollbar thumb appears for ~900ms after the last scroll,
+  // then fades away. CSS-only :hover proved unreliable (webkit pseudo-
+  // elements don't always honor ancestor hover state for scrollbar
+  // visibility), so this is the standard escape hatch.
+  useEffect(() => {
+    let hideTimer: ReturnType<typeof setTimeout> | undefined;
+    const onScroll = () => {
+      document.body.classList.add("grove-scrolling");
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => {
+        document.body.classList.remove("grove-scrolling");
+      }, 900);
+    };
+    document.addEventListener("scroll", onScroll, true);
+    return () => {
+      document.removeEventListener("scroll", onScroll, true);
+      if (hideTimer) clearTimeout(hideTimer);
+      document.body.classList.remove("grove-scrolling");
+    };
+  }, []);
+
+  // Top-edge drag for Tauri Overlay title-bar mode. data-tauri-drag-region
+  // alone gives us double-click-maximize but NOT drag when the webview is
+  // loaded from an external URL (http://localhost) — drag silently fails
+  // after the first attempt. Bind a native (non-React) mousedown listener
+  // and call startDragging() ourselves. Native listener avoids the stale
+  // event-handler issue observed with React's synthetic events here.
+  useEffect(() => {
+    let win: { startDragging: () => Promise<void> } | null = null;
+    let cancelled = false;
+    import("@tauri-apps/api/window")
+      .then((mod) => {
+        if (cancelled) return;
+        win = mod.getCurrentWindow();
+      })
+      .catch(() => {
+        // Not in Tauri runtime — leave win null, handler becomes a no-op
+      });
+
+    const handler = (e: MouseEvent) => {
+      if (!win) return;
+      const target = e.target as HTMLElement | null;
+      if (!target?.closest('[data-window-drag-strip]')) return;
+      void win.startDragging().catch(() => {});
+    };
+    document.addEventListener("mousedown", handler);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("mousedown", handler);
+    };
+  }, []);
+
+  const effectiveSidebarCollapsed = sidebarCollapsed || viewportTooNarrowForSidebar;
   const [hasExitedWelcome, setHasExitedWelcome] = useState(false);
   const [navigationData, setNavigationData] = useState<Record<string, unknown> | null>(null);
-  const { selectedProject, currentProjectId, isLoading, selectProject, projects, addProject } = useProject();
+  const { selectedProject, currentProjectId, isLoading, selectProject, projects, addProject, createNewProject, cloneProject, refreshProjects, refreshSelectedProject } = useProject();
+  useReportDebugId("projectId", selectedProject?.id ?? null);
   const [showAddProject, setShowAddProject] = useState(false);
+  const [addProjectInitialMode, setAddProjectInitialMode] = useState<"coding" | "studio">("coding");
   const [isAddingProject, setIsAddingProject] = useState(false);
   const [addProjectError, setAddProjectError] = useState<string | null>(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [mobileNotifOpen, setMobileNotifOpen] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+  const { isMobile } = useIsMobile();
+  const {
+    isOpen: commandPaletteOpen,
+    open: openCommandPalette, close: closeCommandPalette,
+    openProjectPalette, openTaskPalette,
+    closeProjectPalette, closeTaskPalette,
+    projectPaletteOpen, taskPaletteOpen,
+    registerGlobalCommands,
+    inWorkspace,
+  } = useCommandPalette();
+  const { theme } = useTheme();
+  const { config: globalConfig } = useConfig();
+  const navItems: readonly string[] = selectedProject?.projectType === "studio" ? STUDIO_NAV_IDS : REPO_NAV_IDS;
+
+  const setActiveNavItem = (index: number) => {
+    const nextItem = navItems[index];
+    if (nextItem) {
+      setActiveItem(nextItem);
+    }
+  };
+  // Navigate sidebar by absolute index or relative delta (based on current active item)
+  const navigateSidebar = useCallback((indexOrDelta: number, relative?: boolean) => {
+    if (relative) {
+      const currentIndex = navItems.indexOf(activeItem);
+      const baseIndex = currentIndex >= 0 ? currentIndex : 0;
+      const nextIndex = (baseIndex + indexOrDelta + navItems.length) % navItems.length;
+      setActiveItem(navItems[nextIndex]);
+    } else {
+      const nextItem = navItems[indexOrDelta];
+      if (nextItem) setActiveItem(nextItem);
+    }
+  }, [activeItem, navItems]);
+
+  const isZenMode = tasksMode === "zen";
+
+  // Track palette open flags via refs so the toggle hotkeys don't have to
+  // re-bind (and the whole useHotkeys listener tear down + re-install) on
+  // every open/close. Without this, every palette toggle remounted the
+  // global keydown listener, which intermittently dropped keystrokes that
+  // arrived during the swap window. All three palette flags get the same
+  // pattern so adding a fourth palette later doesn't reintroduce the bug.
+  const commandPaletteOpenRef = useRef(commandPaletteOpen);
+  const projectPaletteOpenRef = useRef(projectPaletteOpen);
+  const taskPaletteOpenRef = useRef(taskPaletteOpen);
+  useEffect(() => {
+    commandPaletteOpenRef.current = commandPaletteOpen;
+  }, [commandPaletteOpen]);
+  useEffect(() => {
+    projectPaletteOpenRef.current = projectPaletteOpen;
+  }, [projectPaletteOpen]);
+  useEffect(() => {
+    taskPaletteOpenRef.current = taskPaletteOpen;
+  }, [taskPaletteOpen]);
+
+  // Cmd+K = command palette, Cmd+P = project palette, Cmd+T = task palette
+  // Cmd+1-5 = tab switch (Zen mode only; Blitz uses Cmd+1-9 for task selection)
+  useHotkeys([
+    { key: "Meta+k", handler: () => (commandPaletteOpenRef.current ? closeCommandPalette() : openCommandPalette()) },
+    { key: "Meta+p", handler: () => (projectPaletteOpenRef.current ? closeProjectPalette() : openProjectPalette()) },
+    { key: "Meta+o", handler: () => (taskPaletteOpenRef.current ? closeTaskPalette() : openTaskPalette()) },
+    { key: "Meta+1", handler: () => setActiveNavItem(0), options: { enabled: isZenMode && !inWorkspace } },
+    { key: "Meta+2", handler: () => setActiveNavItem(1), options: { enabled: isZenMode && !inWorkspace } },
+    { key: "Meta+3", handler: () => setActiveNavItem(2), options: { enabled: isZenMode && !inWorkspace } },
+    { key: "Meta+4", handler: () => setActiveNavItem(3), options: { enabled: isZenMode && !inWorkspace } },
+    { key: "Meta+5", handler: () => setActiveNavItem(4), options: { enabled: isZenMode && !inWorkspace } },
+    { key: "Meta+6", handler: () => setActiveNavItem(5), options: { enabled: isZenMode && !inWorkspace } },
+    { key: "Meta+Alt+ArrowUp", handler: () => navigateSidebar(-1, true), options: { enabled: isZenMode && !inWorkspace } },
+    { key: "Meta+Alt+ArrowDown", handler: () => navigateSidebar(1, true), options: { enabled: isZenMode && !inWorkspace } },
+    // Help overlay — lives at App level so it works from every page (Tasks,
+    // Work, Dashboard, Skills, …) instead of only when TasksPage happens to
+    // be the visible tab.
+    { key: "?", handler: () => setShowHelp((v) => !v) },
+  ], [
+    openCommandPalette, closeCommandPalette,
+    openProjectPalette, closeProjectPalette,
+    openTaskPalette, closeTaskPalette,
+    isZenMode, inWorkspace, navigateSidebar,
+  ]);
+
+  // Allow any page's "help" button (e.g. Blitz toolbar) to open the same
+  // overlay by dispatching a custom event instead of duplicating state.
+  useEffect(() => {
+    const open = () => setShowHelp(true);
+    window.addEventListener("grove:open-help", open);
+    return () => window.removeEventListener("grove:open-help", open);
+  }, []);
+
+  // Mobile virtual-keyboard tracker: exposes the keyboard height as a global
+  // CSS variable (--grove-kb-inset). Bottom-anchored UI uses
+  // `bottom: var(--grove-kb-inset, 0)` to lift above the keyboard on iOS.
+  //
+  // window.resize fires when the layout viewport changes — orientation
+  // flip, iPad split-view resize, breakpoint crossing. On Android Chrome
+  // (and older iOS) it ALSO fires when the keyboard opens, in undefined
+  // order relative to vv.resize. Recompute from `vv` directly on every
+  // event rather than blanking the var; this keeps the inset correct
+  // when the keyboard is genuinely up at resize time, while still
+  // letting orientation changes update the value.
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.visualViewport) return;
+    const vv = window.visualViewport;
+    const root = document.documentElement;
+    const recompute = () => {
+      const offset = window.innerHeight - vv.height - vv.offsetTop;
+      root.style.setProperty("--grove-kb-inset", `${offset > 50 ? offset : 0}px`);
+    };
+    vv.addEventListener("resize", recompute);
+    vv.addEventListener("scroll", recompute);
+    window.addEventListener("resize", recompute);
+    recompute();
+    return () => {
+      vv.removeEventListener("resize", recompute);
+      vv.removeEventListener("scroll", recompute);
+      window.removeEventListener("resize", recompute);
+      root.style.removeProperty("--grove-kb-inset");
+    };
+  }, []);
+
+  useEffect(() => {
+    const isTauri = !!((window as Window & {
+      __TAURI__?: unknown;
+      __TAURI_INTERNALS__?: unknown;
+    }).__TAURI__ || (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
+    const shortcut = globalConfig?.web?.show_hide_window_shortcut || "";
+    if (!isTauri || !shortcut) return;
+
+    const tauriShortcut = shortcut
+      .split("+")
+      .map((part) => part === "Cmd" ? "CommandOrControl" : part === "Ctrl" ? "Control" : part)
+      .join("+");
+    let registered = false;
+    let disposed = false;
+    const unregisterShortcut = () => {
+      import("@tauri-apps/plugin-global-shortcut")
+        .then(({ unregister }) => unregister(tauriShortcut))
+        .catch((err) => console.error("Failed to unregister window shortcut:", err));
+    };
+
+    import("@tauri-apps/plugin-global-shortcut")
+      .then(({ register }) => {
+        if (disposed) return false;
+        return register(tauriShortcut, (event) => {
+          if (event.state === "Pressed") {
+            invoke("toggle_main_window_visibility").catch((err) => {
+              console.error("Failed to toggle Grove window:", err);
+            });
+          }
+        }).then(() => true);
+      })
+      .then((didRegister) => {
+        if (!didRegister) return;
+        if (disposed) {
+          unregisterShortcut();
+          return;
+        }
+        registered = true;
+      })
+      .catch((err) => {
+        if (!disposed) console.error("Failed to register window shortcut:", err);
+      });
+
+    return () => {
+      disposed = true;
+      if (!registered) return;
+      unregisterShortcut();
+    };
+  }, [globalConfig?.web?.show_hide_window_shortcut]);
+
+  // Menubar popover global shortcut — parallel to the main window one.
+  // Conflict guard: if the same combo is bound to the main window we
+  // skip registration (Tauri's global-shortcut plugin would error
+  // anyway; this just keeps the log noise actionable).
+  useEffect(() => {
+    const isTauri = !!((window as Window & {
+      __TAURI__?: unknown;
+      __TAURI_INTERNALS__?: unknown;
+    }).__TAURI__ || (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
+    const shortcut = globalConfig?.notifications?.menubar_shortcut || "";
+    const mainShortcut = globalConfig?.web?.show_hide_window_shortcut || "";
+    if (!isTauri || !shortcut) return;
+    if (shortcut === mainShortcut) {
+      console.warn(
+        "[shortcut] menubar_shortcut conflicts with show_hide_window_shortcut — skipping registration",
+      );
+      return;
+    }
+
+    const tauriShortcut = shortcut
+      .split("+")
+      .map((part) => part === "Cmd" ? "CommandOrControl" : part === "Ctrl" ? "Control" : part)
+      .join("+");
+    let registered = false;
+    let disposed = false;
+    const unregisterShortcut = () => {
+      import("@tauri-apps/plugin-global-shortcut")
+        .then(({ unregister }) => unregister(tauriShortcut))
+        .catch((err) => console.error("Failed to unregister menubar shortcut:", err));
+    };
+
+    import("@tauri-apps/plugin-global-shortcut")
+      .then(({ register }) => {
+        if (disposed) return false;
+        return register(tauriShortcut, (event) => {
+          if (event.state === "Pressed") {
+            invoke("toggle_tray_popover_visibility").catch((err) => {
+              console.error("Failed to toggle Grove menubar:", err);
+            });
+          }
+        }).then(() => true);
+      })
+      .then((didRegister) => {
+        if (!didRegister) return;
+        if (disposed) {
+          unregisterShortcut();
+          return;
+        }
+        registered = true;
+      })
+      .catch((err) => {
+        if (!disposed) console.error("Failed to register menubar shortcut:", err);
+      });
+
+    return () => {
+      disposed = true;
+      if (!registered) return;
+      unregisterShortcut();
+    };
+  }, [
+    globalConfig?.notifications?.menubar_shortcut,
+    globalConfig?.web?.show_hide_window_shortcut,
+  ]);
+
+  const handleSwitchToZen = useCallback(() => {
+    setTasksMode("zen");
+    refreshProjects();
+    refreshSelectedProject();
+  }, [refreshProjects, refreshSelectedProject]);
+
+  const navigateToProjectDashboard = useCallback(() => {
+    setActiveItem("dashboard");
+    setNavigationData(null);
+  }, []);
+
+  // Initialize agent configuration on app startup
+  useEffect(() => {
+    const initializeAgentConfig = async () => {
+      try {
+        // Load current config
+        const cfg = await getConfig();
+
+        // Check command availability
+        const cmds = new Set<string>();
+        for (const opt of agentOptions) {
+          if (opt.terminalCheck) cmds.add(opt.terminalCheck);
+          if (opt.acpCheck) cmds.add(opt.acpCheck);
+        }
+        const commandAvailability = await checkCommands([...cmds]);
+
+        let needsUpdate = false;
+        const updates: { layout?: { agent_command?: string }, acp?: { agent_command?: string } } = {};
+
+        // Check Terminal Agent
+        if (cfg.layout?.agent_command) {
+          const currentAgent = agentOptions.find(a => a.id === cfg.layout.agent_command);
+          const cmd = currentAgent?.terminalCheck;
+          if (cmd && commandAvailability[cmd] === false) {
+            // Find first available terminal agent
+            const firstAvailable = agentOptions.find(a => {
+              const check = a.terminalCheck;
+              return check && commandAvailability[check] !== false;
+            });
+            if (firstAvailable) {
+              updates.layout = { agent_command: firstAvailable.id };
+              needsUpdate = true;
+            }
+          }
+        }
+
+        // Check Chat Agent
+        if (cfg.acp?.agent_command) {
+          const currentAgent = agentOptions.find(a => a.id === cfg.acp.agent_command);
+          const cmd = currentAgent?.acpCheck;
+          if (cmd && commandAvailability[cmd] === false) {
+            // Find first available chat agent
+            const firstAvailable = agentOptions.find(a => {
+              const check = a.acpCheck;
+              return check && commandAvailability[check] !== false;
+            });
+            if (firstAvailable) {
+              updates.acp = { agent_command: firstAvailable.id };
+              needsUpdate = true;
+            }
+          }
+        }
+
+        // Save updated config if needed
+        if (needsUpdate) {
+          await patchConfig(updates);
+        }
+      } catch (err) {
+        console.error("Failed to initialize agent configuration:", err);
+      }
+    };
+
+    initializeAgentConfig();
+  }, []);
 
   const handleAddProject = async (path: string, name?: string) => {
     setIsAddingProject(true);
     setAddProjectError(null);
     try {
-      await addProject(path, name);
+      const project = await addProject(path, name);
+      selectProject(project);
+      navigateToProjectDashboard();
       setShowAddProject(false);
     } catch (err) {
       setAddProjectError(err instanceof Error ? err.message : "Failed to add project");
-    } finally {
-      setIsAddingProject(false);
     }
+    setIsAddingProject(false);
+  };
+
+  const handleCloneProject = async (url: string, name?: string) => {
+    setIsAddingProject(true);
+    setAddProjectError(null);
+    try {
+      const project = await cloneProject(url, name);
+      selectProject(project);
+      navigateToProjectDashboard();
+      setShowAddProject(false);
+    } catch (err: unknown) {
+      if (err && typeof err === "object" && "message" in err) {
+        setAddProjectError((err as { message: string }).message || "Failed to clone project");
+      } else {
+        setAddProjectError("Failed to clone project");
+      }
+    }
+    setIsAddingProject(false);
+  };
+
+  const handleCreateNewProject = async (parentDir: string, name: string, initGit: boolean, projectType?: string) => {
+    setIsAddingProject(true);
+    setAddProjectError(null);
+    try {
+      const project = await createNewProject(parentDir, name, initGit, projectType);
+      selectProject(project);
+      navigateToProjectDashboard();
+      setShowAddProject(false);
+    } catch (err: unknown) {
+      if (err && typeof err === "object" && "message" in err) {
+        setAddProjectError((err as { message: string }).message || "Failed to create project");
+      } else {
+        setAddProjectError("Failed to create project");
+      }
+    }
+    setIsAddingProject(false);
   };
 
   // Check if we should show welcome page
@@ -58,29 +519,242 @@ function AppContent() {
     setActiveItem("projects");
   };
 
-  // Auto-navigate to dashboard when a project is auto-selected via currentProjectId
+  // Auto-navigate to dashboard when a project is auto-selected via currentProjectId.
+  // Uses the documented "Adjusting state on prop change" pattern (compare to a
+  // memoised marker stored in state) so we don't setState inside an effect.
+  // https://react.dev/reference/react/useState#storing-information-from-previous-renders
+  const [autoNavigatedFor, setAutoNavigatedFor] = useState<string | null>(null);
+  if (
+    currentProjectId &&
+    selectedProject &&
+    !hasExitedWelcome &&
+    autoNavigatedFor !== currentProjectId
+  ) {
+    setAutoNavigatedFor(currentProjectId);
+    setHasExitedWelcome(true);
+    setActiveItem("dashboard");
+  }
+
+  // Tray popover navigation. Rust emits `tray:navigate` with a route and
+  // optional project/task/chat ids. Listener is registered ONCE; refs
+  // hold the latest projects + selectProject so re-mounts don't drop
+  // events arriving in the gap.
+  const projectsRef = useRef(projects);
+  const selectProjectRef = useRef(selectProject);
   useEffect(() => {
-    if (currentProjectId && selectedProject && !hasExitedWelcome) {
+    projectsRef.current = projects;
+  }, [projects]);
+  useEffect(() => {
+    selectProjectRef.current = selectProject;
+  }, [selectProject]);
+  useEffect(() => {
+    // Apply a tray:navigate payload to local nav state. Used from both the
+    // event listener and the initial drain of any pending event the Rust
+    // side stashed before `listen()` resolved.
+    type NavigatePayload = {
+      route: string;
+      project_id?: string | null;
+      task_id?: string | null;
+      chat_id?: string | null;
+    };
+    const allowedRoutes = new Set<string>([
+      ...REPO_NAV_IDS,
+      ...STUDIO_NAV_IDS,
+      "settings",
+      "projects",
+    ]);
+    const applyNavigate = (p: NavigatePayload) => {
+      const { route, project_id, task_id, chat_id } = p;
+      const project = project_id
+        ? projectsRef.current.find((pr) => pr.id === project_id)
+        : undefined;
+      if (project) selectProjectRef.current(project);
       setHasExitedWelcome(true);
-      setActiveItem("dashboard");
-    }
-  }, [currentProjectId, selectedProject, hasExitedWelcome]);
+
+      // For local tasks, navigate to "work" instead of "tasks".
+      // Local tasks always have id "_local" (backend constant LOCAL_TASK_ID).
+      // The projects list uses convertProjectListItem which sets localTask: null,
+      // so we cannot rely on project.localTask here — check the id directly.
+      let effectiveRoute = route;
+      if (task_id && route === "tasks") {
+        const task = project?.tasks?.find((t) => t.id === task_id);
+        const isLocalTask =
+          task?.isLocal || task_id === "_local";
+        if (isLocalTask) {
+          effectiveRoute = "work";
+        }
+      }
+
+      // Guard against typos / future nav-id renames so the tray can't
+      // silently put the user on a page that doesn't exist.
+      setActiveItem(allowedRoutes.has(effectiveRoute) ? effectiveRoute : "dashboard");
+      if (task_id && effectiveRoute !== "work") {
+        // viewMode "terminal" makes TasksPage drop into Workspace mode
+        // (chat / terminal panes) — what the user expects when clicking
+        // Open from the tray.
+        setNavigationData({
+          taskId: task_id,
+          chatId: chat_id ?? undefined,
+          viewMode: "terminal",
+        });
+      } else {
+        setNavigationData(null);
+        // Work route bypasses TasksPage entirely, so the chat-switch handoff
+        // that TasksPage normally performs has to be planted here instead.
+        // Otherwise WorkPage's TaskChat mounts and useInitialChatLoad falls
+        // back to readLastActiveTab — i.e. tray click lands on whichever
+        // chat the user last opened, ignoring the tray's chat_id.
+        if (task_id && effectiveRoute === "work" && chat_id && project_id) {
+          (window as unknown as Record<string, unknown>).__grove_pending_chat = {
+            projectId: project_id,
+            taskId: task_id,
+            chatId: chat_id,
+          };
+          window.dispatchEvent(
+            new CustomEvent("grove:switch-chat", {
+              detail: { projectId: project_id, taskId: task_id, chatId: chat_id },
+            }),
+          );
+        }
+      }
+    };
+
+    // 1. Drain any tray:navigate that Rust stashed before this listener
+    //    was alive (covers the async-listen race).
+    invoke<NavigatePayload | null>("tray_take_pending_navigate")
+      .then((p) => {
+        if (p) applyNavigate(p);
+      })
+      .catch(() => {
+        /* not running in Tauri or command unavailable — silently skip */
+      });
+
+    // 2. Subscribe for live events. StrictMode-safe: cancellation flag so
+    //    a teardown during the async registration doesn't leak the
+    //    listener.
+    let cancelled = false;
+    let unlistenFn: (() => void) | null = null;
+    listen<NavigatePayload>("tray:navigate", (e) => applyNavigate(e.payload))
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlistenFn = fn;
+        }
+      })
+      .catch((err) => console.warn("[tray:navigate] listen failed:", err));
+    return () => {
+      cancelled = true;
+      if (unlistenFn) unlistenFn();
+    };
+  }, []);
+
 
   const handleNavigate = (page: string, data?: Record<string, unknown>) => {
+    let targetProject = selectedProject;
     if (data?.projectId) {
-      const target = projects.find((p) => p.id === data.projectId);
-      if (target) {
-        selectProject(target);
+      const found = projects.find((p) => p.id === data.projectId);
+      if (found) {
+        selectProject(found);
+        targetProject = found;
       }
     }
-    setActiveItem(page);
+    // Redirect local tasks to "work" page.
+    // Local tasks always have id "_local" (backend constant LOCAL_TASK_ID).
+    // targetProject may come from the minimal project list (localTask: null),
+    // so checking the id directly is the reliable fallback.
+    let effectivePage = page;
+    if (page === "tasks" && data?.taskId) {
+      const task = targetProject?.tasks?.find((t) => t.id === data.taskId);
+      const isLocalTask =
+        task?.isLocal ||
+        data.taskId === "_local";
+      if (isLocalTask) effectivePage = "work";
+    }
+    setActiveItem(effectivePage);
     setNavigationData(data ?? null);
   };
 
   // When project changes via sidebar ProjectSelector, go back to dashboard
   const handleProjectSwitch = useCallback(() => {
-    setActiveItem("dashboard");
+    navigateToProjectDashboard();
+  }, [navigateToProjectDashboard]);
+
+  // Task palette: navigate to tasks page and select the task
+  const handleTaskSelectFromPalette = useCallback((task: Task) => {
+    if (task.isLocal) {
+      setActiveItem("work");
+    } else {
+      setActiveItem("tasks");
+      setNavigationData({ taskId: task.id });
+    }
   }, []);
+
+  // Register global commands for the command palette
+  const toggleMode = useCallback(() => {
+    setTasksMode((prev) => (prev === "zen" ? "blitz" : "zen"));
+  }, []);
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsed((prev) => !prev);
+  }, []);
+  const handleOpenIDE = useCallback(() => {
+    if (selectedProject) openIDE(selectedProject.id);
+  }, [selectedProject]);
+  const handleOpenTerminal = useCallback(() => {
+    if (selectedProject) openTerminal(selectedProject.id);
+  }, [selectedProject]);
+
+  // Register global command builder — uses refs internally, no re-renders
+  const globalOptionsRef = useRef<UseCommandsOptions>(null!);
+  const nextGlobalOptions: UseCommandsOptions = {
+    navigation: {
+      onNavigate: setActiveItem,
+      activeItem,
+    },
+    project: {
+      projects,
+      selectedProject,
+      onSelectProject: selectProject,
+    onAddProject: (studioMode?: "studio") => {
+      setAddProjectInitialMode(studioMode === "studio" ? "studio" : "coding");
+      setShowAddProject(true);
+    },
+      onProjectSwitch: handleProjectSwitch,
+      accentPalette: theme.accentPalette,
+    },
+    mode: {
+      tasksMode,
+      onToggleMode: toggleMode,
+      onToggleSidebar: toggleSidebar,
+    },
+    palettes: {
+      onOpenProjectPalette: openProjectPalette,
+      onOpenTaskPalette: openTaskPalette,
+    },
+    projectActions: selectedProject ? {
+      onOpenIDE: handleOpenIDE,
+      onOpenTerminal: handleOpenTerminal,
+    } : undefined,
+  };
+
+  // Sync the latest options into the ref after render so the registered
+  // command builder always sees fresh values. Effect-only ref write avoids
+  // mutating refs during render.
+  useEffect(() => {
+    globalOptionsRef.current = nextGlobalOptions;
+  });
+
+  useEffect(() => {
+    registerGlobalCommands(() => buildCommands(globalOptionsRef.current));
+  }, [registerGlobalCommands]);
+
+  const handleItemClick = useCallback((item: string) => {
+    if (item === "tasks" && activeItem === "tasks" && inWorkspace) {
+      setTasksExitSignal(prev => prev + 1);
+    } else {
+      setActiveItem(item);
+    }
+  }, [activeItem, inWorkspace]);
 
   // Show loading state
   if (isLoading) {
@@ -101,15 +775,54 @@ function AppContent() {
       case "dashboard":
         return <DashboardPage onNavigate={handleNavigate} />;
       case "projects":
-        return <ProjectsPage onNavigate={setActiveItem} />;
-      case "tasks":
+        return <ProjectsPage onNavigate={setActiveItem} key={"projects-" + (navigationData?.tab ?? "coding")} initialTab={navigationData?.tab as "coding" | "studio" | undefined} />;
+      case "work":
+        return <WorkPage key="work" />;
+      case "resource":
+        return <ResourcePage />;
+      case "automation":
         return (
-          <TasksPage
-            initialTaskId={navigationData?.taskId as string | undefined}
-            initialViewMode={navigationData?.viewMode as string | undefined}
-            onNavigationConsumed={() => setNavigationData(null)}
+          <AutomationPage
+            onOpenChat={(taskId, chatId) => {
+              // Mirror the tray's deep-link handoff (this same file,
+              // `handleNavigate` around line 552). Two paths exist:
+              //
+              //   • Tasks route → setNavigationData({taskId, chatId}).
+              //     TasksPage consumes it and itself dispatches
+              //     grove:switch-chat once mounted.
+              //   • Work route (Local Task) → TasksPage isn't on the
+              //     path at all, so we must plant `__grove_pending_chat`
+              //     on window before mount. WorkPage's TaskChat reads
+              //     this on init; without it useInitialChatLoad falls
+              //     back to readLastActiveTab and our chatId is ignored.
+              const projectId = selectedProject?.id;
+              if (!projectId) return;
+              const isLocal = taskId === "_local";
+              if (isLocal) {
+                (window as unknown as Record<string, unknown>).__grove_pending_chat = {
+                  projectId,
+                  taskId,
+                  chatId,
+                };
+                setActiveItem("work");
+                window.dispatchEvent(
+                  new CustomEvent("grove:switch-chat", {
+                    detail: { projectId, taskId, chatId },
+                  }),
+                );
+              } else {
+                setActiveItem("tasks");
+                setNavigationData({ taskId, chatId });
+              }
+            }}
           />
         );
+      case "skills":
+        return <SkillsPage />;
+      case "ai":
+        return <AIPage />;
+      case "statistics":
+        return <ProjectStatsPage projectId={selectedProject?.id} />;
       case "settings":
         return <SettingsPage config={mockConfig} />;
       default:
@@ -128,10 +841,250 @@ function AppContent() {
     }
   };
 
-  const isFullWidthPage = activeItem === "tasks";
+  const isDashboardPage = activeItem === "dashboard";
+  const isFullWidthPage =
+    isDashboardPage ||
+    activeItem === "projects" ||
+    activeItem === "work" ||
+    activeItem === "skills" ||
+    activeItem === "ai" ||
+    activeItem === "resource" ||
+    activeItem === "automation" ||
+    activeItem === "statistics";
 
+  const sidebarProps = {
+    activeItem,
+    onItemClick: handleItemClick,
+    collapsed: effectiveSidebarCollapsed,
+    onToggleCollapse: () => setSidebarCollapsed(!sidebarCollapsed),
+    onManageProjects: (tab?: "coding" | "studio") => handleNavigate("projects", { tab }),
+    onAddProject: (studioMode?: "studio") => {
+      setAddProjectInitialMode(studioMode === "studio" ? "studio" : "coding");
+      setShowAddProject(true);
+    },
+    onNavigate: handleNavigate,
+    tasksMode,
+    onTasksModeChange: setTasksMode,
+    onProjectSwitch: handleProjectSwitch,
+    onSearch: openCommandPalette,
+    tasks: selectedProject?.tasks ?? [],
+    onTaskSelect: handleTaskSelectFromPalette,
+    inWorkspace,
+  };
+
+  // Add-library dialog — surfaces both the install confirmation and any
+  // download/parse/install error so the user always knows what happened.
+  // Rendered in both desktop and mobile branches via {addLibraryDialog}.
+  let addLibraryDialog: React.ReactNode = null;
+  if (addLibrary.state?.kind === "install") {
+    const s = addLibrary.state;
+    const unnamedCount = s.total - s.namedCount;
+    addLibraryDialog = (
+      <ConfirmDialog
+        isOpen
+        title="Add Excalidraw library"
+        variant="warning"
+        confirmLabel={`Install ${s.total} item${s.total === 1 ? "" : "s"}`}
+        cancelLabel="Cancel"
+        onConfirm={addLibrary.confirm}
+        onCancel={addLibrary.dismiss}
+        message={
+          <div className="space-y-2">
+            <p>
+              Install <strong>{s.total}</strong> item{s.total === 1 ? "" : "s"}{" "}
+              into your global Excalidraw library from:
+            </p>
+            <p className="font-mono text-xs break-all text-[var(--color-text)]/80">
+              {s.url}
+            </p>
+            <div className="text-xs space-y-1">
+              <div>
+                <span className="text-[var(--color-text-muted)]">
+                  With name (usable by AI):
+                </span>{" "}
+                <strong>{s.namedCount}</strong>
+              </div>
+              <div>
+                <span className="text-[var(--color-text-muted)]">
+                  Without name (canvas-only, AI cannot reference):
+                </span>{" "}
+                <strong
+                  className={unnamedCount > 0 ? "text-[var(--color-warning)]" : ""}
+                >
+                  {unnamedCount}
+                </strong>
+              </div>
+            </div>
+            <p className="text-xs text-[var(--color-text-muted)]">
+              Only accept libraries from sources you trust.
+            </p>
+          </div>
+        }
+      />
+    );
+  } else if (addLibrary.state?.kind === "error") {
+    const s = addLibrary.state;
+    addLibraryDialog = (
+      <ConfirmDialog
+        isOpen
+        title="Add Excalidraw library failed"
+        variant="danger"
+        confirmLabel={s.retryable ? "Reload to retry" : "OK"}
+        cancelLabel="Dismiss"
+        onConfirm={() => {
+          if (s.retryable) {
+            window.location.reload();
+          } else {
+            addLibrary.dismiss();
+          }
+        }}
+        onCancel={addLibrary.dismiss}
+        message={
+          <div className="space-y-2">
+            <p>{s.message}</p>
+            <p className="font-mono text-xs break-all text-[var(--color-text-muted)]">
+              {s.url}
+            </p>
+            {s.retryable && (
+              <p className="text-xs text-[var(--color-text-muted)]">
+                The pending install is parked for an hour — you can refresh
+                this page to retry without re-clicking the source link.
+              </p>
+            )}
+          </div>
+        }
+      />
+    );
+  }
+
+  // Mobile layout
+  if (isMobile) {
+    return (
+      <div className="flex flex-col h-[100dvh] bg-[var(--color-bg)] overflow-hidden">
+        <UpdateBanner />
+        <MobileHeader
+          onMenuOpen={() => setDrawerOpen(true)}
+          onNotificationOpen={() => setMobileNotifOpen(true)}
+        />
+        <NotificationPopover
+          isOpen={mobileNotifOpen}
+          onClose={() => setMobileNotifOpen(false)}
+          onNavigate={handleNavigate}
+        />
+        <MobileDrawer isOpen={drawerOpen} onClose={() => setDrawerOpen(false)}>
+          <Sidebar
+            {...sidebarProps}
+            drawerMode
+            onDrawerClose={() => setDrawerOpen(false)}
+          />
+        </MobileDrawer>
+
+        <main className={`relative flex-1 ${(activeItem === "tasks" && tasksMode !== "blitz") || activeItem === "work" ? "overflow-hidden" : "overflow-y-auto"}`}>
+          {/* TasksPage always mounted on mobile too */}
+          <div
+            className="h-full p-3"
+            style={{ display: activeItem === "tasks" && tasksMode !== "blitz" ? "block" : "none" }}
+          >
+            <TasksPage
+              initialTaskId={navigationData?.taskId as string | undefined}
+              initialChatId={navigationData?.chatId as string | undefined}
+              initialViewMode={navigationData?.viewMode as string | undefined}
+              initialOpenNewTask={navigationData?.openNewTask as boolean | undefined}
+              onNavigationConsumed={() => setNavigationData(null)}
+              onNavByIndex={navigateSidebar}
+              exitWorkspaceSignal={tasksExitSignal}
+            />
+          </div>
+          <div className={activeItem === "work" ? "h-full p-3" : isFullWidthPage ? "min-h-full p-3" : "max-w-5xl mx-auto p-3"}
+               style={{ display: activeItem === "tasks" && tasksMode !== "blitz" ? "none" : undefined }}>
+            <AnimatePresence mode="wait">
+              {tasksMode === "blitz" ? (
+                <motion.div
+                  key="blitz"
+                  className="w-full h-full"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.2 }}
+                >
+                  <BlitzPage onSwitchToZen={handleSwitchToZen} onNavigate={setActiveItem} />
+                </motion.div>
+              ) : (
+                <motion.div
+                  key="zen-content"
+                  className={activeItem === "work" ? "w-full h-full" : "w-full min-h-full"}
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.2 }}
+                >
+                  {renderContent()}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+          {selectedProject && !selectedProject.exists &&
+            activeItem !== "projects" && activeItem !== "settings" && (
+              <div className="absolute inset-0 z-40 bg-[var(--color-bg)] flex items-center justify-center">
+                <MissingProjectState project={selectedProject} />
+              </div>
+            )}
+        </main>
+
+        <AddProjectDialog
+          isOpen={showAddProject}
+          onClose={() => {
+            setShowAddProject(false);
+            setAddProjectError(null);
+          }}
+          onAdd={handleAddProject}
+          onCreateNew={handleCreateNewProject}
+          onClone={handleCloneProject}
+          isLoading={isAddingProject}
+          externalError={addProjectError}
+          initialMode={addProjectInitialMode}
+        />
+        <CommandPalette />
+        <ProjectCommandPalette
+          isOpen={projectPaletteOpen}
+          onClose={closeProjectPalette}
+          onProjectSelect={handleProjectSwitch}
+        />
+        <TaskCommandPalette
+          isOpen={taskPaletteOpen}
+          onClose={closeTaskPalette}
+          tasks={selectedProject?.tasks ?? []}
+          selectedTask={null}
+          onTaskSelect={handleTaskSelectFromPalette}
+        />
+        <GlobalAudioRecorder projectId={selectedProject?.id ?? null} />
+        {addLibraryDialog}
+      </div>
+    );
+  }
+
+  // Desktop layout (unchanged)
   return (
     <div className="flex h-screen bg-[var(--color-bg)] overflow-hidden">
+      {/* Invisible top-edge drag strip — Tauri Overlay title-bar mode hides
+          the OS title bar, so the user expects to drag the window from
+          anywhere along the top edge (Raycast / Tahoe convention).
+          h-6 = 24px matches main's `p-6` top padding so the strip never
+          covers actual card content. z-[45] sits above the sidebar (z-40)
+          but below modals/popovers (z-50+).
+
+          ⚠ Z-INDEX CONTRACT: any clickable UI placed in the top 24px must
+          use z-50 or higher, otherwise this drag strip will swallow its
+          mousedown events.
+
+          data-tauri-drag-region: gives us double-click-maximize for free.
+          data-window-drag-strip: picked up by the document-level mousedown
+            listener in the parent useEffect to trigger startDragging(). */}
+      <div
+        className="fixed top-0 left-0 right-0 h-6 z-[45]"
+        data-tauri-drag-region
+        data-window-drag-strip
+      />
       <UpdateBanner />
       <AnimatePresence mode="wait">
         {tasksMode === "blitz" ? (
@@ -143,7 +1096,7 @@ function AppContent() {
             exit={{ opacity: 0, x: 40 }}
             transition={{ duration: 0.3, ease: [0.25, 1, 0.5, 1] }}
           >
-            <BlitzPage onSwitchToZen={() => setTasksMode("zen")} />
+            <BlitzPage onSwitchToZen={handleSwitchToZen} onNavigate={setActiveItem} />
           </motion.div>
         ) : (
           <motion.div
@@ -154,22 +1107,46 @@ function AppContent() {
             exit={{ opacity: 0, x: -40 }}
             transition={{ duration: 0.3, ease: [0.25, 1, 0.5, 1] }}
           >
-            <Sidebar
-              activeItem={activeItem}
-              onItemClick={setActiveItem}
-              collapsed={sidebarCollapsed}
-              onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
-              onManageProjects={() => setActiveItem("projects")}
-              onAddProject={() => setShowAddProject(true)}
-              onNavigate={handleNavigate}
-              tasksMode={tasksMode}
-              onTasksModeChange={setTasksMode}
-              onProjectSwitch={handleProjectSwitch}
-            />
-            <main className={`flex-1 ${isFullWidthPage ? "overflow-hidden" : "overflow-y-auto"}`}>
-              <div className={isFullWidthPage ? "h-full p-6" : "max-w-5xl mx-auto p-6"}>
-                {renderContent()}
+            <Sidebar {...sidebarProps} />
+            {/* Floating main card — mirrors the sidebar's "floating panel"
+               language so the chrome reads as a single design system:
+               two cards on a desktop, 12px gap between them and to all
+               window edges. left tracks the sidebar collapsed state so
+               the gap stays visually consistent in both modes. */}
+            <main
+              className={`fixed top-3 right-3 bottom-3 rounded-2xl bg-[var(--color-bg)] transition-[left] duration-200 ease-in-out ${isFullWidthPage && !isDashboardPage ? "overflow-hidden" : "overflow-y-auto"}`}
+              style={{
+                left: effectiveSidebarCollapsed ? "96px" : "280px",
+                boxShadow:
+                  "0 1px 3px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.06), 0 0 0 1px color-mix(in oklab, var(--color-border) 35%, transparent)",
+              }}
+            >
+              {/* TasksPage always mounted to preserve workspace state across tab switches */}
+              <div
+                className={`h-full transition-[padding] duration-300 ease-out ${inWorkspace ? 'p-2' : 'p-6'}`}
+                style={{ display: activeItem === "tasks" ? "block" : "none" }}
+              >
+                <TasksPage
+                  initialTaskId={navigationData?.taskId as string | undefined}
+                  initialChatId={navigationData?.chatId as string | undefined}
+                  initialViewMode={navigationData?.viewMode as string | undefined}
+                  initialOpenNewTask={navigationData?.openNewTask as boolean | undefined}
+                  onNavigationConsumed={() => setNavigationData(null)}
+                  onNavByIndex={navigateSidebar}
+                  exitWorkspaceSignal={tasksExitSignal}
+                />
               </div>
+              {activeItem !== "tasks" && (
+                <div className={isFullWidthPage ? `h-full transition-[padding] duration-300 ease-out ${inWorkspace && activeItem === "work" ? 'p-2' : 'p-6'}` : "max-w-5xl mx-auto p-6"}>
+                  {renderContent()}
+                </div>
+              )}
+              {selectedProject && !selectedProject.exists &&
+                activeItem !== "projects" && activeItem !== "settings" && (
+                  <div className="absolute inset-0 z-40 bg-[var(--color-bg)] flex items-center justify-center">
+                    <MissingProjectState project={selectedProject} />
+                  </div>
+                )}
             </main>
           </motion.div>
         )}
@@ -181,9 +1158,28 @@ function AppContent() {
           setAddProjectError(null);
         }}
         onAdd={handleAddProject}
+        onCreateNew={handleCreateNewProject}
+        onClone={handleCloneProject}
         isLoading={isAddingProject}
         externalError={addProjectError}
+        initialMode={addProjectInitialMode}
       />
+      <CommandPalette />
+      <ProjectCommandPalette
+        isOpen={projectPaletteOpen}
+        onClose={closeProjectPalette}
+        onProjectSelect={handleProjectSwitch}
+      />
+      <TaskCommandPalette
+        isOpen={taskPaletteOpen}
+        onClose={closeTaskPalette}
+        tasks={selectedProject?.tasks ?? []}
+        selectedTask={null}
+        onTaskSelect={handleTaskSelectFromPalette}
+      />
+      <GlobalAudioRecorder projectId={selectedProject?.id ?? null} />
+      <HelpOverlay isOpen={showHelp} onClose={() => setShowHelp(false)} />
+      {addLibraryDialog}
     </div>
   );
 }
@@ -194,20 +1190,36 @@ function App() {
   if (reviewMatch) {
     return (
       <ThemeProvider>
-        <DiffReviewPage projectId={reviewMatch[1]} taskId={reviewMatch[2]} />
+        <BannerProvider>
+          <PreviewCommentProvider>
+            <DiffReviewPage projectId={reviewMatch[1]} taskId={reviewMatch[2]} />
+          </PreviewCommentProvider>
+        </BannerProvider>
       </ThemeProvider>
     );
   }
 
   return (
     <ThemeProvider>
-      <TerminalThemeProvider>
-        <ProjectProvider>
-          <NotificationProvider>
-            <AppContent />
-          </NotificationProvider>
-        </ProjectProvider>
-      </TerminalThemeProvider>
+      <BannerProvider>
+        <AuthGate>
+          <ConfigProvider>
+            <TerminalThemeProvider>
+              <ProjectProvider>
+                <NotificationProvider>
+                  <CommandPaletteProvider>
+                    <PreviewCommentProvider>
+                      <OptionalPerfProfiler id="App">
+                        <AppContent />
+                      </OptionalPerfProfiler>
+                    </PreviewCommentProvider>
+                  </CommandPaletteProvider>
+                </NotificationProvider>
+              </ProjectProvider>
+            </TerminalThemeProvider>
+          </ConfigProvider>
+        </AuthGate>
+      </BannerProvider>
     </ThemeProvider>
   );
 }

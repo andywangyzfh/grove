@@ -1,7 +1,7 @@
-import { useState, useMemo, useEffect } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import { X, GitBranchPlus, Check, Search } from "lucide-react";
 import { Button } from "../../ui";
+import { DialogShell } from "../../ui/DialogShell";
 
 interface RebaseDialogProps {
   isOpen: boolean;
@@ -23,6 +23,12 @@ export function RebaseDialog({
   const [selectedBranch, setSelectedBranch] = useState(currentTarget);
   const [searchQuery, setSearchQuery] = useState("");
 
+  const handleClose = useCallback(() => {
+    setSelectedBranch(currentTarget);
+    setSearchQuery("");
+    onClose();
+  }, [currentTarget, onClose]);
+
   // Escape to close
   useEffect(() => {
     if (!isOpen) return;
@@ -31,12 +37,14 @@ export function RebaseDialog({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [isOpen]);
+  }, [isOpen, handleClose]);
 
   // Reset state when dialog opens
   useEffect(() => {
     if (isOpen) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedBranch(currentTarget);
+       
       setSearchQuery("");
     }
   }, [isOpen, currentTarget]);
@@ -58,34 +66,9 @@ export function RebaseDialog({
     }
   };
 
-  const handleClose = () => {
-    setSelectedBranch(currentTarget);
-    setSearchQuery("");
-    onClose();
-  };
-
   return (
-    <AnimatePresence>
-      {isOpen && (
-        <>
-          {/* Backdrop */}
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            onClick={handleClose}
-            className="fixed inset-0 bg-black/50 z-50"
-            data-hotkeys-dialog
-          />
-
-          {/* Dialog */}
-          <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: 10 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 10 }}
-            className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-md z-50"
-          >
-            <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] shadow-xl overflow-hidden">
+    <DialogShell isOpen={isOpen} onClose={handleClose}>
+      <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] shadow-xl overflow-hidden">
               {/* Header */}
               <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--color-border)]">
                 <div className="flex items-center gap-2">
@@ -206,10 +189,7 @@ export function RebaseDialog({
                   </Button>
                 </div>
               </form>
-            </div>
-          </motion.div>
-        </>
-      )}
-    </AnimatePresence>
+      </div>
+    </DialogShell>
   );
 }

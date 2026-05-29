@@ -4,11 +4,12 @@ import type { ReactNode } from "react";
 interface ButtonProps {
   children: ReactNode;
   onClick?: () => void;
-  variant?: "primary" | "secondary" | "ghost";
+  variant?: "primary" | "secondary" | "ghost" | "danger";
   size?: "sm" | "md" | "lg";
   disabled?: boolean;
   className?: string;
   type?: "button" | "submit" | "reset";
+  title?: string;
 }
 
 export function Button({
@@ -19,6 +20,7 @@ export function Button({
   disabled = false,
   className = "",
   type = "button",
+  title,
 }: ButtonProps) {
   const baseStyles =
     "inline-flex items-center justify-center font-medium rounded-lg transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-[var(--color-bg)]";
@@ -30,6 +32,8 @@ export function Button({
       "bg-[var(--color-bg-secondary)] hover:bg-[var(--color-bg-tertiary)] text-[var(--color-text)] border border-[var(--color-border)] focus:ring-[var(--color-border)]",
     ghost:
       "bg-transparent hover:bg-[var(--color-bg-secondary)] text-[var(--color-text-muted)] hover:text-[var(--color-text)] focus:ring-[var(--color-border)]",
+    danger:
+      "bg-[var(--color-error)] hover:brightness-95 text-white focus:ring-[var(--color-error)]",
   };
 
   const sizes = {
@@ -45,6 +49,7 @@ export function Button({
       whileTap={{ scale: disabled ? 1 : 0.98 }}
       onClick={onClick}
       disabled={disabled}
+      title={title}
       className={`${baseStyles} ${variants[variant]} ${sizes[size]} ${
         disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer"
       } ${className}`}

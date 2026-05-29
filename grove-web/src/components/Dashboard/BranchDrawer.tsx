@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   GitBranch,
@@ -17,15 +17,18 @@ import {
   ArrowDownToLine,
   ListTodo,
   Circle,
+  Cloud,
+  ExternalLink,
+  RefreshCw,
+  Archive,
 } from "lucide-react";
 import type { Branch, Task } from "../../data/types";
+import { getRemotes, getBranches as apiGetBranches } from "../../api";
 
 // Branch with task info
 interface BranchWithTasks {
   name: string;
   taskCount: number;
-  liveTasks: number;
-  idleTasks: number;
   tasks: Task[];
 }
 
@@ -34,6 +37,7 @@ interface BranchDrawerProps {
   branches: Branch[];
   tasks?: Task[];
   isLoading?: boolean;
+  projectId: string | null;
   onClose: () => void;
   onCheckout: (branch: Branch) => void;
   onNewBranch: () => void;
@@ -43,6 +47,10 @@ interface BranchDrawerProps {
   onPullMerge?: (branch: Branch) => void;
   onPullRebase?: (branch: Branch) => void;
   onTaskClick?: (task: Task) => void;
+  onTaskRebase?: (task: Task) => void;
+  onTaskArchive?: (task: Task) => void;
+  onTaskClean?: (task: Task) => void;
+  onTaskRecover?: (task: Task) => void;
 }
 
 // Tree node for nested folder structure
@@ -118,6 +126,7 @@ export function BranchDrawer({
   branches,
   tasks = [],
   isLoading = false,
+  projectId,
   onClose,
   onCheckout,
   onNewBranch,
@@ -127,32 +136,155 @@ export function BranchDrawer({
   onPullMerge,
   onPullRebase,
   onTaskClick,
+  onTaskRebase,
+  onTaskArchive,
+  onTaskClean,
+  onTaskRecover,
 }: BranchDrawerProps) {
   const [searchQuery, setSearchQuery] = useState("");
-  const [showRemote, setShowRemote] = useState(false);
   const [showWithTasks, setShowWithTasks] = useState(true);
+  const [showLocal, setShowLocal] = useState(true);
+  const [showRemote, setShowRemote] = useState(true);
+  const [showRemoteButtons, setShowRemoteButtons] = useState(true);
   const [selectedBranch, setSelectedBranch] = useState<Branch | null>(null);
   const [selectedTaskBranch, setSelectedTaskBranch] = useState<string | null>(null);
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
-    new Set(["grove", "feature", "origin", "origin/feature", "origin/grove"])
-  );
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+
+  // Remote loading state
+  const [remotes, setRemotes] = useState<string[]>([]);
+  const [loadedRemotes, setLoadedRemotes] = useState<Set<string>>(new Set());
+  const [loadedRemoteBranches, setLoadedRemoteBranches] = useState<Record<string, Branch[]>>({});
+  const [loadingRemote, setLoadingRemote] = useState<string | null>(null);
+
+  // Load remotes when drawer opens
+  useEffect(() => {
+    if (isOpen && projectId) {
+      getRemotes(projectId)
+        .then((res) => {
+          setRemotes(res.remotes);
+        })
+        .catch((err) => {
+          console.error("Failed to load remotes:", err);
+        });
+    }
+  }, [isOpen, projectId]);
+
+  // Reset remote state when drawer closes (derived state pattern: track
+  // previous prop value, reset during render rather than in an effect).
+  const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+  if (prevIsOpen !== isOpen) {
+    setPrevIsOpen(isOpen);
+    if (!isOpen) {
+      setLoadedRemotes(new Set());
+      setLoadedRemoteBranches({});
+      setLoadingRemote(null);
+    }
+  }
+
+  // Load branches from a specific remote
+  const loadRemoteBranches = async (remote: string) => {
+    if (!projectId || loadedRemotes.has(remote)) return;
+
+    setLoadingRemote(remote);
+    try {
+      const res = await apiGetBranches(projectId, remote);
+      // Filter: only keep branches in "remote/branch" format
+      const remoteBranches: Branch[] = res.branches
+        .filter(b => {
+          const parts = b.name.split('/');
+          // Must have at least "remote/branch" format (2 parts)
+          return parts.length >= 2 && parts[0] === remote;
+        })
+        .map(b => ({
+          name: b.name,
+          isCurrent: b.is_current,
+          isLocal: false,
+        }));
+
+      setLoadedRemoteBranches((prev) => ({
+        ...prev,
+        [remote]: remoteBranches,
+      }));
+      setLoadedRemotes((prev) => new Set(prev).add(remote));
+
+      // Auto-expand the remote folder and all its first-level subfolders
+      setExpandedFolders((prev) => {
+        const next = new Set(prev);
+        next.add(remote); // Expand remote root (e.g., "origin")
+
+        // Find all first-level folders under this remote
+        const firstLevelFolders = new Set<string>();
+        remoteBranches.forEach(branch => {
+          // Branch name format: "origin/feature/xxx" or "origin/master"
+          const parts = branch.name.split('/');
+          if (parts.length >= 2 && parts[0] === remote) {
+            // Add first-level folder path: "origin/feature"
+            firstLevelFolders.add(`${parts[0]}/${parts[1]}`);
+          }
+        });
+
+        // Expand all first-level folders
+        firstLevelFolders.forEach(folder => next.add(folder));
+        return next;
+      });
+    } catch (err) {
+      console.error(`Failed to load branches from ${remote}:`, err);
+    }
+    setLoadingRemote(null);
+  };
 
   const localBranches = branches.filter(b => b.isLocal);
-  const remoteBranches = branches.filter(b => !b.isLocal);
+
+  // Combine all loaded remote branches
+  const allRemoteBranches: Branch[] = Object.values(loadedRemoteBranches).flat();
+
+  // Track if we've auto-expanded folders (reset when drawer closes)
+  const hasAutoExpandedRef = useRef(false);
+
+  // Reset auto-expand flag when drawer closes
+  useEffect(() => {
+    if (!isOpen) {
+      hasAutoExpandedRef.current = false;
+    }
+  }, [isOpen]);
+
+  // Auto-expand first-level folders for local branches (only once when drawer opens)
+  useEffect(() => {
+    if (!isOpen || localBranches.length === 0 || hasAutoExpandedRef.current) return;
+
+    const firstLevelFolders = new Set<string>();
+    localBranches.forEach(branch => {
+      const parts = branch.name.split('/');
+      if (parts.length >= 2) {
+        // Add first-level folder (e.g., "feature", "grove", "fix")
+        firstLevelFolders.add(parts[0]);
+      }
+    });
+
+    // Expand all first-level folders (only if not already in the set).
+    // Effect-driven because expansion depends on async-loaded `localBranches`;
+    // the `hasAutoExpandedRef` guard runs this exactly once per drawer-open.
+    setExpandedFolders((prev) => {
+      const next = new Set(prev);
+      firstLevelFolders.forEach(folder => next.add(folder));
+      return next;
+    });
+
+    hasAutoExpandedRef.current = true;
+  }, [isOpen, localBranches]);
 
   const filteredLocal = localBranches.filter(b =>
     b.name.toLowerCase().includes(searchQuery.toLowerCase())
   );
-  const filteredRemote = remoteBranches.filter(b =>
+  const filteredRemote = allRemoteBranches.filter(b =>
     b.name.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
-  // Group active tasks by target branch
+  // Group tasks by target branch (include all statuses for display inside panel)
   const branchesWithTasks = useMemo(() => {
-    const activeTasks = tasks.filter(t => t.status !== "archived");
     const branchMap = new Map<string, Task[]>();
 
-    activeTasks.forEach(task => {
+    tasks.forEach(task => {
       const existing = branchMap.get(task.target) || [];
       existing.push(task);
       branchMap.set(task.target, existing);
@@ -164,16 +296,17 @@ export function BranchDrawer({
       if (searchQuery && !branchName.toLowerCase().includes(searchQuery.toLowerCase())) {
         return;
       }
+      const nonArchived = branchTasks.filter(t => t.status !== "archived");
+      // Only show section if there are non-archived tasks
+      if (nonArchived.length === 0) return;
       result.push({
         name: branchName,
-        taskCount: branchTasks.length,
-        liveTasks: branchTasks.filter(t => t.status === "live").length,
-        idleTasks: branchTasks.filter(t => t.status === "idle").length,
-        tasks: branchTasks,
+        taskCount: nonArchived.length,
+        tasks: branchTasks, // all tasks including archived
       });
     });
 
-    // Sort by task count descending
+    // Sort by active task count descending
     return result.sort((a, b) => b.taskCount - a.taskCount);
   }, [tasks, searchQuery]);
 
@@ -219,7 +352,7 @@ export function BranchDrawer({
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             onClick={onClose}
-            className="fixed inset-0 bg-black/30 z-40"
+            className="fixed inset-0 m-0 bg-black/30 z-40"
           />
 
           {/* Drawer */}
@@ -311,6 +444,10 @@ export function BranchDrawer({
                                 onClose();
                               }
                             }}
+                            onTaskRebase={onTaskRebase}
+                            onTaskArchive={onTaskArchive}
+                            onTaskClean={onTaskClean}
+                            onTaskRecover={onTaskRecover}
                           />
                         ))}
                       </motion.div>
@@ -320,35 +457,112 @@ export function BranchDrawer({
               )}
 
               {/* Local Branches */}
-              <div className="text-xs font-medium text-[var(--color-text-muted)] px-2 py-1.5 uppercase tracking-wider">
-                Local ({filteredLocal.length})
-              </div>
-              <div className="space-y-0.5">
-                <TreeView
-                  node={localTree}
-                  depth={0}
-                  expandedFolders={expandedFolders}
-                  selectedBranch={selectedBranch}
-                  folderColor="var(--color-warning)"
-                  onToggleFolder={toggleFolder}
-                  onBranchClick={handleBranchClick}
-                  onCheckout={onCheckout}
-                  onMerge={onMerge}
-                  onRename={onRename}
-                  onDelete={onDelete}
-                  onPullMerge={onPullMerge}
-                  onPullRebase={onPullRebase}
-                  onClose={onClose}
-                  isLocal={true}
-                />
+              <div>
+                <button
+                  onClick={() => setShowLocal(!showLocal)}
+                  className="w-full flex items-center gap-1 text-xs font-medium text-[var(--color-text-muted)] px-2 py-1.5 hover:text-[var(--color-text)] transition-colors uppercase tracking-wider"
+                >
+                  {showLocal ? (
+                    <ChevronDown className="w-3 h-3" />
+                  ) : (
+                    <ChevronRight className="w-3 h-3" />
+                  )}
+                  Local ({filteredLocal.length})
+                </button>
+                <AnimatePresence>
+                  {showLocal && (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: "auto" }}
+                      exit={{ opacity: 0, height: 0 }}
+                      className="space-y-0.5 overflow-hidden"
+                    >
+                      <TreeView
+                        node={localTree}
+                        depth={0}
+                        expandedFolders={expandedFolders}
+                        selectedBranch={selectedBranch}
+                        folderColor="var(--color-warning)"
+                        onToggleFolder={toggleFolder}
+                        onBranchClick={handleBranchClick}
+                        onCheckout={onCheckout}
+                        onMerge={onMerge}
+                        onRename={onRename}
+                        onDelete={onDelete}
+                        onPullMerge={onPullMerge}
+                        onPullRebase={onPullRebase}
+                        onClose={onClose}
+                        isLocal={true}
+                      />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
 
-              {/* Remote Branches */}
+              {/* Remote Loading Buttons - Only show unloaded remotes */}
+              {remotes.filter(r => !loadedRemotes.has(r)).length > 0 && (
+                <div className="mt-4">
+                  <button
+                    onClick={() => setShowRemoteButtons(!showRemoteButtons)}
+                    className="w-full flex items-center gap-1 text-xs font-medium text-[var(--color-text-muted)] px-2 py-1.5 hover:text-[var(--color-text)] transition-colors uppercase tracking-wider"
+                  >
+                    {showRemoteButtons ? (
+                      <ChevronDown className="w-3 h-3" />
+                    ) : (
+                      <ChevronRight className="w-3 h-3" />
+                    )}
+                    Remote ({remotes.filter(r => !loadedRemotes.has(r)).length})
+                  </button>
+                  <AnimatePresence>
+                    {showRemoteButtons && (
+                      <motion.div
+                        initial={{ opacity: 0, height: 0 }}
+                        animate={{ opacity: 1, height: "auto" }}
+                        exit={{ opacity: 0, height: 0 }}
+                        className="space-y-2 mt-2 px-2 overflow-hidden"
+                      >
+                        {remotes
+                          .filter(remote => !loadedRemotes.has(remote))
+                          .map((remote) => {
+                            const isLoading = loadingRemote === remote;
+
+                            return (
+                              <button
+                                key={remote}
+                                onClick={() => loadRemoteBranches(remote)}
+                                disabled={isLoading}
+                                className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+                                  isLoading
+                                    ? "bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)] cursor-wait"
+                                    : "bg-[var(--color-bg-tertiary)] text-[var(--color-text)] hover:bg-[var(--color-highlight)]/10 hover:text-[var(--color-highlight)] border border-[var(--color-border)] hover:border-[var(--color-highlight)]/50"
+                                }`}
+                              >
+                                {isLoading ? (
+                                  <>
+                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                    Loading {remote}...
+                                  </>
+                                ) : (
+                                  <>
+                                    <Cloud className="w-4 h-4" />
+                                    Load {remote}
+                                  </>
+                                )}
+                              </button>
+                            );
+                          })}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              )}
+
+              {/* Loaded Remote Branches Tree */}
               {filteredRemote.length > 0 && (
                 <div className="mt-4">
                   <button
                     onClick={() => setShowRemote(!showRemote)}
-                    className="flex items-center gap-1 text-xs font-medium text-[var(--color-text-muted)] px-2 py-1.5 hover:text-[var(--color-text)] transition-colors uppercase tracking-wider"
+                    className="w-full flex items-center gap-1 text-xs font-medium text-[var(--color-text-muted)] px-2 py-1.5 hover:text-[var(--color-text)] transition-colors uppercase tracking-wider"
                   >
                     {showRemote ? (
                       <ChevronDown className="w-3 h-3" />
@@ -419,6 +633,10 @@ interface TaskBranchItemProps {
   onBranchClick: () => void;
   onCheckout: () => void;
   onTaskClick: (task: Task) => void;
+  onTaskRebase?: (task: Task) => void;
+  onTaskArchive?: (task: Task) => void;
+  onTaskClean?: (task: Task) => void;
+  onTaskRecover?: (task: Task) => void;
 }
 
 function TaskBranchItem({
@@ -428,7 +646,21 @@ function TaskBranchItem({
   onBranchClick,
   onCheckout,
   onTaskClick,
+  onTaskRebase,
+  onTaskArchive,
+  onTaskClean,
+  onTaskRecover,
 }: TaskBranchItemProps) {
+  const [expandedTaskId, setExpandedTaskId] = useState<string | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
+
+  const activeTasks = branchWithTasks.tasks.filter(t => t.status !== "archived");
+  const archivedTasks = branchWithTasks.tasks.filter(t => t.status === "archived");
+
+  const handleTaskRowClick = (taskId: string) => {
+    setExpandedTaskId(expandedTaskId === taskId ? null : taskId);
+  };
+
   return (
     <div>
       <button
@@ -452,18 +684,11 @@ function TaskBranchItem({
           </span>
         </div>
         <div className="flex items-center gap-2 flex-shrink-0">
-          {/* Task count badges */}
+          {/* Task count badge */}
           <div className="flex items-center gap-1">
-            {branchWithTasks.liveTasks > 0 && (
-              <span className="flex items-center gap-0.5 text-xs px-1.5 py-0.5 rounded-full bg-[var(--color-success)]/20 text-[var(--color-success)]">
-                <Circle className="w-2 h-2 fill-current" />
-                {branchWithTasks.liveTasks}
-              </span>
-            )}
-            {branchWithTasks.idleTasks > 0 && (
-              <span className="flex items-center gap-0.5 text-xs px-1.5 py-0.5 rounded-full bg-[var(--color-text-muted)]/20 text-[var(--color-text-muted)]">
-                <Circle className="w-2 h-2" />
-                {branchWithTasks.idleTasks}
+            {branchWithTasks.taskCount > 0 && (
+              <span className="text-xs px-1.5 py-0.5 rounded-full bg-[var(--color-highlight)]/15 text-[var(--color-highlight)]">
+                {branchWithTasks.taskCount}
               </span>
             )}
           </div>
@@ -495,43 +720,200 @@ function TaskBranchItem({
               )}
 
               {/* Task list */}
-              <div className="border-t border-[var(--color-border)] pt-2 mt-2">
-                <div className="text-xs text-[var(--color-text-muted)] mb-1.5">
-                  Tasks ({branchWithTasks.taskCount})
+              <div className="border-t border-[var(--color-border)] pt-2 mt-2 space-y-2">
+                {/* Active Tasks */}
+                <div>
+                  <div className="text-xs text-[var(--color-text-muted)] mb-1.5">
+                    Active Tasks ({activeTasks.length})
+                  </div>
+                  <div className="space-y-1">
+                    {activeTasks.map(task => (
+                      <TaskRow
+                        key={task.id}
+                        task={task}
+                        isExpanded={expandedTaskId === task.id}
+                        isCurrent={isCurrent}
+                        onToggle={() => handleTaskRowClick(task.id)}
+                        onTaskClick={onTaskClick}
+                        onTaskRebase={onTaskRebase}
+                        onTaskArchive={onTaskArchive}
+                        onTaskClean={onTaskClean}
+                      />
+                    ))}
+                  </div>
                 </div>
-                {/* Hint: checkout required before accessing tasks */}
-                {!isCurrent && (
-                  <div className="text-xs text-[var(--color-warning)] mb-2 px-2">
-                    Checkout this branch to access tasks
+
+                {/* Archived Tasks */}
+                {archivedTasks.length > 0 && (
+                  <div className="border-t border-[var(--color-border)] pt-2">
+                    <button
+                      onClick={() => setShowArchived(v => !v)}
+                      className="flex items-center gap-1 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors mb-1"
+                    >
+                      {showArchived ? (
+                        <ChevronDown className="w-3 h-3" />
+                      ) : (
+                        <ChevronRight className="w-3 h-3" />
+                      )}
+                      Archived ({archivedTasks.length})
+                    </button>
+                    <AnimatePresence>
+                      {showArchived && (
+                        <motion.div
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: "auto", opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          className="overflow-hidden space-y-1"
+                        >
+                          {archivedTasks.map(task => (
+                            <ArchivedTaskRow
+                              key={task.id}
+                              task={task}
+                              isExpanded={expandedTaskId === task.id}
+                              onToggle={() => handleTaskRowClick(task.id)}
+                              onTaskRecover={onTaskRecover}
+                              onTaskClean={onTaskClean}
+                            />
+                          ))}
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
                   </div>
                 )}
-                <div className="space-y-1">
-                  {branchWithTasks.tasks.map(task => (
-                    <button
-                      key={task.id}
-                      onClick={() => isCurrent && onTaskClick(task)}
-                      disabled={!isCurrent}
-                      className={`w-full flex items-center gap-2 px-2 py-1.5 text-sm rounded-md transition-colors text-left
-                        ${isCurrent
-                          ? "text-[var(--color-text)] hover:bg-[var(--color-bg)] cursor-pointer"
-                          : "text-[var(--color-text-muted)] cursor-not-allowed opacity-60"
-                        }`}
-                    >
-                      <Circle className={`w-2.5 h-2.5 flex-shrink-0 ${
-                        task.status === "live"
-                          ? "fill-[var(--color-success)] text-[var(--color-success)]"
-                          : "text-[var(--color-text-muted)]"
-                      }`} />
-                      <span className="truncate">{task.name}</span>
-                      {task.filesChanged > 0 && (
-                        <span className="text-xs text-[var(--color-text-muted)] ml-auto flex-shrink-0">
-                          {task.filesChanged} files
-                        </span>
-                      )}
-                    </button>
-                  ))}
-                </div>
               </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+// Active task row with expandable action menu
+interface TaskRowProps {
+  task: Task;
+  isExpanded: boolean;
+  isCurrent: boolean;
+  onToggle: () => void;
+  onTaskClick: (task: Task) => void;
+  onTaskRebase?: (task: Task) => void;
+  onTaskArchive?: (task: Task) => void;
+  onTaskClean?: (task: Task) => void;
+}
+
+function TaskRow({ task, isExpanded, isCurrent, onToggle, onTaskClick, onTaskRebase, onTaskArchive, onTaskClean }: TaskRowProps) {
+  return (
+    <div>
+      <button
+        onClick={onToggle}
+        className="w-full flex items-center gap-2 px-2 py-1.5 text-sm rounded-md transition-colors text-left text-[var(--color-text)] hover:bg-[var(--color-bg)] cursor-pointer"
+      >
+        <Circle className={`w-2.5 h-2.5 flex-shrink-0 ${
+          task.status === "archived"
+            ? "text-[var(--color-text-muted)]"
+            : "fill-[var(--color-highlight)] text-[var(--color-highlight)]"
+        }`} />
+        <span className="truncate flex-1">{task.name}</span>
+        {isExpanded ? (
+          <ChevronDown className="w-3.5 h-3.5 text-[var(--color-text-muted)] flex-shrink-0" />
+        ) : (
+          <ChevronRight className="w-3.5 h-3.5 text-[var(--color-text-muted)] flex-shrink-0" />
+        )}
+      </button>
+      <AnimatePresence>
+        {isExpanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="overflow-hidden"
+          >
+            <div className="pl-6 pr-1 pb-1 space-y-0.5">
+              {isCurrent && (
+                <button
+                  onClick={() => onTaskClick(task)}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-[var(--color-highlight)] hover:bg-[var(--color-bg)] rounded-md transition-colors"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  Go To Task
+                </button>
+              )}
+              <button
+                onClick={() => onTaskRebase?.(task)}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-[var(--color-text)] hover:bg-[var(--color-bg)] rounded-md transition-colors"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                Rebase
+              </button>
+              <button
+                onClick={() => onTaskArchive?.(task)}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-[var(--color-text)] hover:bg-[var(--color-bg)] rounded-md transition-colors"
+              >
+                <Archive className="w-3.5 h-3.5" />
+                Archive
+              </button>
+              <button
+                onClick={() => onTaskClean?.(task)}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-[var(--color-error)] hover:bg-[var(--color-error)]/10 rounded-md transition-colors"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Clean
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+// Archived task row with Recover / Clean actions
+interface ArchivedTaskRowProps {
+  task: Task;
+  isExpanded: boolean;
+  onToggle: () => void;
+  onTaskRecover?: (task: Task) => void;
+  onTaskClean?: (task: Task) => void;
+}
+
+function ArchivedTaskRow({ task, isExpanded, onToggle, onTaskRecover, onTaskClean }: ArchivedTaskRowProps) {
+  return (
+    <div>
+      <button
+        onClick={onToggle}
+        className="w-full flex items-center gap-2 px-2 py-1.5 text-sm rounded-md transition-colors text-left text-[var(--color-text-muted)] hover:bg-[var(--color-bg)] cursor-pointer"
+      >
+        <Archive className="w-3 h-3 flex-shrink-0 text-[var(--color-text-muted)]" />
+        <span className="truncate flex-1">{task.name}</span>
+        {isExpanded ? (
+          <ChevronDown className="w-3.5 h-3.5 text-[var(--color-text-muted)] flex-shrink-0" />
+        ) : (
+          <ChevronRight className="w-3.5 h-3.5 text-[var(--color-text-muted)] flex-shrink-0" />
+        )}
+      </button>
+      <AnimatePresence>
+        {isExpanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="overflow-hidden"
+          >
+            <div className="pl-6 pr-1 pb-1 space-y-0.5">
+              <button
+                onClick={() => onTaskRecover?.(task)}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-[var(--color-text)] hover:bg-[var(--color-bg)] rounded-md transition-colors"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                Recover
+              </button>
+              <button
+                onClick={() => onTaskClean?.(task)}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-[var(--color-error)] hover:bg-[var(--color-error)]/10 rounded-md transition-colors"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Clean
+              </button>
             </div>
           </motion.div>
         )}
@@ -860,7 +1242,11 @@ function RemoteBranchItem({
             >
               <button
                 onClick={() => {
-                  onCheckout(branch);
+                  // Strip "<remote>/" prefix so `git checkout <name>` DWIMs
+                  // a local tracking branch instead of detaching HEAD.
+                  const slash = branch.name.indexOf("/");
+                  const localName = slash >= 0 ? branch.name.slice(slash + 1) : branch.name;
+                  onCheckout({ ...branch, name: localName });
                   onClose();
                 }}
                 className="w-full flex items-center gap-2 px-3 py-2 text-sm text-white bg-[var(--color-highlight)] hover:opacity-90 rounded-lg transition-colors"

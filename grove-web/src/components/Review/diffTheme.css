@@ -7,6 +7,8 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .diff-review-page.embedded {
@@ -18,7 +20,7 @@
   display: flex;
   align-items: center;
   gap: 16px;
-  padding: 12px 16px;
+  padding: 8px 16px;
   background: var(--color-bg-secondary);
   border-bottom: 1px solid var(--color-border);
   flex-shrink: 0;
@@ -57,6 +59,44 @@
 /* Move background when second button is active */
 .diff-mode-selector:has(button:nth-child(2).active)::before {
   transform: translateX(calc(100% + 4px));
+}
+
+/* When there's only one button (non-git mode), full-width indicator */
+.diff-mode-selector:not(:has(button:nth-child(2)))::before {
+  width: calc(100% - 6px);
+}
+
+.diff-refresh-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: color 0.2s, background 0.2s;
+}
+
+.diff-refresh-btn:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-tertiary);
+}
+
+.diff-refresh-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.diff-refresh-btn .spin {
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 .diff-mode-selector button {
@@ -112,6 +152,7 @@
 .diff-layout {
   display: flex;
   flex: 1;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -204,8 +245,39 @@
 /* Content area */
 .diff-content {
   flex: 1;
+  min-width: 0;
+  min-height: 0;
   overflow-y: auto;
   overflow-x: auto;
+}
+
+/* When a preview drawer is open, make diff-content a flex column so the file section
+   can stretch to fill all available height (avoiding both triple scrollbars and clipping) */
+.diff-content:has(.diff-file-body.with-preview) {
+  overflow-y: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.diff-content:has(.diff-file-body.with-preview) .diff-file-section {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Only allow selection in review body content, not chrome/header/sidebar controls */
+.diff-code,
+.diff-code *,
+.diff-comment-body,
+.diff-comment-body *,
+.preview-drawer-content,
+.preview-drawer-content *,
+.diff-review-page input,
+.diff-review-page textarea,
+.diff-review-page [contenteditable="true"] {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 /* File section */
@@ -216,9 +288,8 @@
 
 .diff-file-header {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 16px;
+  flex-direction: column;
+  align-items: stretch;
   background: var(--color-bg-secondary);
   border-bottom: 1px solid var(--color-border);
   border-top: 1px solid var(--color-border);
@@ -226,12 +297,68 @@
   top: 0;
   z-index: 5;
   font-size: 13px;
+  container-type: inline-size;
+}
+
+.diff-file-header-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+/* Preview button (Eye icon in header) */
+.diff-file-preview-btn {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+  flex-shrink: 0;
+}
+
+.diff-file-header:hover .diff-file-preview-btn {
+  opacity: 0.6;
+}
+
+.diff-file-preview-btn:hover {
+  opacity: 1 !important;
+  color: var(--color-highlight);
+  background: var(--color-bg-tertiary);
+}
+
+.diff-file-preview-btn.active {
+  opacity: 1 !important;
+  color: var(--color-highlight);
+}
+
+/* TOC outline button: TocPanel itself is `hidden md:flex`, so hide the
+   toggle below the same breakpoint to avoid a no-op click. */
+@media (max-width: 767px) {
+  .diff-file-preview-btn-md-only {
+    display: none;
+  }
 }
 
 .diff-file-path {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 12px;
   color: var(--color-text);
+  min-width: 0;
+  flex: 0 1 auto;
+  max-width: min(62cqi, 820px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .diff-file-badge {
@@ -739,6 +866,8 @@ td.diff-code.diff-line-highlighted::before {
 .diff-sidebar-search-input::placeholder {
   color: var(--color-text-muted);
   opacity: 0.6;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .diff-sidebar-search-input:focus {
@@ -836,8 +965,11 @@ td.diff-code.diff-line-highlighted::before {
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 12px;
-  flex-shrink: 0;
+  justify-content: flex-end;
+  gap: 10px;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding-left: 0;
 }
 
 .diff-file-viewed-label {
@@ -892,6 +1024,7 @@ td.diff-code.diff-line-highlighted::before {
   font-size: 11px;
   color: var(--color-text-muted);
   white-space: nowrap;
+  min-width: 0;
 }
 
 .diff-file-unresolved {
@@ -1206,6 +1339,161 @@ td.diff-code.diff-line-highlighted::before {
 .diff-version-copy-btn:hover {
   opacity: 1 !important;
   background: var(--color-bg-secondary);
+}
+
+/* File body — flex layout for drawer */
+.diff-file-body {
+  display: flex;
+  overflow: clip;
+}
+
+/* When preview drawer is open, fill available height (set by flex parent) so both
+   left and right panels can scroll independently without a fixed viewport height */
+.diff-file-body.with-preview {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.diff-file-body.with-preview .diff-file-body-main {
+  overflow-y: auto;
+}
+
+.diff-file-body-main {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.diff-file-body-main.hidden {
+  width: 0;
+  min-width: 0;
+  flex: 0;
+  overflow: hidden;
+}
+
+/* Preview drawer */
+.preview-drawer {
+  position: relative;
+  width: 0;
+  min-width: 0;
+  overflow: clip;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--color-border);
+  background: var(--color-bg);
+  transition: width 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              min-width 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              opacity 0.2s ease;
+  opacity: 0;
+}
+
+.preview-drawer.open {
+  width: 50%;
+  min-width: 300px;
+  opacity: 1;
+}
+
+.preview-drawer.expanded {
+  width: 100%;
+  flex: 1;
+}
+
+/* Resize handle on left edge of drawer */
+.preview-drawer-resize {
+  position: absolute;
+  top: 0;
+  left: -2px;
+  width: 5px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 10;
+}
+
+.preview-drawer-resize:hover,
+.preview-drawer-resize:active {
+  background: var(--color-highlight);
+  opacity: 0.4;
+}
+
+.preview-drawer-header {
+  display: flex;
+  align-items: center;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-secondary);
+  font-size: 12px;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.preview-drawer-header .diff-file-preview-btn {
+  opacity: 0.6;
+}
+
+.preview-drawer-header .diff-file-preview-btn:hover {
+  opacity: 1 !important;
+}
+
+.preview-drawer-content {
+  padding: 12px;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Diff preview hunk markers (inside drawer) — non-code blocks */
+.preview-block-insert {
+  background: color-mix(in srgb, var(--color-success) 18%, transparent);
+  border-radius: 4px;
+  padding: 2px 6px;
+  margin: 2px 0;
+}
+
+.preview-block-delete {
+  background: color-mix(in srgb, var(--color-error) 15%, transparent);
+  border-radius: 4px;
+  padding: 2px 6px;
+  margin: 2px 0;
+}
+
+.preview-block-context {
+  padding: 2px 6px;
+  margin: 2px 0;
+}
+
+/* Diff preview code blocks — per-line coloring */
+.preview-code-block {
+  margin: 4px 0;
+  padding: 12px;
+  background: var(--color-bg-tertiary);
+  border-radius: 6px;
+  overflow-x: auto;
+}
+
+.preview-code-block code {
+  font-family: ui-monospace, 'SF Mono', 'Fira Code', 'Fira Mono', 'Roboto Mono', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.preview-code-line {
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+.preview-code-line-insert {
+  background: color-mix(in srgb, var(--color-success) 18%, transparent);
+}
+
+.preview-code-line-delete {
+  background: color-mix(in srgb, var(--color-error) 15%, transparent);
+}
+
+.preview-loading {
+  padding: 12px;
+  color: var(--color-text-muted);
+  font-size: 12px;
 }
 
 /* ============================================================================
@@ -1748,12 +2036,23 @@ td.diff-code.diff-line-highlighted::before {
   font-size: 13px;
   transition: all 0.15s;
   white-space: nowrap;
+  min-width: 0;
 }
 
 .diff-file-comment-btn:hover {
   background: var(--color-bg-tertiary);
   border-color: var(--color-highlight);
   color: var(--color-highlight);
+}
+
+@container (max-width: 560px) {
+  .diff-file-comment-btn span {
+    display: none;
+  }
+
+  .diff-file-header-right {
+    gap: 8px;
+  }
 }
 
 /* Conversation sidebar footer */
@@ -1994,14 +2293,25 @@ td.diff-code.diff-line-highlighted::before {
    File Tree Context Menu & Virtual Path Creation
    ============================================================================ */
 
-/* Context menu */
+/* Context menu — portaled to body so position: fixed isn't trapped by transformed ancestors */
+.file-tree-context-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  background: transparent;
+}
+
 .file-tree-context-menu {
+  position: fixed;
+  z-index: 9999;
   background: var(--color-bg);
   border: 1px solid var(--color-border);
   border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), 0 2px 6px rgba(0, 0, 0, 0.08);
   padding: 4px;
-  min-width: 200px;
+  min-width: 180px;
+  font-size: 12px;
+  user-select: none;
 }
 
 .file-tree-context-menu button {
@@ -2009,19 +2319,32 @@ td.diff-code.diff-line-highlighted::before {
   align-items: center;
   gap: 8px;
   width: 100%;
-  padding: 8px 12px;
+  padding: 6px 10px;
   background: none;
   border: none;
   border-radius: 4px;
   color: var(--color-text);
-  font-size: 13px;
+  font-size: 12px;
+  line-height: 1.4;
   cursor: pointer;
   text-align: left;
-  transition: background 0.15s;
+  transition: background 0.1s;
 }
 
-.file-tree-context-menu button:hover {
+.file-tree-context-menu button:hover:not(:disabled) {
   background: var(--color-bg-tertiary);
+}
+
+.file-tree-context-menu button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.file-tree-context-menu-separator {
+  height: 1px;
+  background: var(--color-border);
+  margin: 4px 2px;
+  opacity: 0.6;
 }
 
 /* Inline virtual path input in file tree */
@@ -2085,4 +2408,276 @@ td.diff-code.diff-line-highlighted::before {
   background: rgba(255, 165, 0, 0.6);
   outline: 2px solid orange;
   outline-offset: -1px;
+}
+
+/* ============================================================================
+   Mobile / Tablet — max-width: 1199px
+   ============================================================================ */
+
+@media (max-width: 1199px) {
+  /* --- Page header --- */
+  .diff-page-header {
+    gap: 8px;
+    padding: 6px 12px;
+  }
+  .diff-page-title {
+    font-size: 14px;
+  }
+
+  /* --- Toolbar --- */
+  .diff-toolbar {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 6px 12px;
+  }
+  .diff-toolbar-left {
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  /* --- File tree sidebar → fixed overlay --- */
+  .diff-sidebar {
+    position: fixed;
+    z-index: 20;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: 280px;
+    box-shadow: 4px 0 16px rgba(0, 0, 0, 0.25);
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+                opacity 0.2s ease;
+  }
+  .diff-sidebar.collapsed {
+    width: 280px;
+    transform: translateX(-100%);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  /* --- Conversation sidebar → fixed overlay --- */
+  .conv-sidebar {
+    position: fixed;
+    z-index: 20;
+    top: 0;
+    right: 0;
+    height: 100%;
+    width: 300px;
+    box-shadow: -4px 0 16px rgba(0, 0, 0, 0.25);
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+                opacity 0.2s ease;
+  }
+  .conv-sidebar.collapsed {
+    width: 300px;
+    transform: translateX(100%);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  /* --- Diff gutter compact --- */
+  .diff-gutter {
+    width: 36px;
+    min-width: 36px;
+    padding: 0 4px;
+  }
+  .diff-code {
+    padding: 0 6px;
+  }
+
+  /* --- File header --- */
+  .diff-file-header {
+    font-size: 12px;
+  }
+  .diff-file-header-top {
+    padding: 6px 10px;
+    gap: 6px;
+    flex-wrap: nowrap;
+  }
+  .diff-file-preview-mode {
+    padding: 6px 10px;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .diff-file-header-right {
+    gap: 8px;
+  }
+  .diff-file-comment-btn span {
+    display: none;
+  }
+
+  /* --- Comment card compact --- */
+  .diff-comment-card {
+    margin: 6px 8px;
+  }
+
+  /* --- Version range --- */
+  .diff-version-range {
+    gap: 4px;
+  }
+
+  /* --- Split view gutter (shouldn't show on mobile, but just in case) --- */
+  .diff-split .diff-gutter {
+    width: 32px;
+    min-width: 32px;
+  }
+}
+
+/* ─── Navigation highlight (flash when jumping from Chat) ─── */
+@keyframes nav-highlight-flash {
+  0%   { background-color: color-mix(in srgb, var(--color-highlight) 35%, transparent); }
+  100% { background-color: transparent; }
+}
+
+tr.diff-line-nav-highlight,
+tr.diff-line-nav-highlight td {
+  animation: nav-highlight-flash 2.5s ease-out forwards;
+}
+
+/* ─── Cleanup Panel ─── */
+.conv-cleanup-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.conv-cleanup-btn:hover {
+  background: color-mix(in srgb, var(--color-error) 12%, var(--color-bg));
+  color: var(--color-error);
+}
+
+.conv-cleanup-panel {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  width: 260px;
+  margin-top: 4px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  z-index: 100;
+  overflow: hidden;
+}
+
+.conv-cleanup-title {
+  padding: 10px 12px 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.conv-cleanup-section-title {
+  padding: 6px 12px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--color-text-muted);
+}
+
+.conv-cleanup-checkbox-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  font-size: 12px;
+  color: var(--color-text);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.conv-cleanup-checkbox-item:hover {
+  background: var(--color-bg-tertiary);
+}
+
+.conv-cleanup-checkbox-item input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--color-highlight);
+}
+
+.conv-cleanup-checkbox-item span:first-of-type {
+  flex: 1;
+}
+
+.conv-cleanup-count {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.conv-cleanup-footer {
+  padding: 8px 12px 10px;
+  border-top: 1px solid var(--color-border);
+  margin-top: 4px;
+}
+
+.conv-cleanup-affected {
+  display: block;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-bottom: 8px;
+}
+
+.conv-cleanup-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.conv-cleanup-cancel {
+  padding: 4px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: none;
+  color: var(--color-text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.conv-cleanup-cancel:hover {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text);
+}
+
+.conv-cleanup-delete {
+  padding: 4px 12px;
+  border: 1px solid color-mix(in srgb, var(--color-error) 40%, var(--color-border));
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--color-error) 10%, var(--color-bg));
+  color: var(--color-error);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.conv-cleanup-delete:hover {
+  background: color-mix(in srgb, var(--color-error) 20%, var(--color-bg));
+  border-color: var(--color-error);
+}
+
+.conv-cleanup-delete.confirming {
+  background: var(--color-error);
+  border-color: var(--color-error);
+  color: white;
+}
+
+.conv-cleanup-delete.confirming:hover {
+  background: color-mix(in srgb, var(--color-error) 85%, black);
+}
+
+.conv-cleanup-delete:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }

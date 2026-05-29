@@ -7,46 +7,71 @@
 //! - grove_reply_review: Reply to review comments
 //! - grove_complete_task: Complete task (commit, sync, merge)
 
-use std::env;
+use std::{collections::HashSet, env};
 
 use rmcp::{
     handler::server::{tool::ToolRouter, wrapper::Parameters},
     model::*,
     schemars,
     schemars::JsonSchema,
-    tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
+    tool, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
+use crate::acp;
 use crate::git;
-use crate::storage::{comments, notes, workspace::project_hash};
+use crate::operations;
+use crate::storage::{chat_history, comments, config, notes, tasks, workspace};
 
 // ============================================================================
 // Grove Instructions for AI
 // ============================================================================
 
-const GROVE_INSTRUCTIONS: &str = r#"
-# Grove - Git Worktree Task Manager
+const MANAGEMENT_INSTRUCTIONS: &str = r#"
+# Grove - Parallel Task Orchestration
 
-Grove is a TUI application that manages parallel development tasks using Git worktrees and tmux sessions.
-
-## What is a Grove Task?
-
-A Grove "task" represents an isolated development environment:
-- Each task has its own Git worktree (branch + working directory)
-- Each task runs in a dedicated tmux session
-- Tasks are isolated from each other, allowing parallel work
-
-## How to Detect Grove Environment
-
-**IMPORTANT**: Before using any Grove tools, first call `grove_status` to check if you are running inside a Grove task.
-
-- If `in_grove_task` is `true`: You are in a Grove task, and you can use all Grove tools.
-- If `in_grove_task` is `false`: You are NOT in a Grove task. Do NOT use other Grove tools as they will fail.
+Grove lets you break down work into isolated, parallel tasks under a project.
+Each task provides an independent working directory where work can proceed
+without affecting other tasks or the main codebase.
 
 ## Available Tools
 
-When inside a Grove task:
+### Task Management
+1. **grove_list_projects** — Find a registered project
+2. **grove_add_project_by_path** — Register a project (idempotent)
+3. **grove_create_task** — Spawn an isolated subtask for parallel work
+4. **grove_list_tasks** — Query existing active tasks
+5. **grove_edit_note** — Write task notes (spec, context, instructions)
+
+### Agent Chat Control
+6. **grove_list_agents** — List available worker agents
+7. **grove_start_chat** — Create and start a chat session (returns chat_id)
+8. **grove_chat_status** — Get chat state, auto-connects if needed, returns available modes/models
+9. **grove_send_prompt** — Send prompt / respond to permission / cancel turn
+10. **grove_list_chats** — List chat sessions for a task
+
+## Orchestration Workflow
+1. Find or register the target project
+2. Call `grove_list_agents` to see available worker agents
+3. Call `grove_create_task` for each subtask
+4. Call `grove_edit_note` to write task spec and context
+5. Call `grove_start_chat` to launch a worker agent
+6. Call `grove_chat_status` to wait for agent ready and get available modes/models
+7. Call `grove_send_prompt` to instruct the worker (always call `grove_chat_status` first!)
+8. Poll with `grove_chat_status` until idle
+   - If `permission_needed`: use `grove_send_prompt` with `permission_option_id`
+   - If stuck: use `grove_send_prompt` with `cancel: true`
+9. Review results in `last_message` / `plan`, send follow-ups as needed
+
+"#;
+
+const CODING_EXECUTION_INSTRUCTIONS: &str = r#"
+# Grove - Coding Task (Git Worktree)
+
+You are running inside a **Coding** Grove task: an isolated git worktree + tmux session for parallel development.
+
+## Available Tools
 
 1. **grove_status** - Get task context (task_id, branch, target_branch, project)
 2. **grove_read_notes** - Read user-written notes containing context and requirements
@@ -61,7 +86,7 @@ When inside a Grove task:
 
 ## Recommended Workflow
 
-1. Call `grove_status` first to verify you are in a Grove task
+1. Call `grove_status` first to verify the task context
 2. Call `grove_read_notes` to understand user requirements and context
 3. Call `grove_read_review` to check for code review feedback
 4. After addressing review comments, use `grove_reply_review` to respond
@@ -69,16 +94,334 @@ When inside a Grove task:
 
 ## Completing a Task
 
-**IMPORTANT**: ONLY call `grove_complete_task` when the user explicitly asks you to complete the task. NEVER call it automatically or proactively.
+**IMPORTANT**: ONLY call `grove_complete_task` when the user explicitly asks. NEVER call it automatically or proactively.
 - Provide a commit message summarizing your changes
 - The tool will: commit → fetch & rebase target → merge into target branch
 - If rebase conflicts occur, resolve them and call `grove_complete_task` again
-
-## When NOT in Grove
-
-If `grove_status` returns `in_grove_task: false`, inform the user:
-"I'm not running inside a Grove task environment. Grove tools are only available when working within a Grove-managed tmux session. Please start a task from the Grove TUI."
 "#;
+
+const STUDIO_EXECUTION_INSTRUCTIONS: &str = r#"
+# Grove - Studio Task
+
+You are running inside a **Studio** Grove task. Studio tasks are not git worktrees; they give you a persistent working directory with conventional subfolders:
+
+- `input/`    — user-provided input files (read-only starting point)
+- `output/`   — your work products
+- `resource/` — shared project resources (symlink to project-level resource/)
+- `scripts/`  — helper scripts
+- `sketch/`   — Excalidraw sketches (see sketch tools below)
+
+## Available Tools
+
+1. **grove_status** — task context (task_id, project_id, project_name)
+2. **grove_read_notes** — user-written notes (context, requirements)
+3. **grove_sketch_read_me()** — one-time format reference for sketch drawing (CALL ONCE before first draw)
+4. **grove_sketch_list()** — list sketches in this task
+5. **grove_sketch_read(sketch, detail_full?)** — read a sketch by name; returns summary + fresh checkpoint_id
+6. **grove_sketch_draw(sketch, elements)** — draw / modify a sketch; auto-creates if name is new; returns new checkpoint_id
+
+## Sketch Workflow
+
+The sketch tool surface is **checkpoint-driven** — a single `grove_sketch_draw` is both create and update. You never pass whole scenes; you pass an ordered array of element objects (plus optional pseudo-elements) that tell Grove how to merge with prior state.
+
+1. Call `grove_sketch_read_me` once to learn the element format.
+2. For a fresh drawing: `grove_sketch_draw(sketch="my-diagram", elements=[...elements])` — the sketch is created.
+3. Save the returned `checkpoint_id`.
+4. To add more: `grove_sketch_draw(sketch="my-diagram", elements=[{"type":"restoreCheckpoint","id":"<cp>"}, ...new elements])`.
+5. To inspect an existing sketch first: `grove_sketch_read("my-diagram")` — returns a summary and a fresh checkpoint_id.
+
+Checkpoints are retained for the most recent 50 draws per sketch (per-sketch LRU). Checkpoints are scoped to the sketch they were created in — passing a `checkpoint_id` from a different sketch will fail.
+
+## Recommended Workflow
+
+1. `grove_status` to verify task context
+2. `grove_read_notes` to understand requirements
+3. Read `input/` for user-provided files
+4. Work in `output/` and, if visual, the sketch canvas via the tools above
+5. When collaborating on a visual design, prefer sketch tools over describing shapes textually
+"#;
+
+/// Element-format reference returned by `grove_sketch_read_me`. Adapted from
+/// the excalidraw-mcp "cheat sheet" (MIT) with Grove-specific pseudo-elements.
+const SKETCH_READ_ME: &str = r##"# Grove Sketch — Excalidraw Element Format
+
+Thanks for calling `grove_sketch_read_me`! Call this ONCE before your first `grove_sketch_draw`. The static portion (element format, palette, examples) does not change; the **Available library items** section at the bottom reflects the user's currently installed Excalidraw libraries at call time.
+
+## How drawing works in Grove
+
+- One tool, `grove_sketch_draw`, handles both create and update.
+- `elements` is a typed **array of objects** — send it as a real JSON array in the tool call, not as a string. Each object's `type` field discriminates it; the MCP schema validates the shape.
+- Sketches are addressed by **name** (e.g. `"architecture"`). Name doesn't exist → a new sketch is created. Name exists → the call updates it.
+- Each successful draw returns a `checkpoint_id`. Pass it back via `restoreCheckpoint` (first element) on the next call to continue from that state.
+- Up to 100 recent checkpoints are kept (global LRU). You can revert to any earlier checkpoint by reusing its id.
+
+## Grove Pseudo-Elements (place in the `elements` array)
+
+**`restoreCheckpoint`** — at most one, must be first:
+`{"type":"restoreCheckpoint","id":"<checkpoint_id>"}`
+Loads the saved scene and appends your new elements on top.
+
+**`delete`** — remove elements by id:
+`{"type":"delete","ids":"r1,r2,a3"}`
+Comma-separated. Also removes bound-text whose `containerId` matches. Place anywhere; applied to the base scene.
+
+**`cameraUpdate`** — viewport hint for the widget (not drawn):
+`{"type":"cameraUpdate","x":0,"y":0,"width":800,"height":600}`
+Use 4:3 sizes: 400x300, 600x450, 800x600, 1200x900, 1600x1200. Emit BEFORE the elements it frames.
+
+**`libraryItem`** — instantiate an icon from the user's installed Excalidraw library at a position. **Strongly prefer this over hand-drawn rectangles when an item with a matching semantic name exists** (e.g. for a database, use the library item named "database" instead of a labeled rectangle):
+`{"type":"libraryItem","id":"<library-item-id>","x":300,"y":200}`
+- `id` MUST be a `LibraryItem.id` from the **Available library items** section below. Do not invent ids.
+- `x,y` is the top-left where the item is placed; the original `width/height` of the item are used (see the listing below).
+- The server expands this into the item's underlying Excalidraw elements with fresh ids, offset by `(x, y)`. If the id isn't in the library, the call fails.
+
+## Color Palette (use consistently)
+
+### Primary strokes (on white)
+| Name | Hex |
+|------|-----|
+| Blue | `#4a9eed` |
+| Amber | `#f59e0b` |
+| Green | `#22c55e` |
+| Red | `#ef4444` |
+| Purple | `#8b5cf6` |
+| Pink | `#ec4899` |
+| Cyan | `#06b6d4` |
+
+### Pastel fills (for shape backgrounds)
+| Color | Hex | Good for |
+|-------|-----|----------|
+| Light Blue | `#a5d8ff` | sources, primary nodes |
+| Light Green | `#b2f2bb` | success, output |
+| Light Orange | `#ffd8a8` | warning, pending |
+| Light Purple | `#d0bfff` | processing, middleware |
+| Light Red | `#ffc9c9` | error, critical |
+| Light Yellow | `#fff3bf` | notes, decisions |
+| Light Teal | `#c3fae8` | storage, data |
+| Light Pink | `#eebefa` | analytics |
+
+Dark mode: start with a huge `{type:"rectangle", x:-4000, y:-3000, width:10000, height:7500, backgroundColor:"#1e1e2e", fillStyle:"solid"}` background element.
+
+## Excalidraw Elements
+
+All elements require: `type`, `id` (unique string), `x`, `y`, `width`, `height`.
+Defaults (omit to save tokens): `strokeColor="#1e1e1e"`, `backgroundColor="transparent"`, `fillStyle="solid"`, `strokeWidth=2`, `roughness=1`, `opacity=100`.
+
+**Rectangle** — `{"type":"rectangle","id":"r1","x":100,"y":100,"width":200,"height":100}`
+Add `"roundness":{"type":3}` for rounded corners, `"backgroundColor":"#a5d8ff","fillStyle":"solid"` for fill.
+
+**Ellipse / Diamond** — same shape as rectangle.
+
+**Labeled shape (PREFERRED for boxes with text)**:
+```
+{"type":"rectangle","id":"r1","x":100,"y":100,"width":200,"height":80,
+ "label":{"text":"Hello","fontSize":20}}
+```
+Works on rectangle/ellipse/diamond. Text auto-centers; container auto-resizes. Saves tokens vs separate text elements.
+
+**Labeled arrow** — add `"label":{"text":"connects"}` to an arrow.
+
+**Standalone text** (titles, annotations only):
+`{"type":"text","id":"t1","x":150,"y":140,"text":"Hello","fontSize":20}`
+`x` is the LEFT edge. To center text at cx: `x = cx - text.length * fontSize * 0.25`.
+
+**Arrow** with points and binding (connects two shapes — drags follow):
+```
+{"type":"arrow","id":"a1","x":300,"y":150,"width":200,"height":0,
+ "points":[[0,0],[200,0]],"endArrowhead":"arrow",
+ "startBinding":{"elementId":"r1","focus":0,"gap":1},
+ "endBinding":{"elementId":"r2","focus":0,"gap":1}}
+```
+Non-elbow arrows (the default) bind via `focus` + `gap`:
+- `focus`: -1..1 offset perpendicular to the line at the shape edge; `0` = centered.
+- `gap`: pixel gap from the arrow tip to the shape edge; `1` is a safe default.
+
+⚠️ Do NOT use `fixedPoint` on non-elbow arrows — Excalidraw resets the
+binding to `null` on the next reconcile and the arrow detaches. `fixedPoint`
+is only valid when you also set `"elbowed": true` on the arrow (orthogonal
+elbow routing). For regular arrows, always use `focus` + `gap`.
+
+`endArrowhead`: `null | "arrow" | "bar" | "dot" | "triangle"`.
+
+Note: you do NOT need to set `boundElements` on the target shapes — the
+server back-fills it automatically from the arrow's `startBinding` /
+`endBinding` on save.
+
+## Drawing Order (CRITICAL)
+
+Array order = z-order (first = back, last = front).
+**Emit progressively**: background → shape → its label → its arrows → next shape.
+Draw decorations/art LAST.
+
+## Camera & Sizing
+
+The inline canvas is ~700px wide. Design for that constraint.
+
+**4:3 camera sizes (always use one):**
+- Camera S: 400×300 — zoomed detail (2-3 elements)
+- Camera M: 600×450 — a section
+- Camera L: 800×600 — standard full diagram (DEFAULT)
+- Camera XL: 1200×900 — large overview; minimum readable fontSize 18
+- Camera XXL: 1600×1200 — panorama; minimum readable fontSize 21
+
+**Font size rules:**
+- Body/labels: minimum 16
+- Titles/headings: minimum 20
+- Secondary annotations: minimum 14 (sparingly)
+
+**Element sizing:**
+- Labeled shapes: at least 120×60
+- Leave 20-30px gaps between elements
+
+ALWAYS emit the first `cameraUpdate` BEFORE the elements it frames.
+
+## Full example
+
+```
+[
+  {"type":"cameraUpdate","width":800,"height":600,"x":50,"y":50},
+  {"type":"rectangle","id":"b1","x":100,"y":100,"width":200,"height":100,"roundness":{"type":3},"backgroundColor":"#a5d8ff","fillStyle":"solid","label":{"text":"Start","fontSize":20}},
+  {"type":"rectangle","id":"b2","x":450,"y":100,"width":200,"height":100,"roundness":{"type":3},"backgroundColor":"#b2f2bb","fillStyle":"solid","label":{"text":"End","fontSize":20}},
+  {"type":"arrow","id":"a1","x":300,"y":150,"width":150,"height":0,"points":[[0,0],[150,0]],"endArrowhead":"arrow","startBinding":{"elementId":"b1","focus":0,"gap":1},"endBinding":{"elementId":"b2","focus":0,"gap":1}}
+]
+```
+
+## Incremental editing example
+
+First call creates the base and returns `checkpoint_id: "cp-abc…"`.
+To add a third box afterwards:
+```
+[
+  {"type":"restoreCheckpoint","id":"cp-abc..."},
+  {"type":"rectangle","id":"b3","x":800,"y":100,"width":200,"height":100,"backgroundColor":"#ffd8a8","fillStyle":"solid","label":{"text":"Next","fontSize":20}}
+]
+```
+To delete `b1` before adding `b3`: include `{"type":"delete","ids":"b1"}` anywhere.
+
+## Common mistakes to avoid
+
+- **Stringifying `elements`**: send the tool call with `elements` as a JSON array, NOT as a JSON-encoded string. Don't wrap it in extra quotes or escape inner quotes.
+- **Reusing ids**: every element id must be unique. Don't reuse an id after deleting it — always pick a fresh id for replacements.
+- **Camera aspect ratio**: non-4:3 causes distortion. Stick to the sizes above.
+- **Low contrast**: light gray text on white is invisible. Minimum `#757575` on white.
+- **Emoji in text**: Excalidraw's font does not render emoji — avoid them.
+- **Tiny fonts**: below 14 becomes unreadable at display scale.
+
+## Tips
+
+- `cameraUpdate` is great for guiding attention while drawing complex diagrams. Emit multiple to pan/zoom across sections.
+- For dark themes: put a massive dark rectangle at index 0 BEFORE any `cameraUpdate`. Use bright primary colors on top.
+- Save every `checkpoint_id` in your reasoning; reverting is just passing an older id.
+
+## Referencing a sketch in chat (sketch:// chip)
+
+When you want the user to see a sketch you've drawn, write `sketch://<sketch-id>` somewhere in your chat message. The Grove UI renders that as a clickable chip showing the sketch's name; clicking it opens the sketch in the Sketch panel.
+
+- The id must be the full sketch id (e.g. `sketch-550e8400-e29b-41d4-a716-446655440000`), NOT the human name. Get it from the `id` field returned by `grove_sketch_draw` / `grove_sketch_list` / `grove_sketch_read`.
+- Write the URL as bare text (e.g. `Here's the flow: sketch://sketch-xxx`) — do not wrap it in a markdown link. The UI auto-detects bare `sketch://` URLs.
+- One chip per sketch is enough. Don't repeat the same URL throughout a reply.
+- Chips only resolve names for sketches in the current task. A `sketch://` id from a different task renders as "Unknown sketch".
+
+Prefer chips over describing the sketch in prose — the user can click through to see the real canvas.
+"##;
+
+const UNKNOWN_TASK_INSTRUCTIONS: &str = r#"
+# Grove - Task (unknown type)
+
+Grove task environment variables are set but the project could not be resolved from the database. This usually indicates misconfiguration or a corrupt project entry.
+
+Only two tools are available in this state: `grove_status` and `grove_read_notes`. Call `grove_status` first to see what went wrong and report back to the user.
+"#;
+
+/// What kind of task-environment this MCP server is running in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskEnvKind {
+    /// Not in a task (orchestrator mode).
+    NotInTask,
+    /// Inside a Coding (git worktree) task.
+    Coding,
+    /// Inside a Studio task.
+    Studio,
+    /// Inside a task but the project record can't be resolved (corrupt / stale env).
+    InTaskUnknown,
+}
+
+fn current_task_env_kind() -> TaskEnvKind {
+    let Some((_task_id, project_path)) = get_task_context() else {
+        return TaskEnvKind::NotInTask;
+    };
+    let hash = crate::storage::workspace::project_hash(&project_path);
+    match crate::storage::workspace::load_project_by_hash(&hash) {
+        Ok(Some(p)) => match p.project_type {
+            crate::storage::workspace::ProjectType::Studio => TaskEnvKind::Studio,
+            _ => TaskEnvKind::Coding,
+        },
+        _ => TaskEnvKind::InTaskUnknown,
+    }
+}
+
+fn get_instructions() -> &'static str {
+    match current_task_env_kind() {
+        TaskEnvKind::NotInTask => MANAGEMENT_INSTRUCTIONS,
+        TaskEnvKind::Coding => CODING_EXECUTION_INSTRUCTIONS,
+        TaskEnvKind::Studio => STUDIO_EXECUTION_INSTRUCTIONS,
+        TaskEnvKind::InTaskUnknown => UNKNOWN_TASK_INSTRUCTIONS,
+    }
+}
+
+fn filter_tools(all: Vec<Tool>) -> Vec<Tool> {
+    // Visible in every in-task context (Coding, Studio, and the unknown-project
+    // fallback state).
+    let common_in_task: HashSet<&'static str> = HashSet::from(["status", "read_notes"]);
+    // Coding-task-only tools.
+    let coding_only: HashSet<&'static str> = HashSet::from([
+        "read_review",
+        "reply_review",
+        "add_comment",
+        "complete_task",
+    ]);
+    // Studio-task-only tools (also exposed to the orchestrator, see below).
+    let studio_only: HashSet<&'static str> = HashSet::from([
+        "sketch_read_me",
+        "sketch_list",
+        "sketch_read",
+        "sketch_draw",
+    ]);
+    // Union of every in-task tool (used to carve out the orchestrator surface
+    // — orchestrator never sees any in-task tool, including sketch).
+    let any_in_task: HashSet<&str> = common_in_task
+        .iter()
+        .chain(coding_only.iter())
+        .chain(studio_only.iter())
+        .copied()
+        .collect();
+
+    match current_task_env_kind() {
+        TaskEnvKind::NotInTask => {
+            // Orchestrator: everything except in-task tools (sketch included —
+            // sketch is Studio-worker-exclusive).
+            all.into_iter()
+                .filter(|t| !any_in_task.contains(t.name.as_ref()))
+                .collect()
+        }
+        TaskEnvKind::Coding => all
+            .into_iter()
+            .filter(|t| {
+                common_in_task.contains(t.name.as_ref()) || coding_only.contains(t.name.as_ref())
+            })
+            .collect(),
+        TaskEnvKind::Studio => all
+            .into_iter()
+            .filter(|t| {
+                common_in_task.contains(t.name.as_ref()) || studio_only.contains(t.name.as_ref())
+            })
+            .collect(),
+        TaskEnvKind::InTaskUnknown => all
+            .into_iter()
+            .filter(|t| common_in_task.contains(t.name.as_ref()))
+            .collect(),
+    }
+}
 
 /// Grove MCP Server
 #[derive(Clone)]
@@ -101,21 +444,39 @@ impl Default for GroveMcpServer {
     }
 }
 
-#[tool_handler(router = self.tool_router)]
 impl ServerHandler for GroveMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "grove".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: Some("Grove MCP Server".to_string()),
-                website_url: Some("https://github.com/GarrickZ2/grove".to_string()),
-                icons: None,
-            },
-            instructions: Some(GROVE_INSTRUCTIONS.to_string()),
-        }
+        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+        info.protocol_version = ProtocolVersion::LATEST;
+        info.server_info = {
+            let mut impl_info = Implementation::new("grove", env!("CARGO_PKG_VERSION"));
+            impl_info.title = Some("Grove MCP Server".to_string());
+            impl_info.website_url = Some("https://github.com/GarrickZ2/grove".to_string());
+            impl_info
+        };
+        info.instructions = Some(get_instructions().to_string());
+        info
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            tools: filter_tools(self.tool_router.list_all()),
+            meta: None,
+            next_cursor: None,
+        })
     }
 }
 
@@ -125,11 +486,15 @@ impl ServerHandler for GroveMcpServer {
 
 /// Single reply to a review comment
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(inline)]
 pub struct SingleReply {
     /// The comment ID to reply to
     pub comment_id: u32,
     /// Your reply message
     pub message: String,
+    /// Set to true to mark the comment as resolved. Only the original comment creator can resolve.
+    /// The creator is identified by matching agent_name + role against the comment's author field.
+    pub resolve: Option<bool>,
 }
 
 /// Batch reply parameters - reply to multiple comments at once
@@ -145,6 +510,7 @@ pub struct ReplyReviewParams {
 
 /// Single comment item
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(inline)]
 pub struct CommentItem {
     /// Type of comment: "inline", "file", or "project" (defaults to "inline")
     pub comment_type: Option<String>,
@@ -174,6 +540,347 @@ pub struct AddCommentParams {
 pub struct CompleteTaskParams {
     /// Commit message for the changes
     pub commit_message: String,
+}
+
+/// Add project by local path (workspace-scoped)
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct AddProjectByPathParams {
+    /// Local filesystem path to a git repository (or a subdirectory within it)
+    pub path: String,
+}
+
+/// List registered projects (workspace-scoped)
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ListProjectsParams {
+    /// Optional fuzzy query for filtering by project path
+    pub query: Option<String>,
+}
+
+/// Create task under a project (workspace-scoped)
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct CreateTaskParams {
+    /// Project ID (hash)
+    pub project_id: String,
+    /// Human-readable task name
+    pub name: String,
+}
+
+/// List active tasks under a project (workspace-scoped)
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ListTasksParams {
+    /// Project ID (hash)
+    pub project_id: String,
+    /// Optional fuzzy query for filtering tasks
+    pub query: Option<String>,
+}
+
+/// Edit notes for a task (workspace-scoped, for orchestrator agents)
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct EditNoteParams {
+    /// Project ID (hash)
+    pub project_id: String,
+    /// Task ID
+    pub task_id: String,
+    /// New note content (markdown). Replaces entire note. Pass empty string to clear.
+    pub content: String,
+}
+
+/// Start a chat session for a task (management tool)
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct StartChatParams {
+    /// Project ID (hash)
+    pub project_id: String,
+    /// Task ID
+    pub task_id: String,
+    /// Chat name (default: "New Chat {timestamp}")
+    pub name: Option<String>,
+    /// Agent to use (default: config default). Use grove_list_agents to see available agents.
+    pub agent: Option<String>,
+}
+
+/// Send a prompt, respond to permission, or cancel a chat turn (management tool).
+///
+/// Exactly one of `text`, `permission_option_id`, or `cancel` must be provided:
+/// - `text` → send a prompt (optionally switch mode/model first)
+/// - `permission_option_id` → respond to a pending permission request
+/// - `cancel: true` → cancel the current agent turn
+///
+/// Note: file/image attachments are not currently supported via MCP — prompts
+/// sent through this tool always carry an empty attachment list, both for
+/// local-owned and remote-socket-owned sessions.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SendPromptParams {
+    /// Project ID (hash)
+    pub project_id: String,
+    /// Task ID
+    pub task_id: String,
+    /// Chat ID
+    pub chat_id: String,
+    /// Prompt text to send. Mutually exclusive with permission_option_id and cancel.
+    pub text: Option<String>,
+    /// Switch agent mode before sending prompt (e.g., "plan", "code"). Only used with text.
+    pub mode_id: Option<String>,
+    /// Switch agent model before sending prompt (e.g., "opus", "sonnet"). Only used with text.
+    pub model_id: Option<String>,
+    /// Change the thought-level / reasoning-effort selector before sending prompt.
+    /// Must provide both `thought_level_config_id` (from grove_chat_status) and
+    /// `thought_level_value_id`. Only used with text.
+    pub thought_level_config_id: Option<String>,
+    /// Value id for the thought-level selector; pair with `thought_level_config_id`.
+    pub thought_level_value_id: Option<String>,
+    /// Respond to a pending permission request with this option ID. Mutually exclusive with text and cancel.
+    pub permission_option_id: Option<String>,
+    /// Set to true to cancel the current agent turn. Mutually exclusive with text and permission_option_id.
+    #[serde(default)]
+    pub cancel: bool,
+    /// Sender name (e.g., "Claude Code (Orchestrator)"). Shown in chat UI to identify who sent the message.
+    pub sender: Option<String>,
+}
+
+/// Query chat status (management tool)
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ChatStatusParams {
+    /// Project ID (hash)
+    pub project_id: String,
+    /// Task ID
+    pub task_id: String,
+    /// Chat ID
+    pub chat_id: String,
+}
+
+/// List chats for a task (management tool)
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ListChatsParams {
+    /// Project ID (hash)
+    pub project_id: String,
+    /// Task ID
+    pub task_id: String,
+    /// Optional fuzzy query for filtering by chat name
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct SketchListParams {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SketchReadParams {
+    /// Sketch reference — either the sketch name (preferred) or a `sketch-<uuid>` id.
+    pub sketch: String,
+    /// If true, include the full Excalidraw scene JSON in the response.
+    /// Default false — only a summary + current checkpoint_id is returned (saves tokens).
+    #[serde(default)]
+    pub detail_full: bool,
+}
+
+/// Nested label for a shape (auto-centered, auto-resizing text binding).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(inline)]
+pub struct SketchElementLabel {
+    /// Label text.
+    pub text: String,
+    /// Font size in px. Minimum 14 for readability; 16+ for body, 20+ for titles.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "fontSize")]
+    pub font_size: Option<f64>,
+    /// Text color override (hex). Defaults to the container's strokeColor.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "strokeColor")]
+    pub stroke_color: Option<String>,
+}
+
+/// Rounded-corner descriptor. Use `{"type": 3}` for the standard adaptive rounding.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(inline)]
+pub struct SketchElementRoundness {
+    /// Rounding algorithm: 3 = adaptive radius (recommended), 2 = proportional.
+    #[serde(rename = "type")]
+    pub kind: u32,
+}
+
+/// Arrow endpoint binding: anchors an arrow tip to a shape so dragging the
+/// shape moves the arrow with it.
+///
+/// **Non-elbow arrows (the default)** MUST use `focus` + `gap`. `fixedPoint`
+/// is ignored by Excalidraw on non-elbow arrows and will be reset to `null`
+/// on the next scene reconcile — your binding will silently break.
+///
+/// **Elbow arrows** (`"elbowed": true`) use `fixedPoint` instead. `focus`
+/// and `gap` are not meaningful in that mode.
+///
+/// Safe default for the common case (straight arrow between two shapes):
+/// `{"elementId": "rect1", "focus": 0, "gap": 1}`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(inline)]
+pub struct SketchElementBinding {
+    /// Id of the shape this arrow end is bound to.
+    #[serde(rename = "elementId")]
+    pub element_id: String,
+    /// [-1.0, 1.0] — offset perpendicular to the arrow line at the
+    /// intersection with the shape's edge. `0` = centered on the edge.
+    /// Required for non-elbow arrows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<f64>,
+    /// Pixel gap between the arrow tip and the shape's edge. Typical
+    /// value: `1`. Required for non-elbow arrows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gap: Option<f64>,
+    /// ELBOW ARROWS ONLY. `[0,1]x[0,1]` relative coordinate on the shape's
+    /// bounding box where the elbow arrow tip should dock. Common values:
+    /// top=[0.5,0], bottom=[0.5,1], left=[0,0.5], right=[1,0.5]. Ignored on
+    /// non-elbow arrows — use `focus` + `gap` there instead.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "fixedPoint")]
+    pub fixed_point: Option<[f64; 2]>,
+    /// Pass-through for any other binding fields (e.g. future Excalidraw
+    /// additions). Keeps the binding forward-compatible.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// Reverse binding on a container (rectangle / ellipse / diamond): lists the
+/// arrows whose `startBinding` / `endBinding` reference this shape. Required
+/// for arrows to follow the shape when it's dragged. `apply_draw` auto-
+/// maintains this array on every draw call, so AI callers may omit it — but
+/// when AI sets it explicitly it's preserved and merged.
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
+#[schemars(inline)]
+pub struct SketchBoundElementRef {
+    /// Id of the bound arrow element.
+    pub id: String,
+    /// Element type of the bound element. Almost always `"arrow"`.
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+/// A single Excalidraw element OR one of the three Grove pseudo-elements.
+///
+/// Discriminated by `type`:
+/// - **Real drawn types**: `rectangle`, `ellipse`, `diamond`, `arrow`, `line`,
+///   `text`, `freedraw`. Must have a unique `id`.
+/// - **`cameraUpdate`**: viewport hint (not drawn). Set `x/y/width/height`
+///   (4:3 sizes only — 400x300, 600x450, 800x600, 1200x900, 1600x1200). No `id`.
+/// - **`delete`**: remove base elements by id. Use the `ids` field with a
+///   comma-separated string (e.g. `"r1,a2,t3"`). No `id` of its own.
+/// - **`restoreCheckpoint`**: must be the FIRST element when used. Set `id`
+///   to a checkpoint_id returned by a previous draw to continue from that state.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(inline)]
+pub struct SketchElement {
+    /// Element type (see struct-level docs for valid values).
+    #[serde(rename = "type")]
+    pub kind: String,
+
+    /// Unique element id within this sketch. Required for drawn elements and
+    /// for `restoreCheckpoint`. Omit on `delete` and `cameraUpdate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
+    /// For `delete`: comma-separated list of element ids to remove
+    /// (e.g. "rect1,arrow2"). Bound-text children are removed automatically.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ids: Option<String>,
+
+    /// Scene x of top-left (or of cameraUpdate's visible area).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x: Option<f64>,
+    /// Scene y of top-left.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
+    /// Element width (or cameraUpdate area width).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    /// Element height (or cameraUpdate area height).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+
+    /// For arrow/line: array of [dx, dy] points offset from (x, y).
+    /// Example straight arrow: `points: [[0,0],[200,0]]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub points: Option<Vec<[f64; 2]>>,
+
+    /// For standalone `text` elements: the displayed string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+
+    /// For standalone `text` elements: font size in px.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "fontSize")]
+    pub font_size: Option<f64>,
+
+    /// For shapes: attach auto-centered text instead of a separate `text`
+    /// element. PREFERRED for labeled boxes/arrows — saves tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<SketchElementLabel>,
+
+    /// Rounded corners on rectangles. Usually `{"type": 3}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roundness: Option<SketchElementRoundness>,
+
+    /// Hex stroke color (default `#1e1e1e`).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "strokeColor")]
+    pub stroke_color: Option<String>,
+    /// Hex fill color (default `transparent`).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "backgroundColor")]
+    pub background_color: Option<String>,
+    /// `"solid"` for filled shapes (default `solid` but only shows if backgroundColor is set).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "fillStyle")]
+    pub fill_style: Option<String>,
+    /// Stroke width in px (default 2).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "strokeWidth")]
+    pub stroke_width: Option<f64>,
+    /// `"solid"` | `"dashed"` | `"dotted"` (default `solid`).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "strokeStyle")]
+    pub stroke_style: Option<String>,
+    /// Opacity 0–100 (default 100). Use 30–50 for subtle background zones.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+    /// Hand-drawn noise amount 0–2 (default 1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roughness: Option<f64>,
+
+    /// For arrows: `null` | `"arrow"` | `"bar"` | `"dot"` | `"triangle"`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "endArrowhead")]
+    pub end_arrowhead: Option<String>,
+    /// Same values as `endArrowhead`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "startArrowhead")]
+    pub start_arrowhead: Option<String>,
+    /// Bind arrow tail to a shape.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "startBinding")]
+    pub start_binding: Option<SketchElementBinding>,
+    /// Bind arrow head to a shape.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "endBinding")]
+    pub end_binding: Option<SketchElementBinding>,
+
+    /// For bound-text (internal): the container shape's id. Usually set
+    /// automatically when you use the `label` field on a shape.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "containerId")]
+    pub container_id: Option<String>,
+
+    /// Reverse index of arrows bound to this shape. You do NOT need to set
+    /// this — `apply_draw` auto-fills it from every arrow's
+    /// `startBinding` / `endBinding`. Provided for callers who want to set
+    /// it explicitly; the auto-fill is additive so hand-set entries are
+    /// preserved.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "boundElements")]
+    pub bound_elements: Option<Vec<SketchBoundElementRef>>,
+
+    /// For arrows: `true` routes the arrow as orthogonal elbow segments.
+    /// Required when using `fixedPoint` bindings. Default `false` (straight
+    /// arrows use `focus` + `gap` bindings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elbowed: Option<bool>,
+
+    /// Catch-all for any additional Excalidraw fields (seed, strokeDasharray,
+    /// angle, etc.). Pass-through without validation.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SketchDrawParams {
+    /// Sketch reference — either a name (auto-created if missing) or a `sketch-<uuid>` id.
+    pub sketch: String,
+    /// Ordered array of Excalidraw elements plus Grove pseudo-elements.
+    /// Array order = z-order (first = back, last = front).
+    /// Emit `cameraUpdate` BEFORE the shapes it frames; emit `restoreCheckpoint`
+    /// (if used) as the first item. Call `grove_sketch_read_me` for drawing conventions.
+    pub elements: Vec<SketchElement>,
 }
 
 // ============================================================================
@@ -224,7 +931,9 @@ pub struct CompleteTaskResult {
 struct ReviewReplyEntry {
     reply_id: u32,
     content: String,
-    author: String,
+    agent: String,
+    model: String,
+    role: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -242,7 +951,9 @@ struct ReviewCommentEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     end_line: Option<u32>,
     content: String,
-    author: String,
+    agent: String,
+    model: String,
+    role: String,
     replies: Vec<ReviewReplyEntry>,
 }
 
@@ -275,11 +986,105 @@ struct ReplyResultEntry {
     success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Whether the comment was resolved by this reply
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved: Option<bool>,
+    /// Error message if resolve was requested but failed (e.g., permission denied)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolve_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct ReplyReviewResult {
     replies: Vec<ReplyResultEntry>,
+}
+
+// ============================================================================
+// Session identity resolution (ACP auto-detection)
+// ============================================================================
+
+/// Normalize raw agent name from session.json to a display-friendly name.
+/// Matches on whitespace/hyphen/underscore/slash-separated tokens so e.g.
+/// "openai-proxy" or "@agentclientprotocol/claude-agent-acp" resolve correctly.
+fn normalize_agent_name(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| {
+            c.is_whitespace() || c == '-' || c == '_' || c == '.' || c == '/' || c == '@'
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let has_token = |needle: &str| tokens.contains(&needle);
+
+    if has_token("claude") {
+        return "Claude Code".to_string();
+    }
+    if has_token("codex") {
+        return "Codex".to_string();
+    }
+    if has_token("gemini") {
+        return "Gemini".to_string();
+    }
+    if has_token("copilot") {
+        return "GitHub Copilot".to_string();
+    }
+    if has_token("cursor") {
+        return "Cursor".to_string();
+    }
+    if has_token("qwen") {
+        return "Qwen".to_string();
+    }
+    if has_token("kimi") {
+        return "Kimi".to_string();
+    }
+    if has_token("junie") {
+        return "Junie".to_string();
+    }
+    if has_token("trae") {
+        return "Trae".to_string();
+    }
+    if has_token("opencode") {
+        return "OpenCode".to_string();
+    }
+    // Unknown agent — return as-is
+    raw.to_string()
+}
+
+/// Tries to resolve agent identity from session.json (ACP mode).
+/// Falls back to params if env vars are missing or session.json not found.
+/// Returns (agent, model, role).
+fn resolve_agent_identity(
+    params_agent: Option<&str>,
+    params_role: Option<&str>,
+) -> (String, String, String) {
+    // Try ACP session auto-detection via env vars + session.json
+    let project_key = env::var("GROVE_PROJECT_KEY").ok();
+    let task_id = env::var("GROVE_TASK_ID").ok();
+    let chat_id = env::var("GROVE_CHAT_ID").ok();
+
+    if let (Some(pk), Some(tid), Some(cid)) = (project_key, task_id, chat_id) {
+        if let Some(meta) = crate::acp::read_session_metadata(&pk, &tid, &cid) {
+            let agent = normalize_agent_name(&meta.agent_name);
+            let model = meta
+                .current_model_id
+                .and_then(|id| {
+                    meta.available_models
+                        .iter()
+                        .find(|(m_id, _)| m_id == &id)
+                        .map(|(_, name)| name.clone())
+                })
+                .unwrap_or_default();
+            let role = params_role.unwrap_or("").to_string();
+            return (agent, model, role);
+        }
+    }
+
+    // Fallback: use params or defaults
+    let agent = params_agent.unwrap_or("Claude Code").to_string();
+    let model = String::new();
+    let role = params_role.unwrap_or("").to_string();
+    (agent, model, role)
 }
 
 // ============================================================================
@@ -290,7 +1095,7 @@ struct ReplyReviewResult {
 impl GroveMcpServer {
     /// Check if running inside a Grove task and get task context
     #[tool(
-        name = "grove_status",
+        name = "status",
         description = "CALL THIS FIRST before using any other Grove tools. Checks if you are running inside a Grove task environment. Returns task context including task_id, branch name, target branch, and project name. If in_grove_task is false, do NOT use other Grove tools."
     )]
     async fn grove_status(&self) -> Result<CallToolResult, McpError> {
@@ -318,16 +1123,330 @@ impl GroveMcpServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
+    /// Register a project by local path (idempotent)
+    #[tool(
+        name = "add_project_by_path",
+        description = "Register a Git project by its local filesystem path. Idempotent — safe to call repeatedly."
+    )]
+    async fn grove_add_project_by_path(
+        &self,
+        params: Parameters<AddProjectByPathParams>,
+    ) -> Result<CallToolResult, McpError> {
+        ensure_not_in_grove_task()?;
+        let path = params.0.path;
+        blocking_json(move || add_project_by_path_json(&path)).await
+    }
+
+    /// List all registered projects
+    #[tool(
+        name = "list_projects",
+        description = "List registered projects. Use `query` to fuzzy-filter by path."
+    )]
+    async fn grove_list_projects(
+        &self,
+        params: Parameters<ListProjectsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        ensure_not_in_grove_task()?;
+        let query = params.0.query;
+        blocking_json(move || list_projects_json(query.as_deref())).await
+    }
+
+    /// Create a task/worktree under a project (does NOT start tmux/zellij session)
+    #[tool(
+        name = "create_task",
+        description = "Create an isolated subtask under a project. Tasks run in parallel without interfering with each other."
+    )]
+    async fn grove_create_task(
+        &self,
+        params: Parameters<CreateTaskParams>,
+    ) -> Result<CallToolResult, McpError> {
+        ensure_not_in_grove_task()?;
+        let p = params.0;
+        blocking_json(move || create_task_json(&p)).await
+    }
+
+    /// List active tasks under a project
+    #[tool(
+        name = "list_tasks",
+        description = "List active tasks under a project. Use `query` to fuzzy-filter by name or branch."
+    )]
+    async fn grove_list_tasks(
+        &self,
+        params: Parameters<ListTasksParams>,
+    ) -> Result<CallToolResult, McpError> {
+        ensure_not_in_grove_task()?;
+        let project_id = params.0.project_id;
+        let query = params.0.query;
+        blocking_json(move || list_tasks_json(&project_id, query.as_deref())).await
+    }
+
+    /// Write or update notes for a task (management tool for orchestrator agents)
+    #[tool(
+        name = "edit_note",
+        description = "Write or update notes for a task. Used to set task spec, context, and instructions before the task agent starts working."
+    )]
+    async fn grove_edit_note(
+        &self,
+        params: Parameters<EditNoteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        ensure_not_in_grove_task()?;
+        let p = params.0;
+        blocking_json(move || edit_note_json(&p)).await
+    }
+
+    /// List available agents
+    #[tool(
+        name = "list_agents",
+        description = "List available agents that can be used to start chat sessions. Returns built-in and custom agents with their capabilities."
+    )]
+    async fn grove_list_agents(&self) -> Result<CallToolResult, McpError> {
+        ensure_not_in_grove_task()?;
+        blocking_json(list_agents_json).await
+    }
+
+    /// Start a new chat session for a task
+    #[tool(
+        name = "start_chat",
+        description = "Create and start a chat session for a task. Spawns the agent process. Returns chat_id, name, and agent. After calling this, use grove_chat_status to wait for the agent to be ready and get available modes/models."
+    )]
+    async fn grove_start_chat(
+        &self,
+        params: Parameters<StartChatParams>,
+    ) -> Result<CallToolResult, McpError> {
+        ensure_not_in_grove_task()?;
+        let p = params.0;
+        start_chat_impl(p).await
+    }
+
+    /// Send a prompt, respond to permission, or cancel a chat turn
+    #[tool(
+        name = "send_prompt",
+        description = "Interact with a chat session. Three mutually exclusive actions: (1) `text` — send a prompt (optionally set mode_id/model_id, or both thought_level_config_id + thought_level_value_id for reasoning-effort). (2) `permission_option_id` — respond to a pending permission request. (3) `cancel: true` — cancel the current turn. Returns immediately. IMPORTANT: Always call grove_chat_status first to check the session state and available modes/models/thought_levels before sending."
+    )]
+    async fn grove_send_prompt(
+        &self,
+        params: Parameters<SendPromptParams>,
+    ) -> Result<CallToolResult, McpError> {
+        ensure_not_in_grove_task()?;
+        let p = params.0;
+        send_prompt_impl(p).await
+    }
+
+    /// Query chat status (auto-connects the session if not running)
+    #[tool(
+        name = "chat_status",
+        description = "Get the current state of a chat session. Auto-connects the agent if not already running. Returns: state (idle/busy/permission_needed), available_modes, available_models, available_thought_levels (+ current_thought_level_id / thought_level_config_id when the agent exposes one), turn_count, last_message, plan, and permission details. Always call this before grove_send_prompt to know the session state and available selectors."
+    )]
+    async fn grove_chat_status(
+        &self,
+        params: Parameters<ChatStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        ensure_not_in_grove_task()?;
+        let p = params.0;
+        chat_status_impl(p).await
+    }
+
+    /// List chats for a task
+    #[tool(
+        name = "list_chats",
+        description = "List all chat sessions under a task. Returns id, title, agent, and creation time for each chat."
+    )]
+    async fn grove_list_chats(
+        &self,
+        params: Parameters<ListChatsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        ensure_not_in_grove_task()?;
+        let p = params.0;
+        list_chats_impl(p).await
+    }
+
+    /// Return the Grove sketch element-format reference (cheat sheet).
+    #[tool(
+        name = "sketch_read_me",
+        description = "Return the Grove sketch drawing reference: Excalidraw element format, color palette, Grove pseudo-elements (restoreCheckpoint / delete / cameraUpdate), camera sizing rules, and worked examples. Call this ONCE before your first `grove_sketch_draw` in a conversation. Do not call it repeatedly — the content does not change."
+    )]
+    async fn grove_sketch_read_me(&self) -> Result<CallToolResult, McpError> {
+        let mut body = String::with_capacity(SKETCH_READ_ME.len() + 512);
+        body.push_str(SKETCH_READ_ME);
+        body.push_str(&render_library_listing());
+        Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    /// List Excalidraw sketches in the current Studio task.
+    #[tool(
+        name = "sketch_list",
+        description = "List sketches in the current Studio task. Returns [{id, name, created_at, updated_at}]. No arguments — task is taken from GROVE_* env. Call this before `grove_sketch_read` to find sketches by name."
+    )]
+    async fn grove_sketch_list(
+        &self,
+        _params: Parameters<SketchListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        blocking_json_result(move || {
+            let (key, task_id) = resolve_current_task()?;
+            let index = crate::storage::sketches::load_index(&key, &task_id)
+                .map_err(|e| mcp_err(&e.to_string()))?;
+            Ok(json!({ "sketches": index.sketches }))
+        })
+        .await
+    }
+
+    /// Read a sketch summary (and optionally the full scene) from the current task.
+    #[tool(
+        name = "sketch_read",
+        description = "Read a sketch in the current Studio task. Returns a rendered image (if the web client has uploaded a fresh thumbnail), a summary (element count, type breakdown, content bounds), and a FRESH checkpoint_id you can pass back via `restoreCheckpoint` in grove_sketch_draw. Set detail_full=true to also include the full Excalidraw scene JSON (costs more tokens)."
+    )]
+    async fn grove_sketch_read(
+        &self,
+        params: Parameters<SketchReadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let (key, task_id) = resolve_current_task()?;
+        let (text, thumb) =
+            tokio::task::spawn_blocking(move || -> Result<(String, Option<Vec<u8>>), McpError> {
+                read_sketch_to_text(&key, &task_id, &p.sketch, p.detail_full)
+            })
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))??;
+
+        let mut content = Vec::new();
+        if let Some(png) = thumb {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+            content.push(Content::image(b64, "image/png"));
+        }
+        content.push(Content::text(text));
+        Ok(CallToolResult::success(content))
+    }
+
+    /// Draw / modify a sketch in the current Studio task.
+    #[tool(
+        name = "sketch_draw",
+        description = "Draw or modify a sketch in the current Studio task. `sketch` is the sketch name (auto-created if no sketch with that name exists). `elements` is an ordered array of Excalidraw elements plus Grove pseudo-elements (`restoreCheckpoint` first to continue from a prior state, `delete` to remove elements, `cameraUpdate` for viewport hints). Returns a new checkpoint_id; save it and pass it back via `restoreCheckpoint` on the next call to append incrementally. Call `grove_sketch_read_me` once for the format reference, and `grove_sketch_read` before editing an existing sketch."
+    )]
+    async fn grove_sketch_draw(
+        &self,
+        params: Parameters<SketchDrawParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let (key, task_id) = resolve_current_task()?;
+
+        // Re-serialize the typed elements into serde_json::Value so the
+        // storage layer doesn't depend on MCP-specific types.
+        let elements: Vec<serde_json::Value> = p
+            .elements
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()
+            .map_err(|e| {
+                mcp_err(&format!(
+                    "failed to serialize element for storage layer: {e}"
+                ))
+            })?;
+
+        let sketch_name = p.sketch;
+        let (meta, outcome, is_new_sketch) = tokio::task::spawn_blocking({
+            let key = key.clone();
+            let task_id = task_id.clone();
+            move || -> Result<_, McpError> {
+                use crate::storage::sketches;
+                let existed = sketches::resolve_sketch_ref(&key, &task_id, &sketch_name)
+                    .map_err(|e| mcp_err(&e.to_string()))?
+                    .is_some();
+                let meta = sketches::get_or_create_by_name(&key, &task_id, &sketch_name)
+                    .map_err(|e| mcp_err(&e.to_string()))?;
+                let outcome = sketches::apply_draw(&key, &task_id, &meta.id, &elements)
+                    .map_err(|e| mcp_err(&e.to_string()))?;
+                Ok((meta, outcome, !existed))
+            }
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))??;
+
+        if is_new_sketch {
+            broadcast_index_changed(&key, &task_id);
+        }
+        broadcast_scene_updated(&key, &task_id, &meta.id, outcome.scene.clone());
+
+        let mut body = String::new();
+        if is_new_sketch {
+            body.push_str(&format!(
+                "Created new sketch \"{}\" (id: {}).\n",
+                meta.name, meta.id
+            ));
+        } else {
+            body.push_str(&format!(
+                "Updated sketch \"{}\" (id: {}).\n",
+                meta.name, meta.id
+            ));
+        }
+        body.push_str(&format!(
+            "- Elements added: {}\n- Elements deleted: {}\n- Total elements: {}\n- New checkpoint: {}\n",
+            outcome.elements_added,
+            outcome.elements_deleted,
+            outcome.element_count,
+            outcome.checkpoint_id,
+        ));
+        for w in &outcome.warnings {
+            body.push_str(&format!("⚠ {w}\n"));
+        }
+        body.push_str(&format!(
+            "\nTo continue editing this sketch, start your next `grove_sketch_draw` call's `elements` array with:\n  {{\"type\":\"restoreCheckpoint\",\"id\":\"{}\"}}\n",
+            outcome.checkpoint_id
+        ));
+
+        let thumb = tokio::task::spawn_blocking({
+            let key = key.clone();
+            let task_id = task_id.clone();
+            let sketch_id = meta.id.clone();
+            move || crate::storage::sketches::load_thumbnail_if_fresh(&key, &task_id, &sketch_id)
+        })
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten();
+
+        let mut note = String::new();
+        if thumb.is_none() {
+            note.push_str(
+                "\n(No rendered image attached — the thumbnail is either missing or older than the current scene. Open the sketch tab in the UI to refresh it.)\n",
+            );
+        }
+
+        let structured = json!({
+            "sketch_id": meta.id,
+            "sketch_name": meta.name,
+            "checkpoint_id": outcome.checkpoint_id,
+            "element_count": outcome.element_count,
+            "elements_added": outcome.elements_added,
+            "elements_deleted": outcome.elements_deleted,
+            "warnings": outcome.warnings,
+            "created_new_sketch": is_new_sketch,
+            "image_attached": thumb.is_some(),
+        });
+        body.push_str(&note);
+        body.push_str("\n---\n");
+        body.push_str(&serde_json::to_string_pretty(&structured).unwrap_or_default());
+
+        let mut content = Vec::new();
+        if let Some(png) = thumb {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+            content.push(Content::image(b64, "image/png"));
+        }
+        content.push(Content::text(body));
+        Ok(CallToolResult::success(content))
+    }
+
     /// Read user-written notes for the current task
     #[tool(
-        name = "grove_read_notes",
+        name = "read_notes",
         description = "Read user-written notes for the current Grove task. Notes contain important context, requirements, and instructions set by the user. Call grove_status first to ensure you are in a Grove task."
     )]
     async fn grove_read_notes(&self) -> Result<CallToolResult, McpError> {
         let (task_id, project_path) = get_task_context()
             .ok_or_else(|| McpError::invalid_request("Not in a Grove task", None))?;
 
-        let project_key = project_hash(&project_path);
+        let project_key = workspace::project_hash(&project_path);
 
         match notes::load_notes(&project_key, &task_id) {
             Ok(content) if content.is_empty() => Ok(CallToolResult::success(vec![Content::text(
@@ -343,14 +1462,14 @@ impl GroveMcpServer {
 
     /// Read review comments for the current task
     #[tool(
-        name = "grove_read_review",
+        name = "read_review",
         description = "Read code review comments for the current Grove task. Returns comments with IDs, locations, content, and status (open/resolved/outdated). Use grove_reply_review to respond to comments. Call grove_status first to ensure you are in a Grove task."
     )]
     async fn grove_read_review(&self) -> Result<CallToolResult, McpError> {
         let (task_id, project_path) = get_task_context()
             .ok_or_else(|| McpError::invalid_request("Not in a Grove task", None))?;
 
-        let project_key = project_hash(&project_path);
+        let project_key = workspace::project_hash(&project_path);
 
         match comments::load_comments(&project_key, &task_id) {
             Ok(data) if data.is_empty() => Ok(CallToolResult::success(vec![Content::text(
@@ -396,14 +1515,18 @@ impl GroveMcpServer {
                             start_line: c.start_line,
                             end_line: c.end_line,
                             content: c.content.clone(),
-                            author: c.author.clone(),
+                            agent: c.agent.clone(),
+                            model: c.model.clone(),
+                            role: c.role.clone(),
                             replies: c
                                 .replies
                                 .iter()
                                 .map(|r| ReviewReplyEntry {
                                     reply_id: r.id,
                                     content: r.content.clone(),
-                                    author: r.author.clone(),
+                                    agent: r.agent.clone(),
+                                    model: r.model.clone(),
+                                    role: r.role.clone(),
                                 })
                                 .collect(),
                         })
@@ -423,8 +1546,8 @@ impl GroveMcpServer {
 
     /// Reply to review comments (supports batch)
     #[tool(
-        name = "grove_reply_review",
-        description = "Reply to one or more code review comments. Supports batch replies to reduce tool calls. Call grove_read_review first to get comment IDs."
+        name = "reply_review",
+        description = "Reply to one or more code review comments. Supports batch replies to reduce tool calls. Call grove_read_review first to get comment IDs. You can also mark comments as resolved by setting resolve=true — only the original comment creator (matched by agent_name + role) is allowed to resolve."
     )]
     async fn grove_reply_review(
         &self,
@@ -433,7 +1556,8 @@ impl GroveMcpServer {
         let (task_id, project_path) = get_task_context()
             .ok_or_else(|| McpError::invalid_request("Not in a Grove task", None))?;
 
-        let project_key = project_hash(&project_path);
+        let project_key = workspace::project_hash(&project_path);
+        validate_task_exists(&project_key, &task_id)?;
 
         if params.0.replies.is_empty() {
             return Err(McpError::invalid_params(
@@ -442,13 +1566,9 @@ impl GroveMcpServer {
             ));
         }
 
-        // Build author string: "agent_name (role)"
-        let author = match (&params.0.agent_name, &params.0.role) {
-            (Some(name), Some(role)) => format!("{} ({})", name, role),
-            (Some(name), None) => name.clone(),
-            (None, Some(role)) => format!("Claude Code ({})", role),
-            (None, None) => "Claude Code".to_string(),
-        };
+        // Resolve agent/model/role (ACP auto-detect or params fallback)
+        let (agent, model, role) =
+            resolve_agent_identity(params.0.agent_name.as_deref(), params.0.role.as_deref());
 
         let mut reply_results: Vec<ReplyResultEntry> = Vec::new();
 
@@ -458,13 +1578,50 @@ impl GroveMcpServer {
                 &task_id,
                 reply.comment_id,
                 &reply.message,
-                &author,
+                &agent,
+                &model,
+                &role,
             ) {
                 Ok(true) => {
+                    // Handle resolve if requested
+                    let (resolved, resolve_error) = if reply.resolve == Some(true) {
+                        // Load comment to check creator permission
+                        match comments::load_comments(&project_key, &task_id) {
+                            Ok(data) => {
+                                match data.comments.iter().find(|c| c.id == reply.comment_id) {
+                                    Some(comment) if comment.agent == agent && comment.role == role => {
+                                        match comments::update_comment_status(
+                                            &project_key,
+                                            &task_id,
+                                            reply.comment_id,
+                                            comments::CommentStatus::Resolved,
+                                        ) {
+                                            Ok(true) => (Some(true), None),
+                                            Ok(false) => (Some(false), Some("comment not found during resolve".to_string())),
+                                            Err(e) => (Some(false), Some(e.to_string())),
+                                        }
+                                    }
+                                    Some(comment) => {
+                                        (Some(false), Some(format!(
+                                            "permission denied: only the creator ({}) can resolve this comment",
+                                            comments::build_author(&comment.agent, &comment.role)
+                                        )))
+                                    }
+                                    None => (Some(false), Some("comment not found during resolve".to_string())),
+                                }
+                            }
+                            Err(e) => (Some(false), Some(e.to_string())),
+                        }
+                    } else {
+                        (None, None)
+                    };
+
                     reply_results.push(ReplyResultEntry {
                         comment_id: reply.comment_id,
                         success: true,
                         error: None,
+                        resolved,
+                        resolve_error,
                     });
                 }
                 Ok(false) => {
@@ -472,6 +1629,8 @@ impl GroveMcpServer {
                         comment_id: reply.comment_id,
                         success: false,
                         error: Some("comment not found".to_string()),
+                        resolved: None,
+                        resolve_error: None,
                     });
                 }
                 Err(e) => {
@@ -479,6 +1638,8 @@ impl GroveMcpServer {
                         comment_id: reply.comment_id,
                         success: false,
                         error: Some(e.to_string()),
+                        resolved: None,
+                        resolve_error: None,
                     });
                 }
             }
@@ -502,7 +1663,7 @@ impl GroveMcpServer {
     /// Add review comments. Supports three levels: inline (code lines), file (entire file),
     /// project (overall). Use for code review, questions, improvements, or visualizing plans.
     #[tool(
-        name = "grove_add_comment",
+        name = "add_comment",
         description = "Create review comments. Three levels: 'inline' (specific lines), 'file' (entire file), 'project' (overall feedback). Use for code review, raising questions, suggesting improvements, or visualizing implementation plans by marking key points. Pass array with one item to create single comment, multiple items for batch."
     )]
     async fn grove_add_comment(
@@ -512,16 +1673,13 @@ impl GroveMcpServer {
         let (task_id, project_path) = get_task_context()
             .ok_or_else(|| McpError::invalid_request("Not in a Grove task", None))?;
 
-        let project_key = project_hash(&project_path);
+        let project_key = workspace::project_hash(&project_path);
+        validate_task_exists(&project_key, &task_id)?;
         let worktree = env::var("GROVE_WORKTREE").unwrap_or_default();
 
-        // Build author string: "agent_name (role)"
-        let author = match (&params.0.agent_name, &params.0.role) {
-            (Some(name), Some(role)) => format!("{} ({})", name, role),
-            (Some(name), None) => name.clone(),
-            (None, Some(role)) => format!("Claude Code ({})", role),
-            (None, None) => "Claude Code".to_string(),
-        };
+        // Resolve agent/model/role (ACP auto-detect or params fallback)
+        let (agent, model, role) =
+            resolve_agent_identity(params.0.agent_name.as_deref(), params.0.role.as_deref());
 
         let mut created = Vec::new();
         let mut errors = Vec::new();
@@ -560,7 +1718,9 @@ impl GroveMcpServer {
                                 Some(start),
                                 Some(end),
                                 &item.content,
-                                &author,
+                                &agent,
+                                &model,
+                                &role,
                                 anchor,
                             )
                             .map_err(|e| e.to_string())
@@ -579,7 +1739,9 @@ impl GroveMcpServer {
                         None,
                         None,
                         &item.content,
-                        &author,
+                        &agent,
+                        &model,
+                        &role,
                         None,
                     )
                     .map_err(|e| e.to_string()),
@@ -594,7 +1756,9 @@ impl GroveMcpServer {
                     None,
                     None,
                     &item.content,
-                    &author,
+                    &agent,
+                    &model,
+                    &role,
                     None,
                 )
                 .map_err(|e| e.to_string()),
@@ -645,7 +1809,7 @@ impl GroveMcpServer {
 
     /// Complete the current task: commit, sync (rebase), and merge
     #[tool(
-        name = "grove_complete_task",
+        name = "complete_task",
         description = "Complete the current Grove task in one operation. This will: (1) commit all changes with your message, (2) sync with target branch via rebase, (3) merge into target branch. If rebase conflicts occur, resolve them and call this tool again. IMPORTANT: ONLY call this tool when the user explicitly requests task completion. NEVER call it automatically or proactively. Call grove_status first to ensure you are in a Grove task."
     )]
     async fn grove_complete_task(
@@ -654,6 +1818,14 @@ impl GroveMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let (task_id, project_path) = get_task_context()
             .ok_or_else(|| McpError::invalid_request("Not in a Grove task", None))?;
+
+        // Local Task: only commit is allowed, no sync/merge
+        if task_id == tasks::LOCAL_TASK_ID {
+            return Err(McpError::invalid_request(
+                "grove_complete_task is not available for Local tasks. Local tasks cannot be synced or merged. Use git commit directly instead.",
+                None,
+            ));
+        }
 
         // Get environment variables
         let worktree_path = env::var("GROVE_WORKTREE")
@@ -743,7 +1915,7 @@ impl GroveMcpServer {
         }
 
         // Load notes for merge commit message (non-fatal)
-        let project_key = project_hash(&project_path);
+        let project_key = workspace::project_hash(&project_path);
         let notes_content = notes::load_notes(&project_key, &task_id)
             .ok()
             .filter(|s| !s.trim().is_empty());
@@ -789,6 +1961,1369 @@ impl GroveMcpServer {
 // Helper Functions
 // ============================================================================
 
+fn ok_json(value: serde_json::Value) -> Result<CallToolResult, McpError> {
+    let json = serde_json::to_string_pretty(&value)
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+async fn blocking_json(
+    f: impl FnOnce() -> serde_json::Value + Send + 'static,
+) -> Result<CallToolResult, McpError> {
+    let value = tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+    ok_json(value)
+}
+
+/// Variant of `blocking_json` whose closure returns `Result<Value, McpError>`.
+/// Used by tools that need the `?` operator for concise error propagation.
+async fn blocking_json_result(
+    f: impl FnOnce() -> Result<serde_json::Value, McpError> + Send + 'static,
+) -> Result<CallToolResult, McpError> {
+    let value = tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))??;
+    ok_json(value)
+}
+
+fn mcp_err(msg: &str) -> McpError {
+    McpError::invalid_request(msg.to_string(), None)
+}
+
+/// Resolve the current Studio task from `GROVE_*` env vars.
+/// Returns `(project_key, task_id)` or a Not-in-task error.
+fn resolve_current_task() -> Result<(String, String), McpError> {
+    let (task_id, project_path) = get_task_context()
+        .ok_or_else(|| mcp_err("Not inside a Grove task: GROVE_TASK_ID / GROVE_PROJECT not set"))?;
+    let project_key = workspace::project_hash(&project_path);
+    Ok((project_key, task_id))
+}
+
+fn broadcast_index_changed(project: &str, task_id: &str) {
+    // In-process broadcast only — the daemon reaches grove-web via its own
+    // WebSocket; MCP writes in a separate OS process, so grove-web discovers
+    // MCP-authored changes through polling while the chat is busy (see
+    // useSketchSync in grove-web).
+    use crate::api::handlers::tasks::sketch_events::{broadcast_sketch_event, SketchEvent};
+    broadcast_sketch_event(SketchEvent::IndexChanged {
+        project: project.to_string(),
+        task_id: task_id.to_string(),
+    });
+}
+
+fn broadcast_scene_updated(
+    project: &str,
+    task_id: &str,
+    sketch_id: &str,
+    scene: serde_json::Value,
+) {
+    // In-process broadcast only — same caveat as `broadcast_index_changed`.
+    // MCP runs in a separate OS process from the web daemon, so this event
+    // NEVER reaches grove-web's WebSocket subscribers. We still emit it so
+    // that if MCP is ever linked into the daemon process (or both run under
+    // the same binary), cross-sketch notifications work without extra code.
+    // Today the real delivery path is grove-web's 2 s polling loop + the
+    // on-idle refresh (see `useSketchSync`). Do not add cross-process
+    // signalling here; use a file-watch or queue instead.
+    use crate::api::handlers::tasks::sketch_events::{
+        broadcast_sketch_event, SketchEvent, SketchEventSource,
+    };
+    broadcast_sketch_event(SketchEvent::SketchUpdated {
+        project: project.to_string(),
+        task_id: task_id.to_string(),
+        sketch_id: sketch_id.to_string(),
+        source: SketchEventSource::Agent,
+        scene,
+    });
+}
+
+fn error_json(error: &str, message: impl Into<String>) -> serde_json::Value {
+    json!({
+        "success": false,
+        "error": error,
+        "message": message.into(),
+    })
+}
+
+/// Render the "Available library items" section appended to
+/// `grove_sketch_read_me`. Text-only by design — AI references items by id,
+/// names provide semantic hints, no visual preview is given (matches the
+/// `.excalidrawlib` format which has no preview field).
+///
+/// Format per item: `- id=<uuid>  name="<name>"  size=<w>x<h>`. Width/height
+/// derive from the element bounding box so AI can plan layout. Items missing
+/// a `name` are still listed (caller decides whether to use them) but flagged
+/// as `<unnamed>`.
+fn render_library_listing() -> String {
+    let file = match crate::storage::libraries::load() {
+        Ok(f) => f,
+        Err(e) => {
+            return format!(
+                "\n\n## Available library items\n\n(library could not be loaded: {e}; treat as empty)\n"
+            );
+        }
+    };
+    if file.library_items.is_empty() {
+        return "\n\n## Available library items\n\nNone installed. Fall back to drawing labeled basic shapes.\n".to_string();
+    }
+    // Only items with a real name are exposed to the agent: an item without
+    // a name cannot be chosen by semantic intent, so listing "<unnamed>"
+    // entries would just be noise (and inviting blind id-picking would
+    // produce arbitrary visual output). Unnamed items still install fine
+    // for human use in the canvas; they're just invisible here.
+    let named: Vec<_> = file
+        .library_items
+        .iter()
+        .filter(|it| it.name.as_deref().is_some_and(|n| !n.trim().is_empty()))
+        .collect();
+    let unnamed_count = file.library_items.len() - named.len();
+    if named.is_empty() {
+        return format!(
+            "\n\n## Available library items\n\nNone of the {} installed item(s) have names, so none can be referenced by semantic intent. Fall back to drawing labeled basic shapes.\n",
+            file.library_items.len()
+        );
+    }
+    let mut out = String::from("\n\n## Available library items\n\nPrefer these over hand-drawn shapes when a name matches your semantic intent. Reference via `{\"type\":\"libraryItem\",\"id\":\"<id>\",\"x\":...,\"y\":...}`.\n\n");
+    for item in &named {
+        let (w, h) = library_item_bbox(item);
+        let raw = item.name.as_deref().unwrap_or("");
+        let name = sanitize_library_name(raw);
+        out.push_str(&format!(
+            "- id={}  name=\"{}\"  size={}x{}\n",
+            item.id,
+            name,
+            w.round() as i64,
+            h.round() as i64,
+        ));
+    }
+    if unnamed_count > 0 {
+        out.push_str(&format!(
+            "\n_({unnamed_count} additional item(s) are installed but unnamed and not listed here.)_\n"
+        ));
+    }
+    out
+}
+
+/// Defangs a library item `name` before it is concatenated into the agent
+/// prompt. Library items can be installed from arbitrary `.excalidrawlib`
+/// URLs via the `#addLibrary=` callback flow, so a hostile name could try
+/// prompt-injection (newlines that look like fresh instructions, very long
+/// runs that pad the context, control chars). Strip newlines/control bytes,
+/// escape embedded quotes, and cap length.
+fn sanitize_library_name(raw: &str) -> String {
+    // Cap is in BYTES (not codepoints), intentionally — its purpose is to
+    // bound prompt size, and prompt budgets are byte-denominated. We check
+    // BEFORE each push so the cap never overshoots: any character whose
+    // UTF-8 encoding (or escaped form, for `"`) would push us past
+    // `MAX_NAME_LEN` truncates here. Always produces valid UTF-8.
+    const MAX_NAME_LEN: usize = 500;
+    let mut out = String::with_capacity(raw.len().min(MAX_NAME_LEN));
+    for ch in raw.chars() {
+        let next_bytes = if ch == '"' {
+            2
+        } else if ch.is_control() {
+            1
+        } else {
+            ch.len_utf8()
+        };
+        if out.len() + next_bytes > MAX_NAME_LEN {
+            out.push('…');
+            break;
+        }
+        if ch == '"' {
+            out.push_str("\\\"");
+        } else if ch.is_control() {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Bounding box (w, h) over the item's elements, used both for the README
+/// listing and for client-side layout planning. Falls back to (0, 0) when the
+/// item has no positioned elements.
+fn library_item_bbox(item: &crate::storage::libraries::LibraryItem) -> (f64, f64) {
+    // Use the un-rotated AABB so this stays consistent with
+    // `libraries::expand`, which anchors at `bbox_min` of the raw element
+    // (x, y) without applying `angle`. Reporting a rotated AABB here while
+    // expanding from the un-rotated min was producing size/placement
+    // mismatches: the AI would reserve canvas space sized to the rotated
+    // bbox but the actual instantiation occupied the un-rotated extent.
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for el in &item.elements {
+        let x = el.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let y = el.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let w = el.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let h = el.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x + w);
+        max_y = max_y.max(y + h);
+    }
+    if min_x.is_finite() && max_x > min_x {
+        (max_x - min_x, max_y - min_y)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+/// Build the text body for `grove_sketch_read` (summary + fresh checkpoint +
+/// optional full scene JSON) plus an optional PNG thumbnail. Also writes a fresh
+/// checkpoint so the caller receives an id they can use with `restoreCheckpoint`
+/// in a follow-up draw.
+fn read_sketch_to_text(
+    project: &str,
+    task_id: &str,
+    reference: &str,
+    detail_full: bool,
+) -> Result<(String, Option<Vec<u8>>), McpError> {
+    use crate::storage::sketches;
+    let meta_opt = sketches::resolve_sketch_ref(project, task_id, reference)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+    let meta = match meta_opt {
+        Some(m) => m,
+        None => {
+            let index =
+                sketches::load_index(project, task_id).map_err(|e| mcp_err(&e.to_string()))?;
+            let list_str = if index.sketches.is_empty() {
+                "  (no sketches exist yet in this task)".to_string()
+            } else {
+                index
+                    .sketches
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "  - name: \"{}\" | id: {} | updated: {}",
+                            m.name, m.id, m.updated_at
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            return Err(mcp_err(&format!(
+                "Sketch \"{reference}\" not found in this task.\n\nAvailable sketches:\n{list_str}\n\nUse grove_sketch_draw with a new name to create a new sketch, or pick one of the names above."
+            )));
+        }
+    };
+
+    let scene = sketches::load_scene_value(project, task_id, &meta.id)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+    let empty_vec: Vec<serde_json::Value> = Vec::new();
+    let elements = scene
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty_vec);
+    let element_count = elements.len();
+
+    let mut type_counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for el in elements.iter() {
+        if let Some(t) = el.get("type").and_then(|v| v.as_str()) {
+            *type_counts.entry(t.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let mut viewport_hint: Option<(f64, f64, f64, f64)> = None;
+    if !elements.is_empty() {
+        let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+        let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for el in elements.iter() {
+            let x = el.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = el.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let w = el.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let h = el.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x + w);
+            max_y = max_y.max(y + h);
+        }
+        if min_x.is_finite() && max_x > min_x {
+            viewport_hint = Some((min_x, min_y, max_x - min_x, max_y - min_y));
+        }
+    }
+
+    let cp_id = crate::storage::sketch_checkpoints::generate_id();
+    crate::storage::sketch_checkpoints::save(project, task_id, &meta.id, &cp_id, &scene)
+        .map_err(|e| mcp_err(&e.to_string()))?;
+
+    let mut body = format!(
+        "Sketch \"{}\" (id: {})\n- Elements: {}\n",
+        meta.name, meta.id, element_count
+    );
+    if !type_counts.is_empty() {
+        let parts: Vec<String> = type_counts
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect();
+        body.push_str(&format!("- By type: {}\n", parts.join(", ")));
+    }
+    body.push_str(&format!("- Last updated: {}\n", meta.updated_at));
+    if let Some((x, y, w, h)) = viewport_hint {
+        body.push_str(&format!(
+            "- Content bounds: x={:.0} y={:.0} w={:.0} h={:.0}\n",
+            x, y, w, h
+        ));
+    }
+    body.push_str(&format!("- Current checkpoint: {cp_id}\n"));
+    body.push_str(&format!(
+        "\nTo modify this sketch, call grove_sketch_draw with:\n  [{{\"type\":\"restoreCheckpoint\",\"id\":\"{cp_id}\"}}, ...your new elements]\n"
+    ));
+
+    if detail_full {
+        body.push_str("\n--- Full Excalidraw scene JSON ---\n");
+        body.push_str(&serde_json::to_string_pretty(&scene).unwrap_or_default());
+    } else {
+        body.push_str("\n(Pass detail_full=true to also receive the complete scene JSON.)\n");
+    }
+
+    let thumb = crate::storage::sketches::load_thumbnail_if_fresh(project, task_id, &meta.id)
+        .ok()
+        .flatten();
+    if thumb.is_none() {
+        body.push_str(
+            "\n(No rendered image attached — the thumbnail is either missing or older than the current scene. Open the sketch tab in the UI to refresh it, or read the scene JSON with detail_full=true.)\n",
+        );
+    }
+
+    Ok((body, thumb))
+}
+
+fn ensure_not_in_grove_task() -> Result<(), McpError> {
+    if get_task_context().is_some() {
+        return Err(McpError::invalid_request(
+            "This tool is only available outside a Grove task",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that the project is registered and the task exists in storage.
+/// Catches misconfigured GROVE_PROJECT / GROVE_TASK_ID env vars before
+/// any data is written to disk.
+fn validate_task_exists(project_key: &str, task_id: &str) -> Result<(), McpError> {
+    match workspace::load_project_by_hash(project_key) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(McpError::invalid_request(
+                "Project not found. GROVE_PROJECT may be misconfigured.",
+                None,
+            ));
+        }
+        Err(e) => {
+            return Err(McpError::internal_error(
+                format!("Failed to verify project: {}", e),
+                None,
+            ));
+        }
+    }
+
+    match tasks::get_task(project_key, task_id) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(McpError::invalid_request(
+            "Task not found. GROVE_TASK_ID may be misconfigured.",
+            None,
+        )),
+        Err(e) => Err(McpError::internal_error(
+            format!("Failed to verify task: {}", e),
+            None,
+        )),
+    }
+}
+
+fn add_project_by_path_json(path: &str) -> serde_json::Value {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return error_json("invalid_path", "Path does not exist");
+    }
+
+    if !git::is_git_repo(path) {
+        return error_json("not_git_repo", "Path is not a Git repository");
+    }
+
+    let repo_path = match git::repo_root(path) {
+        Ok(v) => v,
+        Err(e) => return error_json("not_git_repo", format!("Failed to resolve repo root: {e}")),
+    };
+
+    let project_name = std::path::Path::new(&repo_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let project_id = workspace::project_hash(&repo_path);
+    match workspace::is_project_registered(&repo_path) {
+        Ok(true) => {
+            return json!({
+                "success": true,
+                "project_id": project_id,
+                "path": repo_path,
+            })
+        }
+        Ok(false) => {}
+        Err(e) => return error_json("internal_error", format!("Failed to check project: {e}")),
+    }
+
+    if let Err(e) = workspace::add_project(&project_name, &repo_path) {
+        return error_json("internal_error", format!("Failed to add project: {e}"));
+    }
+
+    json!({
+        "success": true,
+        "project_id": project_id,
+        "path": repo_path,
+    })
+}
+
+/// Fuzzy match: checks if `query` matches `haystack` with flexible matching.
+///
+/// Strategy (all case-insensitive):
+///
+/// 1. Split query into whitespace-separated tokens
+/// 2. Each token must match via at least one of:
+///   - Substring match (e.g., "auth" in "authentication")
+///   - Word-prefix match — split haystack on separators and check if any
+///     word starts with the token (e.g., "lg" matches "login")
+///   - Initials match — token characters match the first letters of
+///     consecutive words (e.g., "al" matches "auth-login")
+fn fuzzy_matches(haystack: &str, query: &str) -> bool {
+    let h = haystack.to_lowercase();
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+
+    // Split haystack into "words" on common separators
+    let words: Vec<&str> = h
+        .split(['/', '-', '_', '.', ' '])
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    q.split_whitespace().all(|token| {
+        // (a) Substring match
+        if h.contains(token) {
+            return true;
+        }
+        // (b) Any word starts with token
+        if words.iter().any(|w| w.starts_with(token)) {
+            return true;
+        }
+        // (c) Initials match: each char of token matches the start of a consecutive word
+        if token.len() >= 2 && token.len() <= words.len() {
+            let token_chars: Vec<char> = token.chars().collect();
+            // Sliding window over words
+            'outer: for start in 0..=words.len() - token_chars.len() {
+                for (i, &tc) in token_chars.iter().enumerate() {
+                    if !words[start + i].starts_with(tc) {
+                        continue 'outer;
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    })
+}
+
+fn list_projects_json(query: Option<&str>) -> serde_json::Value {
+    match workspace::load_projects() {
+        Ok(projects) => {
+            let items: Vec<serde_json::Value> = projects
+                .into_iter()
+                .filter(|p| match query {
+                    Some(q) => fuzzy_matches(&p.path, q) || fuzzy_matches(&p.name, q),
+                    None => true,
+                })
+                .map(|p| {
+                    json!({
+                        "project_id": workspace::project_hash(&p.path),
+                        "path": p.path,
+                    })
+                })
+                .collect();
+            json!({
+                "success": true,
+                "projects": items,
+            })
+        }
+        Err(e) => error_json("internal_error", format!("Failed to load projects: {e}")),
+    }
+}
+
+fn load_project_by_id(project_id: &str) -> Result<Option<workspace::RegisteredProject>, String> {
+    let Some(p) = workspace::load_project_by_hash(project_id).map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    // Studio projects use virtual `studio://<name>` paths that are not on disk;
+    // check the resolved studio directory instead.
+    let exists = match p.project_type {
+        workspace::ProjectType::Studio => workspace::studio_project_dir(&p.path).exists(),
+        _ => std::path::Path::new(&p.path).exists(),
+    };
+    if exists {
+        Ok(Some(p))
+    } else {
+        Ok(None)
+    }
+}
+
+fn create_task_json(params: &CreateTaskParams) -> serde_json::Value {
+    let project = match load_project_by_id(&params.project_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return error_json("project_not_found", "Project not found"),
+        Err(e) => return error_json("internal_error", format!("Failed to load project: {e}")),
+    };
+
+    let target = git::current_branch(&project.path).unwrap_or_else(|_| "main".to_string());
+
+    let full_config = config::load_config();
+    let autolink_patterns = &full_config.auto_link.patterns;
+
+    match operations::tasks::create_task(
+        &project.path,
+        &params.project_id,
+        params.name.clone(),
+        target.clone(),
+        &full_config.default_session_type(),
+        autolink_patterns,
+        "agent",
+    ) {
+        Ok(result) => json!({
+            "success": true,
+            "task": {
+                "task_id": result.task.id,
+                "name": result.task.name,
+                "branch": result.task.branch,
+                "target": result.task.target,
+                "worktree_path": result.worktree_path,
+            }
+        }),
+        Err(e) => error_json("task_create_failed", format!("Failed to create task: {e}")),
+    }
+}
+
+fn list_tasks_json(project_id: &str, query: Option<&str>) -> serde_json::Value {
+    match load_project_by_id(project_id) {
+        Ok(Some(_project)) => {}
+        Ok(None) => return error_json("project_not_found", "Project not found"),
+        Err(e) => return error_json("internal_error", format!("Failed to load project: {e}")),
+    }
+
+    match tasks::load_tasks(project_id) {
+        Ok(list) => {
+            let items: Vec<serde_json::Value> = list
+                .into_iter()
+                .filter(|t| match query {
+                    Some(q) => {
+                        fuzzy_matches(&t.id, q)
+                            || fuzzy_matches(&t.name, q)
+                            || fuzzy_matches(&t.branch, q)
+                            || fuzzy_matches(&t.target, q)
+                    }
+                    None => true,
+                })
+                .map(|t| {
+                    json!({
+                        "task_id": t.id,
+                        "name": t.name,
+                        "branch": t.branch,
+                        "target": t.target,
+                        "worktree_path": t.worktree_path,
+                        "is_local": t.is_local,
+                    })
+                })
+                .collect();
+            json!({
+                "success": true,
+                "tasks": items,
+            })
+        }
+        Err(e) => error_json("internal_error", format!("Failed to load tasks: {e}")),
+    }
+}
+
+fn edit_note_json(params: &EditNoteParams) -> serde_json::Value {
+    match load_project_by_id(&params.project_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return error_json("project_not_found", "Project not found"),
+        Err(e) => return error_json("internal_error", format!("Failed to load project: {e}")),
+    }
+
+    match tasks::get_task(&params.project_id, &params.task_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return error_json("task_not_found", "Task not found"),
+        Err(e) => return error_json("internal_error", format!("Failed to verify task: {e}")),
+    }
+
+    if let Err(e) = notes::save_notes(&params.project_id, &params.task_id, &params.content) {
+        return error_json("save_failed", format!("Failed to save notes: {e}"));
+    }
+
+    json!({
+        "success": true,
+        "task_id": params.task_id,
+        "content_length": params.content.len(),
+    })
+}
+
+// ============================================================================
+// ACP Chat Management Helpers (async — used by management MCP tools)
+// ============================================================================
+
+/// Built-in agent definitions (id, name)
+const BUILTIN_AGENTS: &[(&str, &str)] = &[
+    ("claude", "Claude Code"),
+    ("codex", "Codex"),
+    ("traecli", "Trae CLI"),
+    ("kimi", "Kimi"),
+    ("gemini", "Gemini CLI"),
+    ("qwen", "Qwen"),
+    ("opencode", "OpenCode"),
+    ("copilot", "GitHub Copilot"),
+    ("cursor", "Cursor Agent"),
+    ("junie", "Junie"),
+];
+
+fn list_agents_json() -> serde_json::Value {
+    let cfg = config::load_config();
+    let default_agent = cfg
+        .acp
+        .agent_command
+        .clone()
+        .unwrap_or_else(|| "claude".to_string());
+
+    let mut agents: Vec<serde_json::Value> = BUILTIN_AGENTS
+        .iter()
+        .map(|(id, name)| {
+            json!({
+                "id": id,
+                "name": name,
+                "type": "builtin",
+                "agent_type": "local",
+            })
+        })
+        .collect();
+
+    for custom in &cfg.acp.custom_agents {
+        agents.push(json!({
+            "id": custom.id,
+            "name": custom.name,
+            "type": "custom",
+            "agent_type": custom.agent_type,
+        }));
+    }
+
+    json!({
+        "default_agent": default_agent,
+        "agents": agents,
+    })
+}
+
+/// Resolve project → (project_key, project_path, project_name) with MCP error handling
+fn resolve_project_for_mcp(project_id: &str) -> Result<(String, String, String), McpError> {
+    let project = match load_project_by_id(project_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return Err(McpError::invalid_params("Project not found", None)),
+        Err(e) => {
+            return Err(McpError::internal_error(
+                format!("Failed to load project: {e}"),
+                None,
+            ))
+        }
+    };
+    let project_key = workspace::project_hash(&project.path);
+    Ok((project_key, project.path, project.name))
+}
+
+/// Resolve task with MCP error handling
+fn resolve_task_for_mcp(project_key: &str, task_id: &str) -> Result<tasks::Task, McpError> {
+    match tasks::get_task(project_key, task_id) {
+        Ok(Some(t)) => Ok(t),
+        Ok(None) => Err(McpError::invalid_params("Task not found", None)),
+        Err(e) => Err(McpError::internal_error(
+            format!("Failed to load task: {e}"),
+            None,
+        )),
+    }
+}
+
+/// Build session key for ACP
+fn build_session_key(project_key: &str, task_id: &str, chat_id: &str) -> String {
+    format!("{}:{}:{}", project_key, task_id, chat_id)
+}
+
+/// Build GROVE_* env vars for ACP agent
+fn build_grove_env(
+    project_key: &str,
+    project_path: &str,
+    project_name: &str,
+    task: &tasks::Task,
+) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    env.insert("GROVE_TASK_ID".into(), task.id.clone());
+    env.insert("GROVE_TASK_NAME".into(), task.name.clone());
+    env.insert("GROVE_BRANCH".into(), task.branch.clone());
+    env.insert("GROVE_TARGET".into(), task.target.clone());
+    env.insert("GROVE_WORKTREE".into(), task.worktree_path.clone());
+    env.insert("GROVE_PROJECT_NAME".into(), project_name.into());
+    env.insert("GROVE_PROJECT".into(), project_path.into());
+    env.insert("GROVE_PROJECT_KEY".into(), project_key.into());
+    env
+}
+
+async fn start_chat_impl(p: StartChatParams) -> Result<CallToolResult, McpError> {
+    let (project_key, project_path, project_name) = resolve_project_for_mcp(&p.project_id)?;
+    let task = resolve_task_for_mcp(&project_key, &p.task_id)?;
+
+    let cfg = config::load_config();
+    let agent_name = p.agent.unwrap_or_else(|| {
+        cfg.acp
+            .agent_command
+            .clone()
+            .unwrap_or_else(|| "claude".to_string())
+    });
+
+    // Resolve agent
+    let resolved = acp::resolve_agent(&agent_name)
+        .ok_or_else(|| McpError::invalid_params(format!("Unknown agent: {}", agent_name), None))?;
+
+    // Create chat session in storage
+    let now = chrono::Utc::now();
+    let title = p
+        .name
+        .unwrap_or_else(|| format!("New Chat {}", now.format("%Y-%m-%d %H:%M")));
+    let chat_id = tasks::generate_chat_id();
+
+    let chat = tasks::ChatSession {
+        id: chat_id.clone(),
+        title: title.clone(),
+        agent: agent_name.clone(),
+        acp_session_id: None,
+        created_at: now,
+        duty: None,
+        launch_mode: "acp".to_string(),
+    };
+
+    tasks::add_chat_session(&project_key, &p.task_id, chat)
+        .map_err(|e| McpError::internal_error(format!("Failed to save chat: {e}"), None))?;
+
+    // Build ACP start config
+    let env_vars = build_grove_env(&project_key, &project_path, &project_name, &task);
+    let session_key = build_session_key(&project_key, &p.task_id, &chat_id);
+    let working_dir = std::path::PathBuf::from(&task.worktree_path);
+
+    let acp_config = acp::AcpStartConfig {
+        agent_command: resolved.command,
+        agent_name: resolved.agent_name,
+        agent_args: resolved.args,
+        working_dir,
+        env_vars,
+        project_key: project_key.clone(),
+        task_id: p.task_id.clone(),
+        chat_id: Some(chat_id.clone()),
+        agent_type: resolved.agent_type,
+        remote_url: resolved.url,
+        remote_auth: resolved.auth_header,
+        suppress_initial_connecting: false,
+        persona_injection: None,
+    };
+
+    // Start session (non-blocking — caller should use grove_chat_status to wait for ready)
+    let (_handle, _rx) = acp::get_or_start_session(session_key, acp_config)
+        .await
+        .map_err(|e| McpError::internal_error(format!("Failed to start ACP session: {e}"), None))?;
+
+    ok_json(json!({
+        "chat_id": chat_id,
+        "name": title,
+        "agent": agent_name,
+    }))
+}
+
+/// Get an existing session handle, or auto-start one if the chat exists in storage.
+/// Resolve session access: discover existing (local or remote), or auto-start a new one.
+async fn resolve_session_access(
+    project_key: &str,
+    project_path: &str,
+    project_name: &str,
+    task: &tasks::Task,
+    chat_id: &str,
+) -> Result<acp::SessionAccess, McpError> {
+    let session_key = build_session_key(project_key, &task.id, chat_id);
+
+    // Try discover (in-process HashMap → socket probe)
+    if let Some(access) = acp::discover_session(project_key, &task.id, chat_id, &session_key) {
+        return Ok(access);
+    }
+
+    // Not found anywhere — look up chat in storage and auto-start
+    let chat = tasks::get_chat_session(project_key, &task.id, chat_id)
+        .map_err(|e| McpError::internal_error(format!("Failed to load chat: {e}"), None))?
+        .ok_or_else(|| McpError::invalid_params("Chat not found", None))?;
+
+    let resolved = acp::resolve_agent(&chat.agent)
+        .ok_or_else(|| McpError::internal_error(format!("Unknown agent: {}", chat.agent), None))?;
+
+    let env_vars = build_grove_env(project_key, project_path, project_name, task);
+    let working_dir = std::path::PathBuf::from(&task.worktree_path);
+
+    let config = acp::AcpStartConfig {
+        agent_command: resolved.command,
+        agent_name: resolved.agent_name,
+        agent_args: resolved.args,
+        working_dir,
+        env_vars,
+        project_key: project_key.to_string(),
+        task_id: task.id.clone(),
+        chat_id: Some(chat_id.to_string()),
+        agent_type: resolved.agent_type,
+        remote_url: resolved.url,
+        remote_auth: resolved.auth_header,
+        suppress_initial_connecting: false,
+        persona_injection: None,
+    };
+
+    // Start session — may race with another process. If bind() fails (AddrInUse),
+    // the socket listener inside get_or_start_session will log and skip, which is fine.
+    // A subsequent discover_session would find the remote.
+    let (handle, _rx) = acp::get_or_start_session(session_key, config)
+        .await
+        .map_err(|e| McpError::internal_error(format!("Failed to start ACP session: {e}"), None))?;
+
+    Ok(acp::SessionAccess::Local(handle))
+}
+
+async fn send_prompt_impl(p: SendPromptParams) -> Result<CallToolResult, McpError> {
+    // Validate mutual exclusivity
+    let action_count =
+        p.text.is_some() as u8 + p.permission_option_id.is_some() as u8 + p.cancel as u8;
+    if action_count == 0 {
+        return Err(McpError::invalid_params(
+            "Exactly one of `text`, `permission_option_id`, or `cancel` must be provided",
+            None,
+        ));
+    }
+    if action_count > 1 {
+        return Err(McpError::invalid_params(
+            "`text`, `permission_option_id`, and `cancel` are mutually exclusive",
+            None,
+        ));
+    }
+
+    let (project_key, project_path, project_name) = resolve_project_for_mcp(&p.project_id)?;
+    let task = resolve_task_for_mcp(&project_key, &p.task_id)?;
+
+    let access = resolve_session_access(
+        &project_key,
+        &project_path,
+        &project_name,
+        &task,
+        &p.chat_id,
+    )
+    .await?;
+
+    match access {
+        acp::SessionAccess::Local(handle) => send_prompt_local(&handle, p).await,
+        acp::SessionAccess::Remote { sock_path, .. } => send_prompt_remote(&sock_path, p).await,
+    }
+}
+
+/// Send prompt via local in-process handle
+async fn send_prompt_local(
+    handle: &acp::AcpSessionHandle,
+    p: SendPromptParams,
+) -> Result<CallToolResult, McpError> {
+    // Action: cancel
+    if p.cancel {
+        handle
+            .cancel()
+            .await
+            .map_err(|e| McpError::internal_error(format!("Failed to cancel: {e}"), None))?;
+        return ok_json(json!({ "action": "cancelled" }));
+    }
+
+    // Action: respond to permission
+    if let Some(option_id) = p.permission_option_id {
+        handle.respond_permission(option_id);
+        return ok_json(json!({ "action": "permission_responded" }));
+    }
+
+    // Action: send prompt — bundle any model/mode/thought_level into config so the
+    // cmd_loop applies them as ACP requests right before sending the prompt.
+    let text = p.text.unwrap(); // safe: validated above
+
+    let config = build_queued_config(
+        p.model_id.clone(),
+        p.mode_id.clone(),
+        p.thought_level_config_id.clone(),
+        p.thought_level_value_id.clone(),
+    )?;
+
+    handle
+        .send_prompt(text, vec![], p.sender, false, config)
+        .await
+        .map_err(|e| McpError::internal_error(format!("Failed to send prompt: {e}"), None))?;
+
+    ok_json(json!({ "action": "prompt_sent" }))
+}
+
+/// Assemble a `QueuedConfig` from the MCP params; returns None when no fields are set.
+/// Errors when only one half of the thought-level pair is provided — both
+/// `thought_level_value_id` and `thought_level_config_id` are required together,
+/// silently dropping the value (old behavior) hid bugs in caller scripts.
+fn build_queued_config(
+    model_id: Option<String>,
+    mode_id: Option<String>,
+    thought_level_config_id: Option<String>,
+    thought_level_value_id: Option<String>,
+) -> Result<Option<acp::QueuedConfig>, McpError> {
+    match (&thought_level_value_id, &thought_level_config_id) {
+        (Some(_), None) => {
+            return Err(McpError::invalid_params(
+                "thought_level_value_id requires thought_level_config_id (both must be \
+                 supplied together so the agent knows which config option the value targets)",
+                None,
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(McpError::invalid_params(
+                "thought_level_config_id requires thought_level_value_id",
+                None,
+            ));
+        }
+        _ => {}
+    }
+    let any = model_id.is_some() || mode_id.is_some() || thought_level_value_id.is_some();
+    if !any {
+        return Ok(None);
+    }
+    Ok(Some(acp::QueuedConfig {
+        model: model_id,
+        mode: mode_id,
+        thought_level: thought_level_value_id,
+        thought_level_config_id,
+    }))
+}
+
+/// Send prompt via Unix socket to remote session owner
+async fn send_prompt_remote(
+    sock_path: &std::path::Path,
+    p: SendPromptParams,
+) -> Result<CallToolResult, McpError> {
+    let cmd = if p.cancel {
+        acp::SocketCommand::Cancel
+    } else if let Some(option_id) = p.permission_option_id {
+        acp::SocketCommand::RespondPermission { option_id }
+    } else {
+        let text = p.text.unwrap(); // safe: validated above
+        let config = build_queued_config(
+            p.model_id.clone(),
+            p.mode_id.clone(),
+            p.thought_level_config_id.clone(),
+            p.thought_level_value_id.clone(),
+        )?;
+        acp::SocketCommand::Prompt {
+            text,
+            attachments: vec![],
+            sender: p.sender,
+            config,
+        }
+    };
+
+    let action_name = match &cmd {
+        acp::SocketCommand::Cancel => "cancelled",
+        acp::SocketCommand::RespondPermission { .. } => "permission_responded",
+        _ => "prompt_sent",
+    };
+
+    let resp = acp::send_socket_command(sock_path, &cmd)
+        .await
+        .map_err(|e| McpError::internal_error(format!("Socket command failed: {e}"), None))?;
+
+    match resp {
+        acp::SocketResponse::Ok => ok_json(json!({ "action": action_name })),
+        acp::SocketResponse::Error { message } => Err(McpError::internal_error(
+            format!("Remote command failed: {}", message),
+            None,
+        )),
+    }
+}
+
+async fn chat_status_impl(p: ChatStatusParams) -> Result<CallToolResult, McpError> {
+    let (project_key, project_path, project_name) = resolve_project_for_mcp(&p.project_id)?;
+    let task = resolve_task_for_mcp(&project_key, &p.task_id)?;
+
+    // Auto-connect: resolve session (local, remote, or start new)
+    let access = resolve_session_access(
+        &project_key,
+        &project_path,
+        &project_name,
+        &task,
+        &p.chat_id,
+    )
+    .await?;
+
+    match access {
+        acp::SessionAccess::Local(handle) => chat_status_from_handle(&handle).await,
+        acp::SessionAccess::Remote {
+            project_key,
+            task_id,
+            chat_id,
+            ..
+        } => chat_status_from_disk(&project_key, &task_id, &chat_id).await,
+    }
+}
+
+/// Build chat status from local in-process handle
+async fn chat_status_from_handle(
+    handle: &acp::AcpSessionHandle,
+) -> Result<CallToolResult, McpError> {
+    // Get modes/models: check agent_info first (already initialized), else wait for broadcast
+    let timeout = tokio::time::Duration::from_secs(60);
+    let (persist_project, persist_task, persist_chat) = handle.persist_info();
+
+    // Try session metadata first (already exists for initialized sessions)
+    type Selectors = (
+        Vec<(String, String)>,
+        Vec<(String, String)>,
+        Vec<(String, String)>,
+        Option<String>,
+        Option<String>,
+    );
+    let from_meta: Option<Selectors> = if let Some(ref cid) = persist_chat {
+        acp::read_session_metadata(&persist_project, &persist_task, cid).map(|m| {
+            (
+                m.available_modes,
+                m.available_models,
+                m.available_thought_levels,
+                m.current_thought_level_id,
+                m.thought_level_config_id,
+            )
+        })
+    } else {
+        None
+    };
+
+    let (
+        available_modes,
+        available_models,
+        available_thought_levels,
+        current_thought_level_id,
+        thought_level_config_id,
+    ) = if let Some(sel) = from_meta {
+        sel
+    } else {
+        // New session still initializing — wait for SessionReady via broadcast
+        let mut rx = handle.subscribe();
+        tokio::time::timeout(timeout, async move {
+            loop {
+                match rx.recv().await {
+                    Ok(acp::AcpUpdate::SessionReady {
+                        available_modes,
+                        available_models,
+                        available_thought_levels,
+                        current_thought_level_id,
+                        thought_level_config_id,
+                        ..
+                    }) => {
+                        return (
+                            available_modes,
+                            available_models,
+                            available_thought_levels,
+                            current_thought_level_id,
+                            thought_level_config_id,
+                        );
+                    }
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return (Vec::new(), Vec::new(), Vec::new(), None, None);
+                    }
+                    Err(_) => {
+                        // Lagged — messages were missed, retry
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            McpError::internal_error("Timeout waiting for agent to initialize (60s)", None)
+        })?
+    };
+
+    // Read history from disk (single source of truth)
+    let history = if let Some(ref cid) = persist_chat {
+        chat_history::load_history(&persist_project, &persist_task, cid)
+    } else {
+        vec![]
+    };
+    let compacted = chat_history::compact_events(history);
+
+    build_chat_status_json(
+        &compacted,
+        &available_modes,
+        &available_models,
+        &available_thought_levels,
+        current_thought_level_id.as_deref(),
+        thought_level_config_id.as_deref(),
+    )
+}
+
+/// Build chat status from disk (for remote sessions owned by another process)
+async fn chat_status_from_disk(
+    project_key: &str,
+    task_id: &str,
+    chat_id: &str,
+) -> Result<CallToolResult, McpError> {
+    // Poll session.json for modes/models (may not be written yet if agent just started)
+    let timeout = tokio::time::Duration::from_secs(60);
+    let metadata = tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(meta) = acp::read_session_metadata(project_key, task_id, chat_id) {
+                return meta;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        McpError::internal_error("Timeout waiting for remote session metadata (60s)", None)
+    })?;
+
+    // Load history from disk and compact
+    let history = chat_history::load_history(project_key, task_id, chat_id);
+    let compacted = chat_history::compact_events(history);
+
+    build_chat_status_json(
+        &compacted,
+        &metadata.available_modes,
+        &metadata.available_models,
+        &metadata.available_thought_levels,
+        metadata.current_thought_level_id.as_deref(),
+        metadata.thought_level_config_id.as_deref(),
+    )
+}
+
+/// Build the chat status JSON response from compacted events and mode/model info
+fn build_chat_status_json(
+    compacted: &[acp::AcpUpdate],
+    available_modes: &[(String, String)],
+    available_models: &[(String, String)],
+    available_thought_levels: &[(String, String)],
+    current_thought_level_id: Option<&str>,
+    thought_level_config_id: Option<&str>,
+) -> Result<CallToolResult, McpError> {
+    let last_message = extract_last_message(compacted);
+    let plan = extract_last_plan(compacted);
+    let turn_count = compacted
+        .iter()
+        .filter(|e| matches!(e, acp::AcpUpdate::Complete { .. }))
+        .count();
+    let permission = extract_pending_permission(compacted);
+
+    let state = if permission.is_some() {
+        "permission_needed"
+    } else {
+        let last_significant = compacted.iter().rev().find(|e| {
+            matches!(
+                e,
+                acp::AcpUpdate::Complete { .. }
+                    | acp::AcpUpdate::UserMessage { .. }
+                    | acp::AcpUpdate::MessageChunk { .. }
+                    | acp::AcpUpdate::ToolCall { .. }
+                    | acp::AcpUpdate::ThoughtChunk { .. }
+            )
+        });
+
+        match last_significant {
+            Some(acp::AcpUpdate::Complete { .. }) => "idle",
+            Some(_) => "busy",
+            None => "idle",
+        }
+    };
+
+    let mut result = json!({
+        "state": state,
+        "turn_count": turn_count,
+        "last_message": last_message,
+        "available_modes": available_modes.iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>(),
+        "available_models": available_models.iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>(),
+    });
+
+    if !available_thought_levels.is_empty() {
+        result["available_thought_levels"] = json!(available_thought_levels
+            .iter()
+            .map(|(id, name)| json!({"id": id, "name": name}))
+            .collect::<Vec<_>>());
+    }
+    if let Some(id) = current_thought_level_id {
+        result["current_thought_level_id"] = json!(id);
+    }
+    if let Some(id) = thought_level_config_id {
+        result["thought_level_config_id"] = json!(id);
+    }
+
+    if let Some(plan_entries) = plan {
+        result["plan"] = plan_entries;
+    }
+
+    if let Some(perm) = permission {
+        result["permission"] = perm;
+    }
+
+    if let Some(plan_file) = extract_last_plan_file(compacted) {
+        result["plan_file"] = json!(plan_file);
+    }
+
+    ok_json(result)
+}
+
+/// Extract the last plan file path from events
+fn extract_last_plan_file(events: &[acp::AcpUpdate]) -> Option<String> {
+    events.iter().rev().find_map(|e| match e {
+        acp::AcpUpdate::PlanFileUpdate { path, .. } => Some(path.clone()),
+        _ => None,
+    })
+}
+
+async fn list_chats_impl(p: ListChatsParams) -> Result<CallToolResult, McpError> {
+    let (project_key, _, _) = resolve_project_for_mcp(&p.project_id)?;
+    let _ = resolve_task_for_mcp(&project_key, &p.task_id)?;
+
+    let chats = tasks::load_chat_sessions(&project_key, &p.task_id)
+        .map_err(|e| McpError::internal_error(format!("Failed to load chats: {e}"), None))?;
+
+    let items: Vec<serde_json::Value> = chats
+        .iter()
+        .filter(|c| match &p.query {
+            Some(q) => fuzzy_matches(&c.title, q) || fuzzy_matches(&c.agent, q),
+            None => true,
+        })
+        .map(|c| {
+            json!({
+                "id": c.id,
+                "title": c.title,
+                "agent": c.agent,
+                "created_at": c.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    ok_json(json!({ "chats": items }))
+}
+
+/// Extract the last assistant message from compacted history.
+/// Finds all MessageChunk events after the last Complete, or the last MessageChunk before
+/// the most recent Complete if the agent is idle.
+fn extract_last_message(events: &[acp::AcpUpdate]) -> Option<String> {
+    // Find the position of the last Complete
+    let last_complete_pos = events
+        .iter()
+        .rposition(|e| matches!(e, acp::AcpUpdate::Complete { .. }));
+
+    // If there's a Complete, get the MessageChunk right before it (after previous Complete/start)
+    if let Some(complete_pos) = last_complete_pos {
+        // Find the previous Complete (or start of events)
+        let prev_complete_pos = events[..complete_pos]
+            .iter()
+            .rposition(|e| matches!(e, acp::AcpUpdate::Complete { .. }))
+            .map(|p| p + 1)
+            .unwrap_or(0);
+
+        // Collect all MessageChunk text in this turn
+        let text: String = events[prev_complete_pos..complete_pos]
+            .iter()
+            .filter_map(|e| match e {
+                acp::AcpUpdate::MessageChunk { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+
+    // Also check for MessageChunk after last Complete (agent currently working)
+    let start = last_complete_pos.map(|p| p + 1).unwrap_or(0);
+    let text: String = events[start..]
+        .iter()
+        .filter_map(|e| match e {
+            acp::AcpUpdate::MessageChunk { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    if !text.is_empty() {
+        Some(text)
+    } else {
+        None
+    }
+}
+
+/// Extract the last PlanUpdate entries from history
+fn extract_last_plan(events: &[acp::AcpUpdate]) -> Option<serde_json::Value> {
+    events.iter().rev().find_map(|e| match e {
+        acp::AcpUpdate::PlanUpdate { entries } => Some(json!(entries
+            .iter()
+            .map(|entry| json!({
+                "content": entry.content,
+                "status": entry.status,
+            }))
+            .collect::<Vec<_>>())),
+        _ => None,
+    })
+}
+
+/// Extract pending permission request (last PermissionRequest without a matching PermissionResponse)
+fn extract_pending_permission(events: &[acp::AcpUpdate]) -> Option<serde_json::Value> {
+    // Walk backwards to find the last PermissionRequest
+    let mut last_perm_req = None;
+    let mut last_perm_resp_pos = None;
+    let mut last_perm_req_pos = None;
+
+    for (i, e) in events.iter().enumerate().rev() {
+        match e {
+            acp::AcpUpdate::PermissionResponse { .. } if last_perm_resp_pos.is_none() => {
+                last_perm_resp_pos = Some(i);
+            }
+            acp::AcpUpdate::PermissionRequest {
+                description,
+                options,
+                ..
+            } if last_perm_req.is_none() => {
+                last_perm_req = Some((description.clone(), options.clone()));
+                last_perm_req_pos = Some(i);
+            }
+            _ => {}
+        }
+        if last_perm_req.is_some() {
+            break;
+        }
+    }
+
+    // Only return if PermissionRequest comes after PermissionResponse (or no response exists)
+    if let (Some((desc, opts)), Some(req_pos)) = (last_perm_req, last_perm_req_pos) {
+        let is_resolved = last_perm_resp_pos.is_some_and(|resp_pos| resp_pos > req_pos);
+        if !is_resolved {
+            return Some(json!({
+                "description": desc,
+                "options": opts.iter().map(|o| json!({
+                    "option_id": o.option_id,
+                    "name": o.name,
+                    "kind": o.kind,
+                })).collect::<Vec<_>>(),
+            }));
+        }
+    }
+
+    None
+}
+
 /// Get task context from environment variables
 fn get_task_context() -> Option<(String, String)> {
     let task_id = env::var("GROVE_TASK_ID").ok()?;
@@ -814,4 +3349,1125 @@ pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error + Send + S
     service.waiting().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // MCP tests mutate HOME and the global DB connection — serialize with every
+    // other test module that does the same (storage + handler tests) via the
+    // crate-wide `test_lock` in `crate::storage::database`. Previously this
+    // module had its own `tokio::sync::Mutex`, which only serialized MCP tests
+    // among themselves; concurrent taskgroups tests flipped the DB path under
+    // us and produced flaky failures.
+    use crate::storage::database::test_lock;
+
+    /// Regression: `focus` and `gap` in arrow bindings must round-trip
+    /// through the typed `SketchElement` schema. Before the fix these fields
+    /// were silently dropped by serde because `SketchElementBinding` only
+    /// modeled `fixedPoint`, leaving Excalidraw's reconciler no valid
+    /// binding → it reset `startBinding`/`endBinding` to `null` on load and
+    /// arrows detached on drag.
+    #[test]
+    fn binding_focus_gap_roundtrip() {
+        let input = serde_json::json!({
+            "type": "arrow",
+            "id": "a1",
+            "x": 0.0, "y": 0.0,
+            "points": [[0.0, 0.0], [100.0, 0.0]],
+            "startBinding": {"elementId": "r1", "focus": 0.0, "gap": 1.0},
+            "endBinding": {"elementId": "r2", "focus": -0.5, "gap": 2.5},
+        });
+        let el: SketchElement = serde_json::from_value(input).unwrap();
+        let out = serde_json::to_value(&el).unwrap();
+        let sb = out.get("startBinding").unwrap();
+        assert_eq!(sb["elementId"], "r1");
+        assert_eq!(sb["focus"], 0.0);
+        assert_eq!(sb["gap"], 1.0);
+        let eb = out.get("endBinding").unwrap();
+        assert_eq!(eb["elementId"], "r2");
+        assert_eq!(eb["focus"], -0.5);
+        assert_eq!(eb["gap"], 2.5);
+    }
+
+    // ---- EnvGuard: RAII env-var restore (panic-safe) ----
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            Self { saved: Vec::new() }
+        }
+
+        fn set(&mut self, key: &str, value: &str) {
+            if !self.saved.iter().any(|(k, _)| k == key) {
+                self.saved.push((key.to_string(), std::env::var(key).ok()));
+            }
+            std::env::set_var(key, value);
+        }
+
+        fn remove(&mut self, key: &str) {
+            if !self.saved.iter().any(|(k, _)| k == key) {
+                self.saved.push((key.to_string(), std::env::var(key).ok()));
+            }
+            std::env::remove_var(key);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    // ---- McpTestClient: MCP protocol test harness ----
+
+    struct McpTestClient {
+        writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        reader: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        server_task: tokio::task::JoinHandle<Result<(), String>>,
+    }
+
+    impl McpTestClient {
+        async fn start() -> Self {
+            let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+            let (server_read, server_write) = tokio::io::split(server_stream);
+
+            let server_task = tokio::spawn(async move {
+                let server = GroveMcpServer::new();
+                let service = server
+                    .serve((server_read, server_write))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                service.waiting().await.map_err(|e| e.to_string())?;
+                Ok::<(), String>(())
+            });
+
+            let (client_read, writer) = tokio::io::split(client_stream);
+            let reader = BufReader::new(client_read);
+
+            Self {
+                writer,
+                reader,
+                server_task,
+            }
+        }
+
+        async fn send(&mut self, v: serde_json::Value) {
+            let mut s = serde_json::to_string(&v).unwrap();
+            s.push('\n');
+            self.writer.write_all(s.as_bytes()).await.unwrap();
+            self.writer.flush().await.unwrap();
+        }
+
+        async fn recv_for_id(&mut self, id: i64) -> serde_json::Value {
+            loop {
+                let mut line = String::new();
+                let n = self.reader.read_line(&mut line).await.unwrap();
+                assert!(n > 0, "server closed connection");
+                let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+                if v.get("id").and_then(|x| x.as_i64()) == Some(id) {
+                    return v;
+                }
+            }
+        }
+
+        async fn handshake(&mut self) {
+            self.send(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "grove-test", "version": "0"}
+                }
+            }))
+            .await;
+            let init_resp = self.recv_for_id(1).await;
+            assert!(init_resp.get("result").is_some());
+
+            self.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .await;
+        }
+
+        async fn call_tool(
+            &mut self,
+            id: i64,
+            name: &str,
+            args: serde_json::Value,
+        ) -> serde_json::Value {
+            self.send(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": args}
+            }))
+            .await;
+            self.recv_for_id(id).await
+        }
+
+        async fn shutdown(self) {
+            let Self {
+                mut writer,
+                reader,
+                server_task,
+            } = self;
+            writer.shutdown().await.unwrap();
+            drop(writer);
+            drop(reader);
+            tokio::time::timeout(std::time::Duration::from_secs(3), server_task)
+                .await
+                .expect("server did not exit")
+                .expect("server task join failed")
+                .expect("server returned error");
+        }
+    }
+
+    // ---- Test helpers ----
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        p.push(format!("{}-{}-{}", prefix, pid, nanos));
+        p
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git command failed: {:?}", args);
+    }
+
+    fn init_git_repo(repo: &Path) {
+        std::fs::create_dir_all(repo).unwrap();
+        git(repo, &["init"]);
+        git(repo, &["config", "user.email", "test@example.com"]);
+        git(repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), "test").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "init"]);
+    }
+
+    /// Remove git env vars that leak from pre-commit hooks into test subprocesses.
+    fn clear_git_env(env: &mut EnvGuard) {
+        for key in &[
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ] {
+            env.remove(key);
+        }
+    }
+
+    fn with_isolated_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let _guard = test_lock().blocking_lock();
+
+        let temp_home = unique_temp_dir("grove-mcp-home");
+        std::fs::create_dir_all(&temp_home).unwrap();
+
+        let mut env = EnvGuard::new();
+        env.set("HOME", temp_home.to_string_lossy().as_ref());
+        clear_git_env(&mut env);
+
+        let out = f(&temp_home);
+
+        drop(env);
+        let _ = std::fs::remove_dir_all(&temp_home);
+        out
+    }
+
+    // ---- Sync tests ----
+
+    #[test]
+    fn add_project_invalid_path_returns_success_false() {
+        with_isolated_home(|home| {
+            let missing = home.join("does-not-exist");
+            let v = add_project_by_path_json(missing.to_string_lossy().as_ref());
+            assert_eq!(v["success"].as_bool(), Some(false));
+            assert_eq!(v["error"].as_str(), Some("invalid_path"));
+        })
+    }
+
+    #[test]
+    fn add_project_is_idempotent_and_project_id_resolves() {
+        with_isolated_home(|home| {
+            let repo = home.join("repo");
+            init_git_repo(&repo);
+
+            let v1 = add_project_by_path_json(repo.to_string_lossy().as_ref());
+            assert_eq!(v1["success"].as_bool(), Some(true));
+            let project_id = v1["project_id"].as_str().unwrap().to_string();
+            let repo_path = v1["path"].as_str().unwrap().to_string();
+
+            let v2 = add_project_by_path_json(repo.to_string_lossy().as_ref());
+            assert_eq!(v2["success"].as_bool(), Some(true));
+            assert_eq!(v2["project_id"].as_str(), Some(project_id.as_str()));
+
+            let p = load_project_by_id(&project_id)
+                .expect("project should resolve")
+                .expect("project should resolve");
+            assert_eq!(p.path, repo_path);
+        })
+    }
+
+    #[test]
+    fn list_projects_contains_registered_project() {
+        with_isolated_home(|home| {
+            let repo = home.join("repo");
+            init_git_repo(&repo);
+
+            let v = add_project_by_path_json(repo.to_string_lossy().as_ref());
+            let project_id = v["project_id"].as_str().unwrap().to_string();
+
+            let list = list_projects_json(None);
+            assert_eq!(list["success"].as_bool(), Some(true));
+            let projects = list["projects"].as_array().unwrap();
+            assert!(projects
+                .iter()
+                .any(|p| p["project_id"].as_str() == Some(&project_id)));
+        })
+    }
+
+    #[test]
+    fn add_project_non_git_repo_returns_success_false() {
+        with_isolated_home(|home| {
+            let dir = home.join("not-a-repo");
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let v = add_project_by_path_json(dir.to_string_lossy().as_ref());
+            assert_eq!(v["success"].as_bool(), Some(false));
+            assert_eq!(v["error"].as_str(), Some("not_git_repo"));
+        })
+    }
+
+    #[test]
+    fn create_task_unknown_project_returns_success_false() {
+        with_isolated_home(|_home| {
+            let v = create_task_json(&CreateTaskParams {
+                project_id: "deadbeef".to_string(),
+                name: "task".to_string(),
+            });
+            assert_eq!(v["success"].as_bool(), Some(false));
+            assert_eq!(v["error"].as_str(), Some("project_not_found"));
+        })
+    }
+
+    #[test]
+    fn create_task_and_list_tasks_only_returns_active() {
+        with_isolated_home(|home| {
+            let repo = home.join("repo");
+            init_git_repo(&repo);
+
+            let add = add_project_by_path_json(repo.to_string_lossy().as_ref());
+            let project_id = add["project_id"].as_str().unwrap().to_string();
+
+            let created = create_task_json(&CreateTaskParams {
+                project_id: project_id.clone(),
+                name: "MCP Task".to_string(),
+            });
+            assert_eq!(created["success"].as_bool(), Some(true));
+            let task_id = created["task"]["task_id"].as_str().unwrap().to_string();
+            let worktree_path = created["task"]["worktree_path"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(std::path::Path::new(&worktree_path).exists());
+
+            let list = list_tasks_json(&project_id, None);
+            assert_eq!(list["success"].as_bool(), Some(true));
+            let tasks_arr = list["tasks"].as_array().unwrap();
+            assert!(tasks_arr
+                .iter()
+                .any(|t| t["task_id"].as_str() == Some(task_id.as_str())));
+
+            // Archive task and ensure list_tasks_json doesn't include it (active only)
+            tasks::archive_task(&project_id, &task_id).unwrap();
+            let list2 = list_tasks_json(&project_id, None);
+            assert_eq!(list2["success"].as_bool(), Some(true));
+            let tasks_arr2 = list2["tasks"].as_array().unwrap();
+            assert!(!tasks_arr2
+                .iter()
+                .any(|t| t["task_id"].as_str() == Some(task_id.as_str())));
+        })
+    }
+
+    #[test]
+    fn list_projects_query_filters_correctly() {
+        with_isolated_home(|home| {
+            let repo_alpha = home.join("alpha-project");
+            init_git_repo(&repo_alpha);
+            let repo_beta = home.join("beta-service");
+            init_git_repo(&repo_beta);
+
+            add_project_by_path_json(repo_alpha.to_string_lossy().as_ref());
+            add_project_by_path_json(repo_beta.to_string_lossy().as_ref());
+
+            // No filter → both projects
+            let all = list_projects_json(None);
+            assert_eq!(all["projects"].as_array().unwrap().len(), 2);
+
+            // Filter "alpha" → only alpha
+            let filtered = list_projects_json(Some("alpha"));
+            let projects = filtered["projects"].as_array().unwrap();
+            assert_eq!(projects.len(), 1);
+            assert!(projects[0]["path"].as_str().unwrap().contains("alpha"));
+
+            // Case-insensitive: "BETA" → only beta
+            let filtered = list_projects_json(Some("BETA"));
+            let projects = filtered["projects"].as_array().unwrap();
+            assert_eq!(projects.len(), 1);
+            assert!(projects[0]["path"].as_str().unwrap().contains("beta"));
+
+            // No match → empty
+            let filtered = list_projects_json(Some("nonexistent"));
+            assert_eq!(filtered["projects"].as_array().unwrap().len(), 0);
+        })
+    }
+
+    #[test]
+    fn list_tasks_returns_error_for_unknown_project() {
+        with_isolated_home(|_home| {
+            let v = list_tasks_json("nonexistent-hash", None);
+            assert_eq!(v["success"].as_bool(), Some(false));
+            assert_eq!(v["error"].as_str(), Some("project_not_found"));
+        })
+    }
+
+    #[test]
+    fn list_tasks_query_filters_by_name() {
+        with_isolated_home(|home| {
+            let repo = home.join("repo");
+            init_git_repo(&repo);
+
+            let add = add_project_by_path_json(repo.to_string_lossy().as_ref());
+            let project_id = add["project_id"].as_str().unwrap().to_string();
+
+            create_task_json(&CreateTaskParams {
+                project_id: project_id.clone(),
+                name: "Auth Login".to_string(),
+            });
+            create_task_json(&CreateTaskParams {
+                project_id: project_id.clone(),
+                name: "Dashboard UI".to_string(),
+            });
+
+            // No filter → both created tasks plus the auto-created Local task
+            let all = list_tasks_json(&project_id, None);
+            assert_eq!(all["tasks"].as_array().unwrap().len(), 3);
+
+            // Filter "dashboard" → only dashboard task
+            let filtered = list_tasks_json(&project_id, Some("dashboard"));
+            let tasks = filtered["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0]["name"].as_str(), Some("Dashboard UI"));
+
+            // Case-insensitive: "AUTH" → only auth task
+            let filtered = list_tasks_json(&project_id, Some("AUTH"));
+            let tasks = filtered["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0]["name"].as_str(), Some("Auth Login"));
+
+            // No match → empty
+            let filtered = list_tasks_json(&project_id, Some("nonexistent"));
+            assert_eq!(filtered["tasks"].as_array().unwrap().len(), 0);
+        })
+    }
+
+    #[test]
+    fn add_project_from_subdirectory_resolves_to_root() {
+        with_isolated_home(|home| {
+            let repo = home.join("my-repo");
+            init_git_repo(&repo);
+
+            let subdir = repo.join("src").join("lib");
+            std::fs::create_dir_all(&subdir).unwrap();
+
+            // Register via subdirectory path
+            let v = add_project_by_path_json(subdir.to_string_lossy().as_ref());
+            assert_eq!(v["success"].as_bool(), Some(true));
+
+            // Returned path should be repo root, not subdirectory
+            let returned_path = v["path"].as_str().unwrap();
+            assert!(
+                !returned_path.ends_with("src/lib"),
+                "expected repo root, got subdirectory: {}",
+                returned_path
+            );
+
+            // Register via root path → same project_id (idempotent)
+            let v2 = add_project_by_path_json(repo.to_string_lossy().as_ref());
+            assert_eq!(v2["project_id"].as_str(), v["project_id"].as_str());
+        })
+    }
+
+    #[test]
+    fn filter_tools_outside_task_returns_orchestrator_surface() {
+        let _guard = test_lock().blocking_lock();
+
+        let mut env = EnvGuard::new();
+        env.remove("GROVE_TASK_ID");
+        env.remove("GROVE_PROJECT");
+
+        let server = GroveMcpServer::new();
+        let tools = filter_tools(server.tool_router.list_all());
+        let names: HashSet<String> = tools.into_iter().map(|t| t.name.to_string()).collect();
+
+        // Management tools are visible to the orchestrator.
+        for name in [
+            "add_project_by_path",
+            "list_projects",
+            "create_task",
+            "list_tasks",
+            "edit_note",
+            "list_agents",
+            "start_chat",
+            "send_prompt",
+            "chat_status",
+            "list_chats",
+        ] {
+            assert!(
+                names.contains(name),
+                "expected tool '{}' outside task",
+                name
+            );
+        }
+        // In-task tools (including sketch — Studio-worker-exclusive) must NOT appear.
+        for name in [
+            "status",
+            "read_notes",
+            "read_review",
+            "reply_review",
+            "add_comment",
+            "complete_task",
+            "sketch_read_me",
+            "sketch_list",
+            "sketch_read",
+            "sketch_draw",
+        ] {
+            assert!(!names.contains(name), "tool '{}' leaked out of task", name);
+        }
+    }
+
+    #[test]
+    fn filter_tools_inside_task_with_unknown_project_returns_common_only() {
+        let _guard = test_lock().blocking_lock();
+
+        let mut env = EnvGuard::new();
+        env.set("GROVE_TASK_ID", "task-1");
+        env.set("GROVE_PROJECT", "/tmp/unregistered-path");
+
+        let server = GroveMcpServer::new();
+        let tools = filter_tools(server.tool_router.list_all());
+        let names: HashSet<String> = tools.into_iter().map(|t| t.name.to_string()).collect();
+
+        // Only the always-on in-task pair is visible in this degraded state.
+        for name in ["status", "read_notes"] {
+            assert!(names.contains(name), "expected '{}' in unknown state", name);
+        }
+        // Coding-only, Studio-only, and management tools are all hidden.
+        for name in [
+            "read_review",
+            "reply_review",
+            "add_comment",
+            "complete_task",
+            "sketch_read_me",
+            "sketch_list",
+            "sketch_read",
+            "sketch_draw",
+            "add_project_by_path",
+            "list_projects",
+            "create_task",
+            "list_tasks",
+            "edit_note",
+            "list_agents",
+            "start_chat",
+            "send_prompt",
+            "chat_status",
+            "list_chats",
+        ] {
+            assert!(
+                !names.contains(name),
+                "tool '{}' must be hidden when project is unresolved",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn get_instructions_switches_on_task_context() {
+        let _guard = test_lock().blocking_lock();
+
+        // Outside task → management instructions
+        {
+            let mut env = EnvGuard::new();
+            env.remove("GROVE_TASK_ID");
+            env.remove("GROVE_PROJECT");
+            let instr = get_instructions();
+            assert!(
+                instr.contains("Parallel Task Orchestration"),
+                "expected management instructions outside task"
+            );
+        }
+
+        // Inside task with unregistered project → unknown-task instructions
+        {
+            let mut env = EnvGuard::new();
+            env.set("GROVE_TASK_ID", "task-1");
+            env.set("GROVE_PROJECT", "/tmp/unregistered-path");
+            let instr = get_instructions();
+            assert!(
+                instr.contains("Task (unknown type)"),
+                "expected unknown-task instructions when project can't be resolved"
+            );
+        }
+    }
+
+    // ---- Async integration tests ----
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_newline_protocol_smoke_test() {
+        let _guard = test_lock().lock().await;
+
+        let temp_home = unique_temp_dir("grove-mcp-home");
+        std::fs::create_dir_all(&temp_home).unwrap();
+
+        let mut env = EnvGuard::new();
+        env.set("HOME", temp_home.to_string_lossy().as_ref());
+        clear_git_env(&mut env);
+
+        let repo = temp_home.join("repo");
+        init_git_repo(&repo);
+
+        let mut client = McpTestClient::start().await;
+        client.handshake().await;
+
+        let add_resp = client
+            .call_tool(
+                2,
+                "add_project_by_path",
+                json!({"path": repo.to_string_lossy()}),
+            )
+            .await;
+        let add_text = add_resp["result"]["content"][0]["text"].as_str().unwrap();
+        let add_json: serde_json::Value = serde_json::from_str(add_text).unwrap();
+        assert_eq!(add_json["success"].as_bool(), Some(true));
+        let project_id = add_json["project_id"].as_str().unwrap().to_string();
+
+        let create_resp = client
+            .call_tool(
+                3,
+                "create_task",
+                json!({"project_id": project_id, "name": "mcp smoke task"}),
+            )
+            .await;
+        let create_text = create_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let create_json: serde_json::Value = serde_json::from_str(create_text).unwrap();
+        assert_eq!(create_json["success"].as_bool(), Some(true));
+        assert!(create_json["task"]["task_id"].as_str().is_some());
+
+        client.shutdown().await;
+        drop(env);
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_management_tools_rejected_inside_task_context() {
+        let _guard = test_lock().lock().await;
+
+        let temp_home = unique_temp_dir("grove-mcp-home");
+        std::fs::create_dir_all(&temp_home).unwrap();
+
+        let mut env = EnvGuard::new();
+        env.set("HOME", temp_home.to_string_lossy().as_ref());
+        clear_git_env(&mut env);
+
+        let repo = temp_home.join("repo");
+        init_git_repo(&repo);
+
+        env.set("GROVE_TASK_ID", "task-1");
+        env.set("GROVE_PROJECT", repo.to_string_lossy().as_ref());
+
+        fn assert_tool_rejected(resp: &serde_json::Value) {
+            assert!(
+                resp.get("error").is_some(),
+                "expected error, got: {}",
+                serde_json::to_string(resp).unwrap()
+            );
+            let err_json = serde_json::to_string(&resp["error"]).unwrap();
+            assert!(
+                err_json.contains("only available outside a Grove task"),
+                "unexpected error: {err_json}"
+            );
+        }
+
+        let mut client = McpTestClient::start().await;
+        client.handshake().await;
+
+        let resp_2 = client
+            .call_tool(
+                2,
+                "add_project_by_path",
+                json!({"path": repo.to_string_lossy()}),
+            )
+            .await;
+        assert_tool_rejected(&resp_2);
+
+        let resp_3 = client.call_tool(3, "list_projects", json!({})).await;
+        assert_tool_rejected(&resp_3);
+
+        let resp_4 = client
+            .call_tool(
+                4,
+                "create_task",
+                json!({"project_id": "deadbeef", "name": "task"}),
+            )
+            .await;
+        assert_tool_rejected(&resp_4);
+
+        let resp_5 = client
+            .call_tool(5, "list_tasks", json!({"project_id": "deadbeef"}))
+            .await;
+        assert_tool_rejected(&resp_5);
+
+        let resp_6 = client
+            .call_tool(
+                6,
+                "edit_note",
+                json!({"project_id": "deadbeef", "task_id": "t1", "content": "hello"}),
+            )
+            .await;
+        assert_tool_rejected(&resp_6);
+
+        // New ACP management tools should also be rejected inside task context
+        let resp_7 = client.call_tool(7, "list_agents", json!({})).await;
+        assert_tool_rejected(&resp_7);
+
+        let resp_8 = client
+            .call_tool(8, "start_chat", json!({"project_id": "x", "task_id": "y"}))
+            .await;
+        assert_tool_rejected(&resp_8);
+
+        let resp_9 = client
+            .call_tool(
+                9,
+                "send_prompt",
+                json!({"project_id": "x", "task_id": "y", "chat_id": "z", "text": "hi"}),
+            )
+            .await;
+        assert_tool_rejected(&resp_9);
+
+        let resp_10 = client
+            .call_tool(
+                10,
+                "chat_status",
+                json!({"project_id": "x", "task_id": "y", "chat_id": "z"}),
+            )
+            .await;
+        assert_tool_rejected(&resp_10);
+
+        let resp_11 = client
+            .call_tool(11, "list_chats", json!({"project_id": "x", "task_id": "y"}))
+            .await;
+        assert_tool_rejected(&resp_11);
+
+        client.shutdown().await;
+        drop(env);
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_grove_status_returns_full_context() {
+        let _guard = test_lock().lock().await;
+
+        let temp_home = unique_temp_dir("grove-mcp-home");
+        std::fs::create_dir_all(&temp_home).unwrap();
+
+        let mut env = EnvGuard::new();
+        env.set("HOME", temp_home.to_string_lossy().as_ref());
+        clear_git_env(&mut env);
+
+        let repo = temp_home.join("repo");
+        init_git_repo(&repo);
+
+        env.set("GROVE_TASK_ID", "my-task");
+        env.set("GROVE_PROJECT", repo.to_string_lossy().as_ref());
+        env.set("GROVE_TASK_NAME", "My Task");
+        env.set("GROVE_BRANCH", "feature/my-task");
+        env.set("GROVE_TARGET", "main");
+        env.set("GROVE_PROJECT_NAME", "test-project");
+
+        let mut client = McpTestClient::start().await;
+        client.handshake().await;
+
+        // status should return all task context fields
+        let resp = client.call_tool(2, "status", json!({})).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let status: serde_json::Value = serde_json::from_str(text).unwrap();
+
+        assert_eq!(status["in_grove_task"].as_bool(), Some(true));
+        assert_eq!(status["task_id"].as_str(), Some("my-task"));
+        assert_eq!(status["task_name"].as_str(), Some("My Task"));
+        assert_eq!(status["branch"].as_str(), Some("feature/my-task"));
+        assert_eq!(status["target"].as_str(), Some("main"));
+        assert_eq!(status["project"].as_str(), Some("test-project"));
+
+        client.shutdown().await;
+        drop(env);
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_execution_tools_roundtrip() {
+        let _guard = test_lock().lock().await;
+
+        let temp_home = unique_temp_dir("grove-mcp-home");
+        std::fs::create_dir_all(&temp_home).unwrap();
+
+        let mut env = EnvGuard::new();
+        env.set("HOME", temp_home.to_string_lossy().as_ref());
+        clear_git_env(&mut env);
+
+        let repo = temp_home.join("repo");
+        init_git_repo(&repo);
+
+        // Register project — use the canonical path returned by git
+        let add = add_project_by_path_json(repo.to_string_lossy().as_ref());
+        assert_eq!(add["success"].as_bool(), Some(true));
+        let project_id = add["project_id"].as_str().unwrap().to_string();
+        let canonical_repo = add["path"].as_str().unwrap().to_string();
+        let project_key = workspace::project_hash(&canonical_repo);
+
+        let created = create_task_json(&CreateTaskParams {
+            project_id,
+            name: "Roundtrip Task".to_string(),
+        });
+        assert_eq!(created["success"].as_bool(), Some(true));
+        let task_id = created["task"]["task_id"].as_str().unwrap().to_string();
+
+        env.set("GROVE_TASK_ID", &task_id);
+        env.set("GROVE_PROJECT", &canonical_repo);
+
+        let mut client = McpTestClient::start().await;
+        client.handshake().await;
+
+        // --- read_notes: no notes exist → friendly message ---
+        let resp = client.call_tool(2, "read_notes", json!({})).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "No notes yet.");
+
+        // --- read_notes: save notes, then read back ---
+        notes::save_notes(&project_key, &task_id, "Remember to add tests").unwrap();
+        let resp = client.call_tool(3, "read_notes", json!({})).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "Remember to add tests");
+
+        // --- add_comment: project-level → success ---
+        let resp = client
+            .call_tool(
+                4,
+                "add_comment",
+                json!({
+                    "comments": [{"comment_type": "project", "content": "Needs more tests"}]
+                }),
+            )
+            .await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let add_result: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(add_result["created"].as_array().unwrap().len(), 1);
+        let comment_id = add_result["created"][0]["comment_id"].as_u64().unwrap();
+        assert_eq!(add_result["created"][0]["type"].as_str(), Some("project"));
+
+        // --- add_comment: inline missing file_path → error ---
+        let resp = client
+            .call_tool(
+                5,
+                "add_comment",
+                json!({
+                    "comments": [{"comment_type": "inline", "content": "fix this", "start_line": 1}]
+                }),
+            )
+            .await;
+        assert!(
+            resp.get("error").is_some(),
+            "expected error for inline comment without file_path, got: {}",
+            serde_json::to_string(&resp).unwrap()
+        );
+
+        // --- read_review: returns the created comment ---
+        let resp = client.call_tool(6, "read_review", json!({})).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let review: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(review["open_count"].as_u64(), Some(1));
+        assert_eq!(
+            review["comments"][0]["content"].as_str(),
+            Some("Needs more tests")
+        );
+        assert_eq!(review["comments"][0]["type"].as_str(), Some("project"));
+
+        // --- reply_review: reply to existing comment → success ---
+        let resp = client
+            .call_tool(
+                7,
+                "reply_review",
+                json!({
+                    "replies": [{"comment_id": comment_id, "message": "Done, added tests"}]
+                }),
+            )
+            .await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let reply_result: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(reply_result["replies"][0]["success"].as_bool(), Some(true));
+
+        // --- reply_review: empty replies → error ---
+        let resp = client
+            .call_tool(8, "reply_review", json!({"replies": []}))
+            .await;
+        assert!(
+            resp.get("error").is_some(),
+            "expected error for empty replies array"
+        );
+
+        // --- reply_review: nonexistent comment → error ---
+        let resp = client
+            .call_tool(
+                9,
+                "reply_review",
+                json!({"replies": [{"comment_id": 9999, "message": "hello"}]}),
+            )
+            .await;
+        assert!(
+            resp.get("error").is_some(),
+            "expected error for reply to nonexistent comment"
+        );
+
+        client.shutdown().await;
+        drop(env);
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    /// Env vars point to a project/task that was never registered or created.
+    /// Write operations (add_comment, reply_review) must reject with clear errors.
+    /// Read operations (read_notes, read_review) degrade gracefully.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_execution_tools_with_nonexistent_task() {
+        let _guard = test_lock().lock().await;
+
+        let temp_home = unique_temp_dir("grove-mcp-home");
+        std::fs::create_dir_all(&temp_home).unwrap();
+
+        let mut env = EnvGuard::new();
+        env.set("HOME", temp_home.to_string_lossy().as_ref());
+        clear_git_env(&mut env);
+
+        // Point to a directory that exists but was never registered as a project.
+        // GROVE_TASK_ID refers to a task that was never created.
+        let fake_project = temp_home.join("not-a-project");
+        std::fs::create_dir_all(&fake_project).unwrap();
+        env.set("GROVE_TASK_ID", "ghost-task");
+        env.set("GROVE_PROJECT", fake_project.to_string_lossy().as_ref());
+
+        let mut client = McpTestClient::start().await;
+        client.handshake().await;
+
+        fn assert_error_contains(resp: &serde_json::Value, expected: &str) {
+            assert!(
+                resp.get("error").is_some(),
+                "expected error, got: {}",
+                serde_json::to_string(resp).unwrap()
+            );
+            let err_json = serde_json::to_string(&resp["error"]).unwrap();
+            assert!(
+                err_json.contains(expected),
+                "expected error containing '{}', got: {}",
+                expected,
+                err_json
+            );
+        }
+
+        // read_notes: no data on disk → graceful message, not a crash
+        let resp = client.call_tool(2, "read_notes", json!({})).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "No notes yet.");
+
+        // read_review: no data on disk → graceful message
+        let resp = client.call_tool(3, "read_review", json!({})).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "No code review comments yet.");
+
+        // reply_review: project not registered → rejected
+        let resp = client
+            .call_tool(
+                4,
+                "reply_review",
+                json!({"replies": [{"comment_id": 1, "message": "hi"}]}),
+            )
+            .await;
+        assert_error_contains(&resp, "Project not found");
+
+        // add_comment: project not registered → rejected (no orphan data)
+        let resp = client
+            .call_tool(
+                5,
+                "add_comment",
+                json!({
+                    "comments": [{"comment_type": "project", "content": "orphan comment"}]
+                }),
+            )
+            .await;
+        assert_error_contains(&resp, "Project not found");
+
+        // --- Now register project but DON'T create the task ---
+        let repo = temp_home.join("real-repo");
+        init_git_repo(&repo);
+        let add = add_project_by_path_json(repo.to_string_lossy().as_ref());
+        let canonical_repo = add["path"].as_str().unwrap().to_string();
+        env.set("GROVE_PROJECT", &canonical_repo);
+        // GROVE_TASK_ID still points to "ghost-task" which doesn't exist
+
+        // add_comment: project exists but task doesn't → rejected
+        let resp = client
+            .call_tool(
+                6,
+                "add_comment",
+                json!({
+                    "comments": [{"comment_type": "project", "content": "orphan comment"}]
+                }),
+            )
+            .await;
+        assert_error_contains(&resp, "Task not found");
+
+        // reply_review: project exists but task doesn't → rejected
+        let resp = client
+            .call_tool(
+                7,
+                "reply_review",
+                json!({"replies": [{"comment_id": 1, "message": "hi"}]}),
+            )
+            .await;
+        assert_error_contains(&resp, "Task not found");
+
+        client.shutdown().await;
+        drop(env);
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
+
+    /// grove_edit_note: management tool roundtrip — write notes, read back via worker context.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_edit_note_roundtrip() {
+        let _guard = test_lock().lock().await;
+
+        let temp_home = unique_temp_dir("grove-mcp-home");
+        std::fs::create_dir_all(&temp_home).unwrap();
+
+        let mut env = EnvGuard::new();
+        env.set("HOME", temp_home.to_string_lossy().as_ref());
+        clear_git_env(&mut env);
+
+        let repo = temp_home.join("repo");
+        init_git_repo(&repo);
+
+        // --- Management phase: outside task context ---
+        env.remove("GROVE_TASK_ID");
+        env.remove("GROVE_PROJECT");
+
+        // Register project and create task
+        let add = add_project_by_path_json(repo.to_string_lossy().as_ref());
+        assert_eq!(add["success"].as_bool(), Some(true));
+        let project_id = add["project_id"].as_str().unwrap().to_string();
+        let canonical_repo = add["path"].as_str().unwrap().to_string();
+
+        let created = create_task_json(&CreateTaskParams {
+            project_id: project_id.clone(),
+            name: "Note Test Task".to_string(),
+        });
+        assert_eq!(created["success"].as_bool(), Some(true));
+        let task_id = created["task"]["task_id"].as_str().unwrap().to_string();
+
+        let mut client = McpTestClient::start().await;
+        client.handshake().await;
+
+        // edit_note: project not found → error
+        let resp = client
+            .call_tool(
+                2,
+                "edit_note",
+                json!({"project_id": "nonexistent", "task_id": &task_id, "content": "x"}),
+            )
+            .await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let result: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(result["success"].as_bool(), Some(false));
+        assert_eq!(result["error"].as_str(), Some("project_not_found"));
+
+        // edit_note: task not found → error
+        let resp = client
+            .call_tool(
+                3,
+                "edit_note",
+                json!({"project_id": &project_id, "task_id": "ghost", "content": "x"}),
+            )
+            .await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let result: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(result["success"].as_bool(), Some(false));
+        assert_eq!(result["error"].as_str(), Some("task_not_found"));
+
+        // edit_note: success
+        let resp = client
+            .call_tool(
+                4,
+                "edit_note",
+                json!({
+                    "project_id": &project_id,
+                    "task_id": &task_id,
+                    "content": "## Task Spec\nImplement feature X"
+                }),
+            )
+            .await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let result: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(result["success"].as_bool(), Some(true));
+        assert_eq!(result["task_id"].as_str(), Some(task_id.as_str()));
+        assert_eq!(result["content_length"].as_u64(), Some(32));
+
+        client.shutdown().await;
+
+        // --- Worker phase: switch to task context, read back ---
+        env.set("GROVE_TASK_ID", &task_id);
+        env.set("GROVE_PROJECT", &canonical_repo);
+
+        let mut client = McpTestClient::start().await;
+        client.handshake().await;
+
+        let resp = client.call_tool(2, "read_notes", json!({})).await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "## Task Spec\nImplement feature X");
+
+        client.shutdown().await;
+        drop(env);
+        let _ = std::fs::remove_dir_all(&temp_home);
+    }
 }

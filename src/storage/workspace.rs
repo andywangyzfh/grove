@@ -1,25 +1,45 @@
 //! Workspace 数据存储
-//! 管理 ~/.grove/projects/<hash>/project.toml 中的项目元数据
-//!
-//! 目录结构：
-//! ~/.grove/
-//! ├── config.toml           # 全局配置
-//! └── projects/
-//!     └── <hash>/           # 项目路径的 hash
-//!         ├── project.toml  # 项目元数据
-//!         ├── tasks.toml    # 活跃任务
-//!         └── archived.toml # 归档任务
-
-use std::path::PathBuf;
+//! 管理 projects 表中的项目元数据（SQLite）
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{ensure_project_dir, grove_dir};
+use super::grove_dir;
 use crate::error::Result;
 use crate::git;
 
-/// 注册的项目信息（存储在 project.toml）
+/// 项目类型
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectType {
+    /// 代码仓库项目（git 或非 git 目录）
+    #[default]
+    Repo,
+    /// Studio 项目（AI Agent 工作空间，无 git）
+    Studio,
+}
+
+impl ProjectType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ProjectType::Repo => "repo",
+            ProjectType::Studio => "studio",
+        }
+    }
+}
+
+impl std::str::FromStr for ProjectType {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(match s {
+            "studio" => ProjectType::Studio,
+            _ => ProjectType::Repo,
+        })
+    }
+}
+
+/// 注册的项目信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredProject {
     /// 项目名称（目录名）
@@ -28,6 +48,31 @@ pub struct RegisteredProject {
     pub path: String,
     /// 添加时间
     pub added_at: DateTime<Utc>,
+    /// 是否为 git 仓库
+    #[serde(default = "default_is_git_repo")]
+    pub is_git_repo: bool,
+    /// 项目类型
+    #[serde(default)]
+    pub project_type: ProjectType,
+}
+
+fn default_is_git_repo() -> bool {
+    true
+}
+
+/// 展开路径中的 ~ 前缀为 HOME 目录
+pub fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return dirs::home_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return dirs::home_dir()
+            .map(|p| p.join(rest).to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+    }
+    path.to_string()
 }
 
 /// 根据项目路径生成唯一的目录名（hash）
@@ -44,123 +89,309 @@ pub fn project_hash(path: &str) -> String {
     format!("{:016x}", hash)
 }
 
-/// 获取项目的 project.toml 路径
-fn project_file_path(project_hash: &str) -> PathBuf {
-    grove_dir()
-        .join("projects")
-        .join(project_hash)
-        .join("project.toml")
-}
+/// 解析项目路径,处理 worktree 和非 git 目录
+///
+/// - Git repo / worktree → 返回主 repo 的规范化路径
+/// - 非 git 目录 → canonicalize 后直接返回
+fn resolve_project_path(path: &str) -> Result<String> {
+    let expanded = expand_tilde(path);
 
-/// 加载单个项目的元数据
-fn load_project_metadata(project_hash: &str) -> Result<Option<RegisteredProject>> {
-    let path = project_file_path(project_hash);
-
-    if !path.exists() {
-        return Ok(None);
+    // 尝试 git 路径解析
+    if let Ok(repo_root) = git::repo_root(&expanded) {
+        // 如果是 worktree, 返回主 repo 路径
+        return git::get_main_repo_path(&repo_root).or(Ok(repo_root));
     }
 
-    let project: RegisteredProject = super::load_toml(&path)?;
-    Ok(Some(project))
-}
-
-/// 保存项目元数据
-fn save_project_metadata(project_hash: &str, project: &RegisteredProject) -> Result<()> {
-    ensure_project_dir(project_hash)?;
-    let path = project_file_path(project_hash);
-    super::save_toml(&path, project)
-}
-
-/// 解析项目路径,处理 worktree 情况
-///
-/// - 获取 git repo root
-/// - 如果是 worktree,返回主 repo 路径
-/// - 如果是主 repo,返回规范化后的路径
-fn resolve_project_path(path: &str) -> Result<String> {
-    // 获取 repo root(规范化路径)
-    let repo_root = git::repo_root(path)?;
-
-    // 如果是 worktree,返回主 repo 路径;否则返回 repo_root
-    git::get_main_repo_path(&repo_root).or(Ok(repo_root))
+    // 非 git 目录: canonicalize 路径
+    let canonical = std::fs::canonicalize(&expanded)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or(expanded);
+    Ok(canonical)
 }
 
 /// 加载所有注册的项目列表
-/// 通过扫描 ~/.grove/projects/*/project.toml 获取
 pub fn load_projects() -> Result<Vec<RegisteredProject>> {
-    let projects_dir = grove_dir().join("projects");
-
-    if !projects_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut projects = Vec::new();
-
-    for entry in std::fs::read_dir(&projects_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            let project_toml = path.join("project.toml");
-            if project_toml.exists() {
-                if let Ok(content) = std::fs::read_to_string(&project_toml) {
-                    if let Ok(project) = toml::from_str::<RegisteredProject>(&content) {
-                        // 验证项目路径仍然存在
-                        if std::path::Path::new(&project.path).exists() {
-                            projects.push(project);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 按添加时间排序（最近添加的在前）
-    projects.sort_by(|a, b| b.added_at.cmp(&a.added_at));
-
-    // 按路径去重（保留较新的，即排序后的第一个）
-    let mut seen = std::collections::HashSet::new();
-    projects.retain(|p| seen.insert(p.path.clone()));
-
+    let conn = crate::storage::database::connection();
+    let mut stmt = conn.prepare(
+        "SELECT hash, name, path, is_git_repo, added_at, project_type FROM projects ORDER BY added_at DESC",
+    )?;
+    let projects = stmt
+        .query_map(rusqlite::params![], |row| {
+            let name: String = row.get(1)?;
+            let path: String = row.get(2)?;
+            let is_git: bool = row.get(3)?;
+            let added_at_str: String = row.get(4)?;
+            let project_type_str: String = row.get(5)?;
+            let added_at = DateTime::parse_from_rfc3339(&added_at_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            Ok(RegisteredProject {
+                name,
+                path,
+                added_at,
+                is_git_repo: is_git,
+                project_type: project_type_str.parse().unwrap_or_default(),
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
     Ok(projects)
+}
+
+/// 根据 hash 加载单个项目
+pub fn load_project_by_hash(hash: &str) -> Result<Option<RegisteredProject>> {
+    let conn = crate::storage::database::connection();
+    let result = conn.query_row(
+        "SELECT name, path, is_git_repo, added_at, project_type FROM projects WHERE hash = ?1",
+        rusqlite::params![hash],
+        |row| {
+            let name: String = row.get(0)?;
+            let path: String = row.get(1)?;
+            let is_git: bool = row.get(2)?;
+            let added_at_str: String = row.get(3)?;
+            let project_type_str: String = row.get(4)?;
+            let added_at = DateTime::parse_from_rfc3339(&added_at_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            Ok(RegisteredProject {
+                name,
+                path,
+                added_at,
+                is_git_repo: is_git,
+                project_type: project_type_str.parse().unwrap_or_default(),
+            })
+        },
+    );
+    match result {
+        Ok(project) => Ok(Some(project)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// 添加项目
 ///
 /// 自动处理 worktree:如果传入的路径是 worktree,会自动注册主 repo
 pub fn add_project(name: &str, path: &str) -> Result<()> {
-    // 解析项目路径(处理 worktree)
-    let resolved_path = resolve_project_path(path)?;
+    add_project_with_type(name, path, ProjectType::Repo)
+}
+
+/// 启动时调用一次:如果 cwd 处于一个 git 仓库内,把它的 work_dir 注册为 project。
+///
+/// 设计意图:用户在终端 `cd` 进仓库后启动 grove,自动把仓库登记进来。
+/// 这是**启动期**操作 —— 不要在 HTTP handler 里反复调用,因为
+/// `gix::discover` + `add_project` 的"已存在"分支加在一起在大型仓库
+/// 上能跑到 80ms+。
+pub fn auto_register_cwd_if_git_repo() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Ok(repo) = gix::discover(&cwd) else {
+        return;
+    };
+    let Some(work_dir) = repo.work_dir() else {
+        return;
+    };
+    let git_root = work_dir.to_string_lossy().to_string();
+    let name = work_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    // "already registered" 当成成功 —— 我们只需要保证仓库在 DB 里。
+    let _ = add_project(&name, &git_root);
+    // 不论 add_project 走哪条分支(成功 / 已存在),都补一次 Local Task。
+    // 这覆盖老项目升级到 "Local Task at registration" 重构后缺一行的情况;
+    // ensure_local_task 自身幂等,已存在就 no-op。
+    let hash = project_hash(&git_root);
+    let _ = crate::storage::tasks::ensure_local_task(&hash, &git_root, &name);
+}
+
+/// 添加指定类型的项目
+pub fn add_project_with_type(name: &str, path: &str, project_type: ProjectType) -> Result<()> {
+    let resolved_path = if project_type == ProjectType::Studio {
+        // Studio 项目不走 git 路径解析，直接用传入路径
+        path.to_string()
+    } else {
+        resolve_project_path(path)?
+    };
     let hash = project_hash(&resolved_path);
 
+    let conn = crate::storage::database::connection();
+
     // 检查是否已存在
-    if load_project_metadata(&hash)?.is_some() {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM projects WHERE hash = ?1 LIMIT 1",
+            rusqlite::params![&hash],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if exists {
         return Err(crate::error::GroveError::storage(
             "Project already registered",
         ));
     }
 
-    let project = RegisteredProject {
-        name: name.to_string(),
-        path: resolved_path,
-        added_at: Utc::now(),
+    let is_git = if project_type == ProjectType::Studio {
+        false
+    } else {
+        git::repo_root(&resolved_path).is_ok()
     };
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO projects (hash, name, path, is_git_repo, added_at, project_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![&hash, name, &resolved_path, is_git, &now, project_type.as_str()],
+    )?;
+    drop(conn);
 
-    save_project_metadata(&hash, &project)
+    if project_type == ProjectType::Repo {
+        let _ = crate::storage::tasks::ensure_local_task(&hash, &resolved_path, name);
+    }
+
+    Ok(())
 }
 
-/// 删除项目（仅删除元数据，不删除实际目录）
-pub fn remove_project(path: &str) -> Result<()> {
-    let hash = project_hash(path);
-    let project_dir = grove_dir().join("projects").join(&hash);
+/// Upsert 项目元数据
+/// - 如果不存在：创建新记录
+/// - 如果存在：更新 name（保留原 added_at）
+///
+/// 自动处理 worktree:如果传入的路径是 worktree,会自动注册主 repo
+pub fn upsert_project(name: &str, path: &str) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let hash = project_hash(&resolved_path);
 
+    let conn = crate::storage::database::connection();
+
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM projects WHERE hash = ?1 LIMIT 1",
+            rusqlite::params![&hash],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if exists {
+        // 存在 → 更新 name，保留 added_at
+        conn.execute(
+            "UPDATE projects SET name = ?1 WHERE hash = ?2",
+            rusqlite::params![name, &hash],
+        )?;
+    } else {
+        // 不存在 → 新建
+        let is_git = git::repo_root(&resolved_path).is_ok();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO projects (hash, name, path, is_git_repo, added_at, project_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![&hash, name, &resolved_path, is_git, &now, ProjectType::Repo.as_str()],
+        )?;
+    }
+    drop(conn);
+    // Both branches must call ensure_local_task — the existing-project
+    // branch used to skip it on the assumption that a project row
+    // implies a Local Task row, but that's not invariant: legacy DBs
+    // pre-dating the eager-creation refactor could have a project row
+    // without a Local Task. ensure_local_task is idempotent (checks
+    // existence first), so the cost on the common path is one SELECT.
+    let _ = crate::storage::tasks::ensure_local_task(&hash, &resolved_path, name);
+    Ok(())
+}
+
+/// 删除项目（删除数据库记录和相关数据）
+pub fn remove_project(path: &str) -> Result<()> {
+    // Studio projects use virtual paths (studio://name) that cannot be resolved
+    // via git. Use them as-is; the hash matches what was stored at registration.
+    let resolved = if path.starts_with("studio://") {
+        path.to_string()
+    } else {
+        resolve_project_path(path).unwrap_or_else(|_| path.to_string())
+    };
+    let hash = project_hash(&resolved);
+
+    {
+        let conn = crate::storage::database::connection();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM audio_config_project WHERE project_hash = ?1",
+            rusqlite::params![&hash],
+        )?;
+        tx.execute(
+            "DELETE FROM audio_terms WHERE project_hash = ?1",
+            rusqlite::params![&hash],
+        )?;
+
+        // Find affected groups before deleting slots
+        let affected_groups: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT DISTINCT group_id FROM task_group_slots WHERE project_id = ?1")?;
+            let rows = stmt.query_map(rusqlite::params![&hash], |row| row.get::<_, String>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        tx.execute(
+            "DELETE FROM task_group_slots WHERE project_id = ?1",
+            rusqlite::params![&hash],
+        )?;
+
+        // Renumber positions for each affected group
+        for gid in &affected_groups {
+            let slots: Vec<(i64, String, String, Option<String>)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT position, project_id, task_id, target_chat_id \
+                     FROM task_group_slots WHERE group_id = ?1 ORDER BY position",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![gid], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
+            tx.execute(
+                "DELETE FROM task_group_slots WHERE group_id = ?1",
+                rusqlite::params![gid],
+            )?;
+            for (i, (_, proj, task, chat)) in slots.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO task_group_slots (group_id, position, project_id, task_id, target_chat_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![gid, (i + 1) as i64, proj, task, chat],
+                )?;
+            }
+        }
+
+        // 删 tasks + session 等项目作用域行 —— 这些表没有 FK 到 projects,
+        // 不显式删会留下孤儿。session 上有 FK ON DELETE CASCADE,所以
+        // 删它会顺带带走 agent_edge / agent_pending_message。
+        tx.execute(
+            "DELETE FROM session WHERE project = ?1",
+            rusqlite::params![&hash],
+        )?;
+        tx.execute(
+            "DELETE FROM tasks WHERE project = ?1",
+            rusqlite::params![&hash],
+        )?;
+
+        tx.execute(
+            "DELETE FROM projects WHERE hash = ?1",
+            rusqlite::params![&hash],
+        )?;
+        tx.commit()?;
+    }
+
+    // Filesystem cleanup
+    let project_dir = grove_dir().join("projects").join(&hash);
     if project_dir.exists() {
         std::fs::remove_dir_all(&project_dir)?;
     }
 
-    // 同时清理 worktrees 目录
     let worktree_dir = grove_dir().join("worktrees").join(&hash);
     if worktree_dir.exists() {
         std::fs::remove_dir_all(&worktree_dir)?;
+    }
+
+    let studio_dir = grove_dir().join("studios").join(&hash);
+    if studio_dir.exists() {
+        std::fs::remove_dir_all(&studio_dir)?;
     }
 
     Ok(())
@@ -170,38 +401,92 @@ pub fn remove_project(path: &str) -> Result<()> {
 ///
 /// 自动处理 worktree:如果传入的路径是 worktree,会检查主 repo 是否已注册
 pub fn is_project_registered(path: &str) -> Result<bool> {
-    // 解析项目路径(处理 worktree)
     let resolved_path = resolve_project_path(path)?;
     let hash = project_hash(&resolved_path);
-    let project_toml = project_file_path(&hash);
-    Ok(project_toml.exists())
+
+    let conn = crate::storage::database::connection();
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM projects WHERE hash = ?1 LIMIT 1",
+            rusqlite::params![&hash],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    Ok(exists)
 }
 
-/// Upsert 项目元数据
-/// - 如果不存在：创建新记录
-/// - 如果存在：更新 name（保留原 added_at）
-///
-/// 自动处理 worktree:如果传入的路径是 worktree,会自动注册主 repo
-pub fn upsert_project(name: &str, path: &str) -> Result<()> {
-    // 解析项目路径(处理 worktree)
-    let resolved_path = resolve_project_path(path)?;
-    let hash = project_hash(&resolved_path);
+/// 创建 Studio 项目目录结构
+/// 返回创建的项目路径
+pub fn create_studio_project(name: &str) -> Result<String> {
+    // 用名称生成 hash 作为目录名（Studio 没有真实文件系统路径）
+    let virtual_path = format!("studio://{}", name);
+    let hash = project_hash(&virtual_path);
 
-    let project = if let Some(existing) = load_project_metadata(&hash)? {
-        // 存在 → 更新 name，保留 added_at
-        RegisteredProject {
-            name: name.to_string(),
-            path: resolved_path,
-            added_at: existing.added_at,
+    // Check DB first — before touching the filesystem — so we fail fast and
+    // avoid leaving orphaned directories when a project with the same name
+    // already exists.
+    // NOTE: DbGuard holds the global Mutex. It must be dropped before calling
+    // add_project_with_type, which acquires the same Mutex (Mutex is not reentrant).
+    {
+        let conn = crate::storage::database::connection();
+        let already_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM projects WHERE hash = ?1 LIMIT 1",
+                rusqlite::params![&hash],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if already_exists {
+            return Err(crate::error::GroveError::storage(
+                "A Studio project with that name already exists",
+            ));
         }
-    } else {
-        // 不存在 → 新建
-        RegisteredProject {
-            name: name.to_string(),
-            path: resolved_path,
-            added_at: Utc::now(),
-        }
-    };
+    } // DbGuard dropped here — Mutex released before add_project_with_type
 
-    save_project_metadata(&hash, &project)
+    let project_dir = grove_dir().join("studios").join(&hash);
+    std::fs::create_dir_all(project_dir.join("resource"))?;
+
+    // 创建空的 instructions.md
+    let instructions_path = project_dir.join("instructions.md");
+    if !instructions_path.exists() {
+        std::fs::write(&instructions_path, "")?;
+    }
+
+    // 注册到数据库
+    add_project_with_type(name, &virtual_path, ProjectType::Studio)?;
+
+    Ok(virtual_path)
+}
+
+/// 获取 Studio 项目的文件系统目录
+pub fn studio_project_dir(project_path: &str) -> std::path::PathBuf {
+    let hash = project_hash(project_path);
+    grove_dir().join("studios").join(hash)
+}
+
+pub fn rename_project(hash: &str, new_name: &str) -> Result<()> {
+    let conn = crate::storage::database::connection();
+    let changes = conn.execute(
+        "UPDATE projects SET name = ?1 WHERE hash = ?2",
+        rusqlite::params![new_name, hash],
+    )?;
+    if changes == 0 {
+        return Err(crate::error::GroveError::storage("Project not found"));
+    }
+    Ok(())
+}
+
+/// 设置项目的 is_git_repo 标志
+pub fn set_is_git_repo(path: &str, is_git: bool) -> Result<()> {
+    let resolved = resolve_project_path(path).unwrap_or_else(|_| path.to_string());
+    let hash = project_hash(&resolved);
+
+    let conn = crate::storage::database::connection();
+    conn.execute(
+        "UPDATE projects SET is_git_repo = ?1 WHERE hash = ?2",
+        rusqlite::params![is_git, &hash],
+    )?;
+
+    Ok(())
 }

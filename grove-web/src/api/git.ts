@@ -14,18 +14,16 @@ export interface RepoStatusResponse {
   stash_count: number;
   has_conflicts: boolean;
   has_origin: boolean;
+  has_remote: boolean;
 }
 
 export interface BranchDetailInfo {
   name: string;
   is_local: boolean;
   is_current: boolean;
-  last_commit: string | null;
-  ahead: number | null;
-  behind: number | null;
 }
 
-export interface BranchesDetailResponse {
+interface BranchesDetailResponse {
   branches: BranchDetailInfo[];
   current: string;
 }
@@ -37,34 +35,30 @@ export interface RepoCommitEntry {
   time_ago: string;
 }
 
-export interface RepoCommitsResponse {
+interface RepoCommitsResponse {
   commits: RepoCommitEntry[];
 }
 
-export interface GitOpResponse {
+interface GitOpResponse {
   success: boolean;
   message: string;
 }
 
-export interface CheckoutRequest {
+interface CheckoutRequest {
   branch: string;
 }
 
-export interface StashRequest {
-  pop?: boolean;
-}
-
-export interface CreateBranchRequest {
+interface CreateBranchRequest {
   name: string;
   base?: string;
   checkout?: boolean;
 }
 
-export interface RenameBranchRequest {
+interface RenameBranchRequest {
   new_name: string;
 }
 
-export interface CommitRequest {
+interface CommitRequest {
   message: string;
 }
 
@@ -81,16 +75,22 @@ export async function getGitStatus(projectId: string): Promise<RepoStatusRespons
 
 /**
  * Get all branches with details
+ * @param projectId - Project ID
+ * @param remote - Optional remote name ("local", "origin", "upstream", etc.). Defaults to "local".
  */
-export async function getGitBranches(projectId: string): Promise<BranchesDetailResponse> {
-  return apiClient.get<BranchesDetailResponse>(`/api/v1/projects/${projectId}/git/branches`);
+export async function getGitBranches(projectId: string, remote: string = 'local'): Promise<BranchesDetailResponse> {
+  return apiClient.get<BranchesDetailResponse>(`/api/v1/projects/${projectId}/git/branches?remote=${encodeURIComponent(remote)}`);
 }
 
 /**
  * Get recent commits for the repository
  */
-export async function getGitCommits(projectId: string): Promise<RepoCommitsResponse> {
-  return apiClient.get<RepoCommitsResponse>(`/api/v1/projects/${projectId}/git/commits`);
+export async function getGitCommits(projectId: string, options?: { since?: string; limit?: number }): Promise<RepoCommitsResponse> {
+  const params = new URLSearchParams();
+  if (options?.since) params.set('since', options.since);
+  if (options?.limit != null) params.set('limit', String(options.limit));
+  const qs = params.toString();
+  return apiClient.get<RepoCommitsResponse>(`/api/v1/projects/${projectId}/git/commits${qs ? `?${qs}` : ''}`);
 }
 
 /**
@@ -127,16 +127,6 @@ export async function gitPush(projectId: string): Promise<GitOpResponse> {
 export async function gitFetch(projectId: string): Promise<GitOpResponse> {
   return apiClient.post<undefined, GitOpResponse>(
     `/api/v1/projects/${projectId}/git/fetch`
-  );
-}
-
-/**
- * Stash changes
- */
-export async function gitStash(projectId: string, pop: boolean = false): Promise<GitOpResponse> {
-  return apiClient.post<StashRequest, GitOpResponse>(
-    `/api/v1/projects/${projectId}/git/stash`,
-    { pop }
   );
 }
 

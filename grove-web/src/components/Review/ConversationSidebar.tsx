@@ -1,8 +1,12 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { MessageSquare, CheckCircle, RotateCcw, Reply, Send, FileCode, ChevronDown, ChevronRight, Trash2, Maximize2 } from 'lucide-react';
 import type { ReviewCommentEntry } from '../../api/tasks';
 import { AgentAvatar } from './AgentAvatar';
+import { formatAgentDisplay } from './agentDisplay';
 import { CommentDetailModal } from './CommentDetailModal';
+import { useFileMention } from '../../hooks';
+import { FileMentionDropdown } from '../ui';
+import type { MentionItem } from '../../utils/fileMention';
 
 type StatusFilter = 'all' | 'open' | 'resolved' | 'outdated';
 
@@ -18,6 +22,8 @@ interface ConversationSidebarProps {
   onEditComment?: (id: number, content: string) => void;
   onEditReply?: (commentId: number, replyId: number, content: string) => void;
   onDeleteReply?: (commentId: number, replyId: number) => void;
+  onBulkDelete?: (statuses?: string[], authors?: string[]) => void;
+  mentionItems?: MentionItem[] | null;
 }
 
 export function ConversationSidebar({
@@ -32,11 +38,17 @@ export function ConversationSidebar({
   onEditComment,
   onEditReply,
   onDeleteReply,
+  onBulkDelete,
+  mentionItems,
 }: ConversationSidebarProps) {
   const [filter, setFilter] = useState<StatusFilter>('all');
   const [collapsedFiles, setCollapsedFiles] = useState<Set<string>>(new Set());
   const [projectCommentContent, setProjectCommentContent] = useState('');
   const [expandedCommentId, setExpandedCommentId] = useState<number | null>(null);
+  const [cleanupOpen, setCleanupOpen] = useState(false);
+
+  const projectTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const projectMention = useFileMention({ mentionItems: mentionItems ?? null, textareaRef: projectTextareaRef });
 
   // Derive expanded comment from latest comments array so it stays in sync after reply/resolve
   const expandedComment = expandedCommentId !== null
@@ -47,6 +59,18 @@ export function ConversationSidebar({
   const openCount = comments.filter((c) => c.status === 'open').length;
   const resolvedCount = comments.filter((c) => c.status === 'resolved').length;
   const outdatedCount = comments.filter((c) => c.status === 'outdated').length;
+
+  // Agent counts. Key by the RAW agent value (including '' for missing), so a
+  // legitimate agent literally named "Unknown" stays in its own bucket and the
+  // bulk-delete filter can be sent through to the backend untranslated.
+  // Display label converts '' → 'Unknown' at render time.
+  const agentCounts = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const c of comments) {
+      map.set(c.agent, (map.get(c.agent) || 0) + 1);
+    }
+    return map;
+  }, [comments]);
 
   // Filter
   const filtered = useMemo(() => {
@@ -119,6 +143,32 @@ export function ConversationSidebar({
         <MessageSquare style={{ width: 14, height: 14 }} />
         <span>Conversation</span>
         <span className="conv-sidebar-count">{comments.length}</span>
+        {comments.length > 0 && onBulkDelete && (
+          <div style={{ marginLeft: 'auto', position: 'relative' }}>
+            <button
+              className="conv-cleanup-btn"
+              onMouseDown={(e) => {
+                // Prevent the CleanupPanel's outside-click handler from firing first
+                e.stopPropagation();
+              }}
+              onClick={() => setCleanupOpen((v) => !v)}
+              title="Clean up comments"
+            >
+              <Trash2 style={{ width: 13, height: 13 }} />
+            </button>
+            {cleanupOpen && (
+              <CleanupPanel
+                comments={comments}
+                openCount={openCount}
+                resolvedCount={resolvedCount}
+                outdatedCount={outdatedCount}
+                agentCounts={agentCounts}
+                onClose={() => setCleanupOpen(false)}
+                onBulkDelete={onBulkDelete}
+              />
+            )}
+          </div>
+        )}
       </div>
 
       {/* Filter tabs */}
@@ -177,6 +227,7 @@ export function ConversationSidebar({
                 onReply={onReplyComment}
                 onDelete={onDeleteComment}
                 onExpand={() => setExpandedCommentId(comment.id)}
+                mentionItems={mentionItems}
               />
             ))}
           </div>
@@ -215,6 +266,7 @@ export function ConversationSidebar({
                       onReply={onReplyComment}
                       onDelete={onDeleteComment}
                       onExpand={() => setExpandedCommentId(comment.id)}
+                      mentionItems={mentionItems}
                     />
                   ))}
                 </div>
@@ -256,6 +308,7 @@ export function ConversationSidebar({
                       onReply={onReplyComment}
                       onDelete={onDeleteComment}
                       onExpand={() => setExpandedCommentId(comment.id)}
+                      mentionItems={mentionItems}
                     />
                   ))}
                 </div>
@@ -270,15 +323,26 @@ export function ConversationSidebar({
         <div className="conv-sidebar-footer">
           <div className="project-comment-form">
             <textarea
+              ref={projectTextareaRef}
               value={projectCommentContent}
-              onChange={(e) => setProjectCommentContent(e.target.value)}
-              placeholder="Add a project-level comment..."
+              onChange={(e) => { setProjectCommentContent(e.target.value); projectMention.handleChange(); }}
+              placeholder="Add a project-level comment... (type @ to mention files)"
               rows={2}
               onKeyDown={(e) => {
+                if (projectMention.handleKeyDown(e, setProjectCommentContent)) return;
                 if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
                   handleSubmitProjectComment();
                 }
               }}
+            />
+            <FileMentionDropdown
+              items={projectMention.filteredItems}
+              selectedIdx={projectMention.selectedIdx}
+              onSelect={(path) => { const v = projectMention.handleSelect(path); if (v !== null) setProjectCommentContent(v); }}
+              onMouseEnter={projectMention.setSelectedIdx}
+              visible={projectMention.showDropdown}
+              anchorRef={projectTextareaRef}
+              cursorIdx={projectMention.atCharIdx}
             />
             <button
               onClick={handleSubmitProjectComment}
@@ -304,6 +368,7 @@ export function ConversationSidebar({
           onEdit={onEditComment}
           onEditReply={onEditReply}
           onDeleteReply={onDeleteReply}
+          mentionItems={mentionItems}
         />
       )}
     </div>
@@ -318,6 +383,7 @@ function ConversationItem({
   onReply,
   onDelete,
   onExpand,
+  mentionItems,
 }: {
   comment: ReviewCommentEntry;
   onClick: () => void;
@@ -326,9 +392,12 @@ function ConversationItem({
   onReply?: (commentId: number, status: string, message: string) => void;
   onDelete?: (id: number) => void;
   onExpand?: () => void;
+  mentionItems?: MentionItem[] | null;
 }) {
   const [showReplyForm, setShowReplyForm] = useState(false);
   const [replyText, setReplyText] = useState('');
+  const replyTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const replyMention = useFileMention({ mentionItems: mentionItems ?? null, textareaRef: replyTextareaRef });
 
   // Truncate content for preview (show first 3 lines or 120 chars)
   const isLongContent = comment.content.length > 120 || comment.content.split('\n').length > 3;
@@ -390,8 +459,9 @@ function ConversationItem({
   return (
     <div className="conv-item" onClick={onClick}>
       <div className="conv-item-header">
-        <AgentAvatar name={comment.author} size={18} className="conv-item-avatar" />
-        <span className="conv-item-author">{comment.author}</span>
+        <AgentAvatar agent={comment.agent} size={18} className="conv-item-avatar" />
+        <span className="conv-item-author">{formatAgentDisplay(comment.agent, comment.role)}</span>
+        {comment.model && <span className="conv-item-meta" style={{ fontSize: 10, opacity: 0.5 }}>{comment.model}</span>}
         <span className="conv-item-meta" style={{ opacity: 0.6 }}>#{comment.id}</span>
         {locationLabel && <span className="conv-item-meta">{locationLabel}</span>}
         <span
@@ -423,8 +493,8 @@ function ConversationItem({
 
             return (
               <div key={reply.id} className="conv-item-reply">
-                <AgentAvatar name={reply.author} size={14} />
-                <span className="conv-item-reply-author">{reply.author}</span>
+                <AgentAvatar agent={reply.agent} size={14} />
+                <span className="conv-item-reply-author">{formatAgentDisplay(reply.agent, reply.role)}</span>
                 <span className="conv-item-reply-text">{truncatedReply}</span>
               </div>
             );
@@ -500,15 +570,26 @@ function ConversationItem({
       {showReplyForm && (
         <div className="conv-item-reply-form" onClick={(e) => e.stopPropagation()}>
           <textarea
+            ref={replyTextareaRef}
             className="conv-reply-textarea"
             value={replyText}
-            onChange={(e) => setReplyText(e.target.value)}
-            placeholder="Write a reply..."
+            onChange={(e) => { setReplyText(e.target.value); replyMention.handleChange(); }}
+            placeholder="Write a reply... (type @ to mention files)"
             autoFocus
             onKeyDown={(e) => {
+              if (replyMention.handleKeyDown(e, setReplyText)) return;
               if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleSubmitReply();
               if (e.key === 'Escape') { setShowReplyForm(false); setReplyText(''); }
             }}
+          />
+          <FileMentionDropdown
+            items={replyMention.filteredItems}
+            selectedIdx={replyMention.selectedIdx}
+            onSelect={(path) => { const v = replyMention.handleSelect(path); if (v !== null) setReplyText(v); }}
+            onMouseEnter={replyMention.setSelectedIdx}
+            visible={replyMention.showDropdown}
+            anchorRef={replyTextareaRef}
+            cursorIdx={replyMention.atCharIdx}
           />
           <div className="conv-reply-actions">
             <button
@@ -528,6 +609,168 @@ function ConversationItem({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function CleanupPanel({
+  comments,
+  openCount,
+  resolvedCount,
+  outdatedCount,
+  agentCounts,
+  onClose,
+  onBulkDelete,
+}: {
+  comments: ReviewCommentEntry[];
+  openCount: number;
+  resolvedCount: number;
+  outdatedCount: number;
+  agentCounts: Map<string, number>;
+  onClose: () => void;
+  onBulkDelete: (statuses?: string[], authors?: string[]) => void;
+}) {
+  const [checkedStatuses, setCheckedStatuses] = useState<Set<string>>(new Set());
+  const [checkedAuthors, setCheckedAuthors] = useState<Set<string>>(new Set());
+  const [confirming, setConfirming] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // Click outside to close
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
+        onClose();
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [onClose]);
+
+  // Escape to close
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  const toggleStatus = useCallback((s: string) => {
+    setCheckedStatuses((prev) => {
+      const next = new Set(prev);
+      if (next.has(s)) next.delete(s); else next.add(s);
+      return next;
+    });
+    setConfirming(false);
+  }, []);
+
+  const toggleAuthor = useCallback((a: string) => {
+    setCheckedAuthors((prev) => {
+      const next = new Set(prev);
+      if (next.has(a)) next.delete(a); else next.add(a);
+      return next;
+    });
+    setConfirming(false);
+  }, []);
+
+  // Compute affected count (same logic as backend)
+  const affectedCount = useMemo(() => {
+    const noStatuses = checkedStatuses.size === 0;
+    const noAuthors = checkedAuthors.size === 0;
+    if (noStatuses && noAuthors) return comments.length;
+    return comments.filter((c) => {
+      const statusMatch = noStatuses || checkedStatuses.has(c.status);
+      const agentMatch = noAuthors || checkedAuthors.has(c.agent);
+      return statusMatch && agentMatch;
+    }).length;
+  }, [comments, checkedStatuses, checkedAuthors]);
+
+  const isDeleteAll = checkedStatuses.size === 0 && checkedAuthors.size === 0;
+
+  const handleDelete = () => {
+    if (!confirming) {
+      setConfirming(true);
+      return;
+    }
+    const statuses = checkedStatuses.size > 0 ? Array.from(checkedStatuses) : undefined;
+    // checkedAuthors stores raw agent column values (including '' for the
+    // unknown bucket); pass straight through.
+    const authors = checkedAuthors.size > 0 ? Array.from(checkedAuthors) : undefined;
+    onBulkDelete(statuses, authors);
+    onClose();
+  };
+
+  const statusItems: { key: string; label: string; count: number }[] = [
+    { key: 'resolved', label: 'Resolved', count: resolvedCount },
+    { key: 'outdated', label: 'Outdated', count: outdatedCount },
+    { key: 'open', label: 'Open', count: openCount },
+  ].filter((s) => s.count > 0);
+
+  const agentItems = Array.from(agentCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([name, count]) => ({ name, count }));
+
+  return (
+    <div ref={panelRef} className="conv-cleanup-panel" onClick={(e) => e.stopPropagation()}>
+      <div className="conv-cleanup-title">Clean Up Comments</div>
+
+      {statusItems.length > 0 && (
+        <>
+          <div className="conv-cleanup-section-title">STATUS</div>
+          {statusItems.map((s) => (
+            <label key={s.key} className="conv-cleanup-checkbox-item">
+              <input
+                type="checkbox"
+                checked={checkedStatuses.has(s.key)}
+                onChange={() => toggleStatus(s.key)}
+              />
+              <span>{s.label}</span>
+              <span className="conv-cleanup-count">{s.count}</span>
+            </label>
+          ))}
+        </>
+      )}
+
+      {agentItems.length > 0 && (
+        <>
+          <div className="conv-cleanup-section-title" style={statusItems.length > 0 ? { borderTop: '1px solid var(--color-border)', paddingTop: 8, marginTop: 4 } : undefined}>
+            AGENT
+          </div>
+          {agentItems.map((a) => (
+            <label key={a.name || '__unknown__'} className="conv-cleanup-checkbox-item">
+              <input
+                type="checkbox"
+                checked={checkedAuthors.has(a.name)}
+                onChange={() => toggleAuthor(a.name)}
+              />
+              <span>{a.name || 'Unknown'}</span>
+              <span className="conv-cleanup-count">{a.count}</span>
+            </label>
+          ))}
+        </>
+      )}
+
+      <div className="conv-cleanup-footer">
+        <span className="conv-cleanup-affected">
+          {affectedCount === 0
+            ? 'No comments match'
+            : `Affects ${affectedCount} comment${affectedCount !== 1 ? 's' : ''}`}
+        </span>
+        <div className="conv-cleanup-actions">
+          <button className="conv-cleanup-cancel" onClick={onClose}>Cancel</button>
+          <button
+            className={`conv-cleanup-delete ${confirming ? 'confirming' : ''}`}
+            disabled={affectedCount === 0}
+            onClick={handleDelete}
+          >
+            {confirming
+              ? `Confirm Delete (${affectedCount})`
+              : isDeleteAll
+                ? `Delete All (${affectedCount})`
+                : `Delete (${affectedCount})`}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

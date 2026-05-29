@@ -34,14 +34,12 @@ pub fn handle_events(app: &mut App) -> io::Result<bool> {
     for _ in 0..MAX_EVENTS_PER_FRAME {
         // 第一次已经 poll 过了；后续用 0ms poll 排空剩余事件
         match event::read()? {
-            Event::Key(key) => {
-                if key.kind == KeyEventKind::Press {
-                    // 按键不合并：逐个处理以保证操作顺序
-                    if let Some(prev_key) = last_key.take() {
-                        handle_key(app, prev_key);
-                    }
-                    last_key = Some(key);
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // 按键不合并：逐个处理以保证操作顺序
+                if let Some(prev_key) = last_key.take() {
+                    handle_key(app, prev_key);
                 }
+                last_key = Some(key);
             }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollDown => {
@@ -161,6 +159,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // New Project 弹窗
+    if app.dialogs.new_project_dialog.is_some() {
+        handle_new_project_dialog_key(app, key);
+        return;
+    }
+
     // Delete Project 弹窗
     if app.dialogs.delete_project_dialog.is_some() {
         handle_delete_project_dialog_key(app, key);
@@ -229,20 +233,29 @@ fn handle_workspace_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             if let Some(project) = app.workspace.selected_project() {
                 let path = project.path.clone();
-                app.enter_project(&path);
+                if !project.exists {
+                    app.show_toast(
+                        "Project directory is missing. Press 'x' to delete from Grove.".to_string(),
+                    );
+                } else {
+                    app.enter_project(&path);
+                }
             }
         }
 
-        // 功能按键 - 添加项目
+        // 功能按键 - 添加已存在项目
         KeyCode::Char('a') => {
             app.open_add_project_dialog();
         }
 
+        // 功能按键 - 新建项目(创建目录 + 可选 git init + 注册)
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.open_new_project_dialog();
+        }
+
         // 功能按键 - 删除项目
-        KeyCode::Char('x') => {
-            if app.workspace.selected_project().is_some() {
-                app.open_delete_project_dialog();
-            }
+        KeyCode::Char('x') if app.workspace.selected_project().is_some() => {
+            app.open_delete_project_dialog();
         }
 
         // 功能按键 - 搜索
@@ -317,6 +330,14 @@ fn handle_project_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Missing project: 只允许返回 Workspace,其它按键全部禁用
+    if !app.project.exists {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            app.back_to_workspace();
+        }
+        return;
+    }
+
     match key.code {
         // 退出
         KeyCode::Char('q') => app.quit(),
@@ -366,27 +387,21 @@ fn handle_project_key(app: &mut App, key: KeyEvent) {
             if app.project.preview_visible {
                 app.project.preview_sub_tab = PreviewSubTab::Stats;
             } else {
-                app.project.current_tab = ProjectTab::Current;
+                app.project.switch_to_tab(ProjectTab::Active);
             }
         }
         KeyCode::Char('2') => {
             if app.project.preview_visible {
                 app.project.preview_sub_tab = PreviewSubTab::Git;
             } else {
-                app.project.current_tab = ProjectTab::Other;
+                app.project.switch_to_tab(ProjectTab::Archived);
             }
         }
-        KeyCode::Char('3') => {
-            if app.project.preview_visible {
-                app.project.preview_sub_tab = PreviewSubTab::Notes;
-            } else {
-                app.project.current_tab = ProjectTab::Archived;
-            }
+        KeyCode::Char('3') if app.project.preview_visible => {
+            app.project.preview_sub_tab = PreviewSubTab::Notes;
         }
-        KeyCode::Char('4') => {
-            if app.project.preview_visible {
-                app.project.preview_sub_tab = PreviewSubTab::Diff;
-            }
+        KeyCode::Char('4') if app.project.preview_visible => {
+            app.project.preview_sub_tab = PreviewSubTab::Diff;
         }
 
         // Notes 编辑：打开外部编辑器
@@ -408,10 +423,8 @@ fn handle_project_key(app: &mut App, key: KeyEvent) {
         }
 
         // 功能按键 - Enter
-        KeyCode::Enter => {
-            if app.project.current_tab != ProjectTab::Archived {
-                app.enter_worktree();
-            }
+        KeyCode::Enter if app.project.current_tab != ProjectTab::Archived => {
+            app.enter_worktree();
         }
 
         // 功能按键 - Recover (仅 Archived Tab) / Refresh (其他 Tab)
@@ -424,10 +437,8 @@ fn handle_project_key(app: &mut App, key: KeyEvent) {
         }
 
         // 功能按键 - Clean (仅 Archived Tab)
-        KeyCode::Char('x') => {
-            if app.project.current_tab == ProjectTab::Archived {
-                app.start_clean();
-            }
+        KeyCode::Char('x') if app.project.current_tab == ProjectTab::Archived => {
+            app.start_clean();
         }
 
         // 功能按键 - Theme 选择器
@@ -451,10 +462,8 @@ fn handle_project_key(app: &mut App, key: KeyEvent) {
         }
 
         // 功能按键 - Action Palette (非 Archived Tab)
-        KeyCode::Char(' ') => {
-            if app.project.current_tab != ProjectTab::Archived {
-                app.open_action_palette();
-            }
+        KeyCode::Char(' ') if app.project.current_tab != ProjectTab::Archived => {
+            app.open_action_palette();
         }
 
         // 功能按键 - Checkout (在主仓库切换分支)
@@ -629,6 +638,11 @@ fn handle_new_task_dialog_key(app: &mut App, key: KeyEvent) {
             app.close_new_task_dialog();
         }
 
+        // Tab 打开分支选择器
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.new_task_open_branch_selector();
+        }
+
         // 删除字符
         KeyCode::Backspace => {
             app.new_task_delete_char();
@@ -740,6 +754,51 @@ fn handle_add_project_dialog_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// 处理 New Project 弹窗的键盘事件
+fn handle_new_project_dialog_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        // 确认创建
+        KeyCode::Enter => {
+            app.new_project_confirm();
+        }
+
+        // 取消
+        KeyCode::Esc => {
+            app.close_new_project_dialog();
+        }
+
+        // Tab 切换焦点
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.new_project_toggle_focus();
+        }
+
+        // 删除字符
+        KeyCode::Backspace => {
+            app.new_project_delete_char();
+        }
+
+        // Space: 当焦点在复选框时切换,否则当普通字符
+        KeyCode::Char(' ') => {
+            let is_checkbox = matches!(
+                app.dialogs.new_project_dialog.as_ref().map(|d| d.focus),
+                Some(crate::ui::components::new_project_dialog::NewProjectFocus::InitGit)
+            );
+            if is_checkbox {
+                app.new_project_toggle_init_git();
+            } else {
+                app.new_project_input_char(' ');
+            }
+        }
+
+        // 输入字符
+        KeyCode::Char(c) => {
+            app.new_project_input_char(c);
+        }
+
+        _ => {}
+    }
+}
+
 /// 处理 Delete Project 弹窗的键盘事件
 fn handle_delete_project_dialog_key(app: &mut App, key: KeyEvent) {
     match key.code {
@@ -838,6 +897,23 @@ fn handle_config_panel_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('j') | KeyCode::Down => app.config_panel_next(),
             KeyCode::Enter => app.config_panel_confirm(),
             KeyCode::Esc => app.config_panel_back(),
+            _ => {}
+        },
+        ConfigStep::AutoLinkConfig => match key.code {
+            KeyCode::Char('k') | KeyCode::Up => app.config_panel_prev(),
+            KeyCode::Char('j') | KeyCode::Down => app.config_panel_next(),
+            KeyCode::Enter => app.config_panel_confirm(),
+            KeyCode::Esc => app.config_panel_back(),
+            KeyCode::Char('a') => app.config_autolink_add(),
+            KeyCode::Char('e') => app.config_autolink_edit(),
+            KeyCode::Char('d') | KeyCode::Delete => app.config_autolink_delete(),
+            _ => {}
+        },
+        ConfigStep::AutoLinkEdit => match key.code {
+            KeyCode::Enter => app.config_panel_confirm(),
+            KeyCode::Esc => app.config_panel_back(),
+            KeyCode::Backspace => app.config_autolink_delete_char(),
+            KeyCode::Char(c) => app.config_autolink_input_char(c),
             _ => {}
         },
         ConfigStep::McpConfig => match key.code {
@@ -981,6 +1057,7 @@ fn has_active_popup(app: &App) -> bool {
         || app.dialogs.show_new_task_dialog
         || app.ui.show_theme_selector
         || app.dialogs.add_project_dialog.is_some()
+        || app.dialogs.new_project_dialog.is_some()
         || app.dialogs.delete_project_dialog.is_some()
         || app.dialogs.action_palette.is_some()
         || app.dialogs.commit_dialog.is_some()
@@ -1023,7 +1100,13 @@ fn handle_workspace_click(app: &mut App, col: u16, row: u16, is_double: bool) {
         if is_double {
             if let Some(project) = app.workspace.selected_project() {
                 let path = project.path.clone();
-                app.enter_project(&path);
+                if !project.exists {
+                    app.show_toast(
+                        "Project directory is missing. Press 'x' to delete from Grove.".to_string(),
+                    );
+                } else {
+                    app.enter_project(&path);
+                }
             }
         }
     }
@@ -1306,6 +1389,8 @@ fn popup_confirm(app: &mut App) {
         app.create_new_task();
     } else if app.dialogs.add_project_dialog.is_some() {
         app.add_project_confirm();
+    } else if app.dialogs.new_project_dialog.is_some() {
+        app.new_project_confirm();
     } else if app.dialogs.delete_project_dialog.is_some() {
         app.delete_project_confirm();
     } else if app.ui.show_theme_selector {
@@ -1332,6 +1417,8 @@ fn popup_cancel(app: &mut App) {
         app.close_new_task_dialog();
     } else if app.dialogs.add_project_dialog.is_some() {
         app.close_add_project_dialog();
+    } else if app.dialogs.new_project_dialog.is_some() {
+        app.close_new_project_dialog();
     } else if app.dialogs.delete_project_dialog.is_some() {
         app.close_delete_project_dialog();
     } else if app.ui.show_theme_selector {

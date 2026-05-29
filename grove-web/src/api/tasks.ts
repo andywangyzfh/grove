@@ -1,6 +1,8 @@
 // Tasks API client
 
 import { apiClient } from './client';
+import { createStudioFileApi } from './studio-factory';
+import type { StudioFileEntry, StudioWorkDirEntry } from './studio-types';
 
 // ============================================================================
 // Types
@@ -25,38 +27,44 @@ export interface TaskResponse {
   created_at: string;
   updated_at: string;
   path: string;
+  multiplexer: string;
+  enableTerminal: boolean;
+  enableChat: boolean;
+  created_by: string;
+  is_local: boolean;
 }
 
-export interface TaskListResponse {
+interface TaskListResponse {
   tasks: TaskResponse[];
 }
 
-export interface CreateTaskRequest {
+interface CreateTaskRequest {
   name: string;
   target?: string;
   notes?: string;
 }
 
-export type TaskFilter = 'active' | 'archived';
+type TaskFilter = 'active' | 'archived';
 
-export interface NotesResponse {
+interface NotesResponse {
   content: string;
 }
 
-export interface UpdateNotesRequest {
+interface UpdateNotesRequest {
   content: string;
 }
 
-export interface CommitRequest {
+interface CommitRequest {
   message: string;
 }
 
-export interface GitOperationResponse {
+interface GitOperationResponse {
   success: boolean;
   message: string;
+  warning?: string;
 }
 
-export interface DiffFileEntry {
+interface DiffFileEntry {
   path: string;
   status: string; // "A" | "M" | "D" | "R"
   additions: number;
@@ -69,7 +77,7 @@ export interface DiffResponse {
   total_deletions: number;
 }
 
-export interface CommitEntry {
+interface CommitEntry {
   hash: string;
   message: string;
   time_ago: string;
@@ -85,7 +93,9 @@ export interface CommitsResponse {
 export interface CommentReply {
   id: number;
   content: string;
-  author: string;
+  agent: string;
+  model: string;
+  role: string;
   timestamp: string;
 }
 
@@ -93,28 +103,18 @@ export type CommentType = 'inline' | 'file' | 'project';
 
 export interface ReviewCommentEntry {
   id: number;
-  comment_type?: CommentType; // defaults to 'inline' for backward compatibility
+  comment_type?: CommentType; // defaults to 'inline'
   file_path?: string; // optional (None for project-level)
   side?: 'ADD' | 'DELETE'; // optional (None for file/project-level)
   start_line?: number; // optional (None for file/project-level)
   end_line?: number; // optional (None for file/project-level)
   content: string;
-  author: string;
+  agent: string;
+  model: string;
+  role: string;
   timestamp: string;
   status: string; // "open" | "resolved" | "outdated"
   replies: CommentReply[];
-}
-
-/** Build a location key for matching: "file:SIDE:line" */
-export function commentLocationKey(c: ReviewCommentEntry): string {
-  const type = c.comment_type || 'inline';
-  if (type === 'inline' && c.file_path && c.side && c.end_line !== undefined) {
-    return `${c.file_path}:${c.side}:${c.end_line}`;
-  } else if (type === 'file' && c.file_path) {
-    return `file:${c.file_path}`;
-  } else {
-    return `project:${c.id}`;
-  }
 }
 
 export interface ReviewCommentsResponse {
@@ -125,20 +125,14 @@ export interface ReviewCommentsResponse {
   git_user_name?: string;
 }
 
-export interface ReplyCommentRequest {
-  comment_id: number;
-  status: string; // "resolved" | "outdated"
-  message: string;
-}
-
 // Task stats types
-export interface FileEditEntry {
+interface FileEditEntry {
   path: string;
   edit_count: number;
   last_edited: string; // ISO 8601
 }
 
-export interface ActivityEntry {
+interface ActivityEntry {
   hour: string;      // ISO 8601 hour (e.g., "2024-01-15T14:00:00Z")
   buckets: number[]; // 60 minute buckets (index 0 = minute 00, index 59 = minute 59)
   total: number;     // Total edits in this hour
@@ -161,10 +155,12 @@ export interface TaskStatsResponse {
  */
 export async function listTasks(
   projectId: string,
-  filter: TaskFilter = 'active'
+  filter: TaskFilter = 'active',
+  signal?: AbortSignal,
 ): Promise<TaskResponse[]> {
   const response = await apiClient.get<TaskListResponse>(
-    `/api/v1/projects/${projectId}/tasks?filter=${filter}`
+    `/api/v1/projects/${projectId}/tasks?filter=${filter}`,
+    signal,
   );
   return response.tasks;
 }
@@ -172,10 +168,6 @@ export async function listTasks(
 /**
  * Get a single task
  */
-export async function getTask(projectId: string, taskId: string): Promise<TaskResponse> {
-  return apiClient.get<TaskResponse>(`/api/v1/projects/${projectId}/tasks/${taskId}`);
-}
-
 /**
  * Create a new task
  */
@@ -192,6 +184,20 @@ export async function createTask(
 }
 
 /**
+ * Rename a task
+ */
+export async function renameTask(
+  projectId: string,
+  taskId: string,
+  name: string
+): Promise<TaskResponse> {
+  return apiClient.patch<{ name: string }, TaskResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}`,
+    { name }
+  );
+}
+
+/**
  * Archive a task
  */
 export async function archiveTask(
@@ -202,6 +208,68 @@ export async function archiveTask(
   const force = options?.force ?? false;
   return apiClient.post<undefined, TaskResponse>(
     `/api/v1/projects/${projectId}/tasks/${taskId}/archive?force=${force}`
+  );
+}
+
+/**
+ * Activate a task workspace. Fire-and-forget signal that the user has
+ * entered this task's page; backend uses it to attach the file watcher
+ * lazily. Idempotent.
+ */
+export async function activateTask(projectId: string, taskId: string): Promise<void> {
+  await apiClient.post<undefined, void>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/activate`
+  );
+}
+
+// ============================================================================
+// Symbol indexing (cmd+click navigation)
+// ============================================================================
+
+export interface SymbolCandidate {
+  name: string;
+  kind: string;
+  file_path: string;
+  /** 0-indexed line where the identifier begins. */
+  line: number;
+  /** 0-indexed column where the identifier begins. */
+  col: number;
+  /** 0-indexed line where the surrounding declaration ends. */
+  end_line: number;
+  container?: string;
+  language: string;
+}
+
+interface SymbolLookupResponse {
+  candidates: SymbolCandidate[];
+}
+
+/**
+ * Resolve a clicked identifier to its definition(s). Backend ranks
+ * same-file matches first, then by line distance to the click.
+ */
+export async function lookupSymbol(
+  projectId: string,
+  taskId: string,
+  name: string,
+  fromFile?: string,
+  fromLine?: number,
+): Promise<SymbolCandidate[]> {
+  const params = new URLSearchParams({ name });
+  if (fromFile) params.set('from_file', fromFile);
+  if (fromLine !== undefined) params.set('from_line', String(fromLine));
+  const res = await apiClient.get<SymbolLookupResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/symbols/lookup?${params}`,
+  );
+  return res.candidates;
+}
+
+/**
+ * Force a fresh full reindex. Idempotent on success.
+ */
+export async function reindexSymbols(projectId: string, taskId: string): Promise<void> {
+  await apiClient.post<undefined, void>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/symbols/reindex`,
   );
 }
 
@@ -265,7 +333,7 @@ export async function commitTask(
   );
 }
 
-export interface MergeRequest {
+interface MergeRequest {
   method?: "squash" | "merge-commit";
 }
 
@@ -311,22 +379,6 @@ export async function getReviewComments(
 }
 
 /**
- * Reply to a review comment
- */
-export async function replyReviewComment(
-  projectId: string,
-  taskId: string,
-  commentId: number,
-  status: 'resolved' | 'outdated',
-  message: string
-): Promise<ReviewCommentsResponse> {
-  return apiClient.post<ReplyCommentRequest, ReviewCommentsResponse>(
-    `/api/v1/projects/${projectId}/tasks/${taskId}/review`,
-    { comment_id: commentId, status, message }
-  );
-}
-
-/**
  * Get task statistics (file edits, activity)
  */
 export async function getTaskStats(
@@ -350,11 +402,26 @@ export async function resetTask(
   );
 }
 
-export interface FilesResponse {
-  files: string[];
+export interface FileMetadata {
+  path: string;
+  favicon?: string;
 }
 
-export interface RebaseToRequest {
+export interface FilesResponse {
+  files: string[];
+  metadata?: FileMetadata[];
+}
+
+export interface DirEntry {
+  path: string;
+  is_dir: boolean;
+}
+
+interface DirEntriesResponse {
+  entries: DirEntry[];
+}
+
+interface RebaseToRequest {
   target: string;
 }
 
@@ -363,6 +430,12 @@ export interface RebaseToRequest {
  */
 export async function getTaskFiles(projectId: string, taskId: string): Promise<FilesResponse> {
   return apiClient.get<FilesResponse>(`/api/v1/projects/${projectId}/tasks/${taskId}/files`);
+}
+
+export async function getTaskDirEntries(projectId: string, taskId: string, dirPath: string): Promise<DirEntriesResponse> {
+  return apiClient.get<DirEntriesResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/dir-entries?path=${encodeURIComponent(dirPath)}`
+  );
 }
 
 /**
@@ -380,15 +453,330 @@ export async function rebaseToTask(
 }
 
 // ============================================================================
+// Chat Session API (Multi-Chat support)
+// ============================================================================
+
+export interface ChatSessionResponse {
+  id: string;
+  title: string;
+  agent: string;
+  created_at: string;
+  /** Absolute path to this chat's history.jsonl on disk. */
+  history_path: string;
+  /** "acp" (default) or "terminal". Snapshotted at chat creation, immutable. */
+  launch_mode: string;
+}
+
+interface ChatListResponse {
+  chats: ChatSessionResponse[];
+}
+
+interface CreateChatRequest {
+  title?: string;
+  agent?: string;
+}
+
+interface UpdateChatTitleRequest {
+  title: string;
+}
+
+interface UploadChatAttachmentRequest {
+  name: string;
+  mime_type?: string;
+  data: string;
+}
+
+interface UploadChatAttachmentResponse {
+  type: "resource_link";
+  uri: string;
+  name: string;
+  mime_type?: string;
+  size: number;
+}
+
+/**
+ * List all chats for a task
+ */
+export async function listChats(
+  projectId: string,
+  taskId: string
+): Promise<ChatSessionResponse[]> {
+  const response = await apiClient.get<ChatListResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats`
+  );
+  return response.chats;
+}
+
+/**
+ * Create a new chat for a task
+ */
+export async function createChat(
+  projectId: string,
+  taskId: string,
+  title?: string,
+  agent?: string,
+): Promise<ChatSessionResponse> {
+  return apiClient.post<CreateChatRequest, ChatSessionResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats`,
+    { title, agent }
+  );
+}
+
+/**
+ * Update a chat's title
+ */
+export async function updateChatTitle(
+  projectId: string,
+  taskId: string,
+  chatId: string,
+  title: string
+): Promise<ChatSessionResponse> {
+  return apiClient.patch<UpdateChatTitleRequest, ChatSessionResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}`,
+    { title }
+  );
+}
+
+// ── @-mention candidates (agent-graph) ──────────────────────────────────
+
+export interface MentionAgent {
+  name: string;
+  display_name: string;
+  icon_id?: string;
+}
+
+export interface MentionOutgoing {
+  session_id: string;
+  name: string;
+  agent: string;
+  duty?: string;
+}
+
+export interface MentionPendingReply {
+  session_id: string;
+  name: string;
+  agent: string;
+  msg_id: string;
+  body_preview: string;
+}
+
+export interface MentionCandidatesResponse {
+  agents: MentionAgent[];
+  outgoing: MentionOutgoing[];
+  pending_replies: MentionPendingReply[];
+}
+
+/**
+ * Fetch @-mention candidates for the chat composer: agents that can be
+ * spawned, sessions reachable via outgoing edges, and senders waiting on a
+ * reply from this chat.
+ */
+export async function getMentionCandidates(
+  projectId: string,
+  taskId: string,
+  chatId: string,
+): Promise<MentionCandidatesResponse> {
+  return apiClient.get<MentionCandidatesResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/graph/chats/${chatId}/mention-candidates`,
+  );
+}
+
+/**
+ * Send a direct user message to a chat node from the graph popup.
+ * Mirrors what the chat panel send button does, but routed through a
+ * graph-scoped REST endpoint so it works without the chat WS being open.
+ */
+export async function sendGraphChatMessage(
+  projectId: string,
+  taskId: string,
+  chatId: string,
+  text: string,
+): Promise<void> {
+  await apiClient.post<{ text: string }, void>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/graph/chats/${chatId}/message`,
+    { text },
+  );
+}
+
+export interface GraphPendingMessageInfo {
+  from: string;
+  from_name: string;
+  to: string;
+  to_name: string;
+  body_excerpt: string;
+}
+
+export interface GraphNodeResponse {
+  chat_id: string;
+  name: string;
+  agent: string;
+  duty?: string;
+  status: string;
+  pending_in: number;
+  pending_out: number;
+  pending_messages: GraphPendingMessageInfo[];
+}
+
+export interface GraphEdgeResponse {
+  edge_id: number;
+  from: string;
+  to: string;
+  purpose?: string;
+  state: string;
+  pending_message?: GraphPendingMessageInfo;
+}
+
+export interface GraphResponse {
+  nodes: GraphNodeResponse[];
+  edges: GraphEdgeResponse[];
+}
+
+export interface SpawnGraphNodeRequest {
+  from_chat_id?: string | null;
+  agent: string;
+  name: string;
+  duty?: string;
+  purpose?: string;
+}
+
+export interface SpawnGraphNodeResponse {
+  chat_id: string;
+  name: string;
+  duty?: string;
+  agent: string;
+}
+
+export interface AddGraphEdgeRequest {
+  from: string;
+  to: string;
+  duty?: string;
+  purpose?: string;
+}
+
+export async function getTaskGraph(
+  projectId: string,
+  taskId: string,
+): Promise<GraphResponse> {
+  return apiClient.get<GraphResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/graph`,
+  );
+}
+
+export async function spawnGraphNode(
+  projectId: string,
+  taskId: string,
+  body: SpawnGraphNodeRequest,
+): Promise<SpawnGraphNodeResponse> {
+  return apiClient.post<SpawnGraphNodeRequest, SpawnGraphNodeResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/graph/spawn`,
+    body,
+  );
+}
+
+export async function addGraphEdge(
+  projectId: string,
+  taskId: string,
+  body: AddGraphEdgeRequest,
+): Promise<{ edge_id: number }> {
+  return apiClient.post<AddGraphEdgeRequest, { edge_id: number }>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/graph/edges`,
+    body,
+  );
+}
+
+export async function updateGraphChatDuty(
+  projectId: string,
+  taskId: string,
+  chatId: string,
+  duty?: string,
+): Promise<void> {
+  await apiClient.patch<{ duty?: string }, void>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/graph/chats/${chatId}/duty`,
+    { duty },
+  );
+}
+
+export async function updateGraphEdgePurpose(
+  projectId: string,
+  taskId: string,
+  edgeId: number,
+  purpose?: string,
+): Promise<void> {
+  await apiClient.patch<{ purpose?: string }, void>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/graph/edges/${edgeId}`,
+    { purpose },
+  );
+}
+
+export async function deleteGraphEdge(
+  projectId: string,
+  taskId: string,
+  edgeId: number,
+): Promise<void> {
+  await apiClient.delete(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/graph/edges/${edgeId}`,
+  );
+}
+
+export async function remindGraphEdge(
+  projectId: string,
+  taskId: string,
+  edgeId: number,
+): Promise<void> {
+  await apiClient.postNoContent(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/graph/edges/${edgeId}/remind`,
+  );
+}
+
+/**
+ * Fork a chat: 调用后端 ACP `session/fork` 派生新会话,返回新 chat 行
+ */
+export async function forkChat(
+  projectId: string,
+  taskId: string,
+  chatId: string
+): Promise<ChatSessionResponse> {
+  return apiClient.post<Record<string, never>, ChatSessionResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/fork`,
+    {}
+  );
+}
+
+/**
+ * Delete a chat
+ */
+export async function deleteChat(
+  projectId: string,
+  taskId: string,
+  chatId: string
+): Promise<void> {
+  return apiClient.delete(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}`
+  );
+}
+
+export async function uploadChatAttachment(
+  projectId: string,
+  taskId: string,
+  chatId: string,
+  payload: UploadChatAttachmentRequest,
+): Promise<UploadChatAttachmentResponse> {
+  return apiClient.post<UploadChatAttachmentRequest, UploadChatAttachmentResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/attachments`,
+    payload,
+  );
+}
+
+// ============================================================================
 // File Content API (for Monaco Editor)
 // ============================================================================
 
-export interface FileContentResponse {
+interface FileContentResponse {
   content: string;
   path: string;
 }
 
-export interface WriteFileRequest {
+interface WriteFileRequest {
   content: string;
 }
 
@@ -424,24 +812,20 @@ export async function writeFileContent(
 // File System Operations API
 // ============================================================================
 
-export interface FsOperationResponse {
+interface FsOperationResponse {
   success: boolean;
   message: string;
 }
 
-export interface CreateFileRequest {
+interface CreateFileRequest {
   path: string;
   content?: string;
 }
 
-export interface CreateDirectoryRequest {
+interface CreateDirectoryRequest {
   path: string;
 }
 
-export interface CopyFileRequest {
-  source: string;
-  destination: string;
-}
 
 /**
  * Create a new file in a task's worktree
@@ -485,17 +869,193 @@ export async function deleteFileOrDir(
   );
 }
 
+interface MoveFileRequest {
+  source: string;
+  destination: string;
+}
+
 /**
- * Copy a file in a task's worktree
+ * Move or rename a file or directory in a task's worktree
  */
-export async function copyFile(
+export async function moveFileOrDir(
   projectId: string,
   taskId: string,
   source: string,
   destination: string
 ): Promise<FsOperationResponse> {
-  return apiClient.post<CopyFileRequest, FsOperationResponse>(
-    `/api/v1/projects/${projectId}/tasks/${taskId}/fs/copy`,
+  return apiClient.post<MoveFileRequest, FsOperationResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/fs/move`,
     { source, destination }
   );
+}
+
+
+// ============================================================================
+// Chat History & Take Control API (read-only observation mode)
+// ============================================================================
+
+interface SessionMetadata {
+  pid: number;
+  agent_name: string;
+  agent_version: string;
+  available_modes?: [string, string][] | null;
+  current_mode_id?: string | null;
+  available_models?: [string, string][] | null;
+  current_model_id?: string | null;
+  available_thought_levels?: [string, string][] | null;
+  current_thought_level_id?: string | null;
+  thought_level_config_id?: string | null;
+  prompt_capabilities?: {
+    image?: boolean;
+    audio?: boolean;
+    embedded_context?: boolean;
+  } | null;
+  available_commands?: {
+    name: string;
+    description: string;
+    input_hint?: string;
+  }[] | null;
+  current_usage?: {
+    used: number;
+    size: number;
+    cost?: { amount: number; currency: string } | null;
+  } | null;
+}
+
+interface ChatHistoryResponse {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  events: any[];
+  total: number;
+  session: SessionMetadata | null;
+}
+
+interface TakeControlResponse {
+  success: boolean;
+}
+
+/**
+ * Get incremental chat history (for read-only polling mode)
+ */
+export async function getChatHistory(
+  projectId: string,
+  taskId: string,
+  chatId: string,
+  offset: number = 0
+): Promise<ChatHistoryResponse> {
+  return apiClient.get<ChatHistoryResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/history?offset=${offset}`
+  );
+}
+
+/**
+ * Read a file by absolute path (for Plan File rendering)
+ */
+export async function readFile(path: string): Promise<{ path: string; content: string }> {
+  return apiClient.get(`/api/v1/read-file?path=${encodeURIComponent(path)}`);
+}
+
+/**
+ * Take control of a remote session (kill the current owner)
+ */
+export async function takeControl(
+  projectId: string,
+  taskId: string,
+  chatId: string
+): Promise<TakeControlResponse> {
+  return apiClient.post<undefined, TakeControlResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/take-control`
+  );
+}
+
+// ============================================================================
+// Studio Artifacts API
+// ============================================================================
+
+export interface ArtifactFile extends StudioFileEntry {
+  directory: string;
+}
+
+export type ArtifactWorkDirectoryEntry = StudioWorkDirEntry;
+
+export interface ArtifactsResponse {
+  input: ArtifactFile[];
+  output: ArtifactFile[];
+}
+
+export async function listArtifacts(projectId: string, taskId: string): Promise<ArtifactsResponse> {
+  return apiClient.get<ArtifactsResponse>(`/api/v1/projects/${projectId}/tasks/${taskId}/artifacts`);
+}
+
+const artifactApi = (projectId: string, taskId: string) =>
+  createStudioFileApi(`/api/v1/projects/${projectId}/tasks/${taskId}/artifacts`);
+
+export function previewArtifact(projectId: string, taskId: string, dir: string, path: string) {
+  return artifactApi(projectId, taskId).preview(path, { dir });
+}
+
+export function artifactDownloadUrl(projectId: string, taskId: string, dir: string, path: string) {
+  return artifactApi(projectId, taskId).downloadUrl(path, { dir });
+}
+
+export function deleteArtifact(projectId: string, taskId: string, dir: string, path: string) {
+  return artifactApi(projectId, taskId).delete(path, { dir });
+}
+
+export function uploadArtifacts(projectId: string, taskId: string, files: File[]) {
+  return artifactApi(projectId, taskId).upload(files) as Promise<ArtifactFile[]>;
+}
+
+export async function createArtifactLink(
+  projectId: string,
+  taskId: string,
+  payload: { name: string; url: string; description?: string; path?: string },
+): Promise<ArtifactFile> {
+  return apiClient.post<typeof payload, ArtifactFile>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/artifacts/link`,
+    payload,
+  );
+}
+
+export async function updateArtifactLink(
+  projectId: string,
+  taskId: string,
+  oldPath: string,
+  payload: { name: string; url: string; description?: string },
+): Promise<ArtifactFile> {
+  return apiClient.patch<typeof payload, ArtifactFile>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/artifacts/link?path=${encodeURIComponent(oldPath)}`,
+    payload,
+  );
+}
+
+export async function syncArtifactToResource(
+  projectId: string,
+  taskId: string,
+  directory: string,
+  path: string,
+  options?: { force?: boolean; renameTo?: string },
+): Promise<void> {
+  await apiClient.post<
+    { path: string; directory: string; force?: boolean; rename_to?: string },
+    void
+  >(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/artifacts/sync-to-resource`,
+    { path, directory, force: options?.force, rename_to: options?.renameTo },
+  );
+}
+
+export function listArtifactWorkdirs(projectId: string, taskId: string) {
+  return artifactApi(projectId, taskId).listWorkdirs();
+}
+
+export function addArtifactWorkdir(projectId: string, taskId: string, path: string) {
+  return artifactApi(projectId, taskId).addWorkdir(path);
+}
+
+export function deleteArtifactWorkdir(projectId: string, taskId: string, name: string) {
+  return artifactApi(projectId, taskId).deleteWorkdir(name);
+}
+
+export function openArtifactWorkdir(projectId: string, taskId: string, name: string) {
+  return artifactApi(projectId, taskId).openWorkdir(name);
 }

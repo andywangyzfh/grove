@@ -1,0 +1,9638 @@
+import {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  useMemo,
+  useDeferredValue,
+  memo,
+  type CSSProperties,
+} from "react";
+import { createPortal } from "react-dom";
+import { motion, AnimatePresence } from "framer-motion";
+import {
+  MessageSquare,
+  MessageSquarePlus,
+  ChevronLeft,
+  ChevronRight,
+  ChevronDown,
+  Maximize2,
+  Minimize2,
+  Send,
+  Loader2,
+  CheckCircle2,
+  Circle,
+  Brain,
+  ListTodo,
+  Slash,
+  X,
+  ShieldCheck,
+  ShieldX,
+  AlertTriangle,
+  Plus,
+  ListPlus,
+  Trash2,
+  GitFork,
+  Pencil,
+  Square,
+  Paperclip,
+  Mic,
+  Bot,
+  Globe,
+  Terminal,
+  Eye,
+  BookOpen,
+  ArrowDown,
+  Sparkles,
+  Plug,
+  Wrench,
+  ChevronUp,
+  ExternalLink,
+  Bookmark,
+  Search,
+  User,
+  ListChecks,
+} from "lucide-react";
+import { iconUrlForFile } from "../../ui/iconUrl";
+import {
+  Button,
+  ImageLightbox,
+  MarkdownRenderer,
+  VSCodeIcon,
+  FileMentionDropdown,
+  AgentPickerMenuItems,
+} from "../../ui";
+import { agentOptions } from "../../../data/agents";
+import {
+  buildMentionItems,
+  buildStudioMentionItems,
+  filterMentionItems,
+  buildAgentMentionItems,
+} from "../../../utils/fileMention";
+import {
+  buildGroveMetaTag,
+  parseGroveMetaSegments,
+} from "../../../utils/groveMeta";
+import { renderGroveMetaEnvelope } from "./groveMetaRenderers";
+import { FormPill } from "./FormPill";
+import type { AskFormDefinition } from "./formPillTypes";
+import {
+  agentIconComponent,
+  agentIconUrl,
+  usePersonaRegistry,
+} from "../../../utils/agentIcon";
+import type { MentionItem, FilteredMentionItem } from "../../../utils/fileMention";
+import { getMentionCandidates } from "../../../api";
+import { listExtensionTabs, getExtensionStatus } from "../../../api/extension";
+import { useProject } from "../../../context/ProjectContext";
+import { useConfig } from "../../../context/ConfigContext";
+import { usePreviewComments, type PreviewCommentDraft } from "../../../context";
+import { PreviewSearchBar } from "../../Review/PreviewSearchBar";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
+import { useChatSearch } from "./useChatSearch";
+import { useChatPositioning } from "./useChatPositioning";
+import { useACPAvailability } from "./useACPAvailability";
+import { useInitialChatLoad } from "./useInitialChatLoad";
+import { useActiveChatId } from "./useActiveChatId";
+import { useTypewriter } from "./useTypewriter";
+import { listSketches, type SketchMeta } from "../../../api/sketches";
+import { writeLastActiveTab } from "../../../utils/lastActiveTab";
+import { XTerminal } from "../TaskDetail/XTerminal";
+import { sendInputToTerminal } from "../TaskDetail/terminalCache";
+import type { Task } from "../../../data/types";
+import { perfMark } from "../../../perf/marks";
+import { useReportDebugId } from "../../../perf/debugIdsStore";
+import { getApiHost, appendHmacToUrl } from "../../../api/client";
+import { useAgentQuota, useRadioEvents } from "../../../hooks";
+import { AgentQuotaPopover } from "./AgentQuotaPopover";
+import { ContextUsagePill } from "./ContextUsagePill";
+import { TurnUsageMeta } from "./TurnUsageMeta";
+import {
+  quotaBadgePercent,
+  quotaBatteryIcon,
+  quotaHealthColor,
+} from "./quotaColors";
+import {
+  getConfig,
+  listChats,
+  createChat,
+  updateChatTitle,
+  deleteChat,
+  forkChat,
+  uploadChatAttachment,
+  getTaskFiles,
+  getChatHistory,
+  takeControl,
+  readFile,
+  updateNotes,
+} from "../../../api";
+import type { ChatSessionResponse, CustomAgentServer } from "../../../api";
+import { listProjects, getProject, listResources, type ProjectListItem } from "../../../api/projects";
+import { openExternalUrl } from "../../../utils/openExternal";
+import "./task-chat.css";
+
+// ─── Chat draft persistence (localStorage) ────────────────────────────────
+
+const CHAT_DRAFT_PREFIX = "grove:chat-draft:";
+const CHAT_DRAFT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+// Hard cap on persisted draft size. localStorage is shared across the
+// whole origin (~5–10 MB depending on browser); a runaway draft full of
+// pasted screenshots could exhaust quota and silently break the next
+// save. 256 KB easily fits multi-page text + several @file chips.
+const CHAT_DRAFT_MAX_BYTES = 256 * 1024;
+let chatDraftGcDone = false;
+
+function chatDraftKey(chatId: string): string {
+  return `${CHAT_DRAFT_PREFIX}${chatId}`;
+}
+
+function saveChatDraft(chatId: string, html: string): void {
+  if (!chatId) return;
+  try {
+    if (!html) {
+      window.localStorage.removeItem(chatDraftKey(chatId));
+      return;
+    }
+    // Skip persistence for oversized drafts rather than silently
+    // truncating — a partial HTML snapshot would corrupt the inline
+    // chip markup and confuse the editor on next load.
+    if (html.length > CHAT_DRAFT_MAX_BYTES) {
+      return;
+    }
+    window.localStorage.setItem(
+      chatDraftKey(chatId),
+      JSON.stringify({ html, updatedAt: Date.now() }),
+    );
+  } catch {
+    // quota/denied — silently skip
+  }
+}
+
+function loadChatDraft(chatId: string): string {
+  if (!chatId) return "";
+  try {
+    const raw = window.localStorage.getItem(chatDraftKey(chatId));
+    if (!raw) return "";
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.html !== "string") return "";
+    if (Date.now() - parsed.updatedAt > CHAT_DRAFT_MAX_AGE_MS) {
+      window.localStorage.removeItem(chatDraftKey(chatId));
+      return "";
+    }
+    return parsed.html;
+  } catch {
+    return "";
+  }
+}
+
+function clearChatDraft(chatId: string): void {
+  if (!chatId) return;
+  try {
+    window.localStorage.removeItem(chatDraftKey(chatId));
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Sweep stale draft entries on first invocation per page load. Drafts
+ * for deleted chats accumulate forever otherwise (TTL is only checked
+ * on `loadChatDraft`, which never runs for chats that no longer exist
+ * in the UI). Idempotent and best-effort — quota errors swallowed.
+ */
+function gcChatDraftsOnce(): void {
+  if (chatDraftGcDone) return;
+  chatDraftGcDone = true;
+  try {
+    const now = Date.now();
+    const stale: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
+      if (!key || !key.startsWith(CHAT_DRAFT_PREFIX)) continue;
+      const raw = window.localStorage.getItem(key);
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(raw);
+        if (
+          !parsed ||
+          typeof parsed.updatedAt !== "number" ||
+          now - parsed.updatedAt > CHAT_DRAFT_MAX_AGE_MS
+        ) {
+          stale.push(key);
+        }
+      } catch {
+        // Unparsable entry — drop it.
+        stale.push(key);
+      }
+    }
+    for (const key of stale) {
+      window.localStorage.removeItem(key);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+interface TaskChatProps {
+  projectId: string;
+  task: Task;
+  collapsed?: boolean;
+  onExpand?: () => void;
+  onCollapse?: () => void;
+  onConnected?: () => void;
+  onDisconnected?: () => void;
+  fullscreen?: boolean;
+  onToggleFullscreen?: () => void;
+  hideHeader?: boolean;
+  /** Navigate to a file (optionally at a line) in the Review panel.
+   *  Returns whether the file was found and the panel staged — `false`
+   *  lets in-message FileChips fall back to plain markdown rendering. */
+  onNavigateToFile?: (
+    filePath: string,
+    line?: number,
+    mode?: "diff" | "full",
+  ) => Promise<boolean>;
+  /** Called when chat transitions from busy to idle (work completed) */
+  onChatBecameIdle?: () => void;
+  /** Called when the user successfully sends a message */
+  onUserMessageSent?: () => void;
+  /** Called when busy state changes (true = agent working, false = idle) */
+  onBusyStateChange?: (busy: boolean) => void;
+}
+
+type ToolMessage = {
+  type: "tool";
+  id: string;
+  title: string;
+  status: string;
+  content?: string;
+  collapsed: boolean;
+  locations?: { path: string; line?: number }[];
+  /// ACP `tool_call.raw_input` — agent 实际调用工具时的入参 JSON。
+  /// Bash 的 `command`、Grep 的 `pattern`、MCP 的入参等。
+  rawInput?: unknown;
+};
+
+interface PermOption {
+  option_id: string;
+  name: string;
+  kind: string; // "allow_once" | "allow_always" | "reject_once" | "reject_always"
+}
+
+type PermissionMessage = {
+  type: "permission";
+  /** Server-assigned id (ACP tool_call_id). Empty for legacy events. */
+  id: string;
+  description: string;
+  options: PermOption[];
+  resolved?: string; // selected option name when resolved
+};
+
+interface Attachment {
+  type: "image" | "audio" | "resource";
+  data: string; // base64 for image/audio
+  mimeType: string;
+  name: string; // original filename
+  label: string; // display label e.g. "Image #1", "Audio #2", "File #3"
+  previewUrl?: string; // blob URL for image preview
+  uri?: string;
+  size?: number;
+  /** Raw file pending upload — upload is deferred until the prompt is sent */
+  pendingFile?: File;
+}
+
+interface TurnUsageData {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedReadTokens?: number;
+}
+
+type AskFormMessage = {
+  /** Special-case rendering of the `ask_form` MCP tool call: instead of a
+   *  collapsed tool card we show an interactive form (FormPill). The agent
+   *  hits `ask_form` → ACP transports the tool_call event to chat → here we
+   *  detect it and create this message variant; the user fills it and we send
+   *  the markdown answers back through the regular user-prompt channel. */
+  type: "ask_form";
+  /** ACP tool_call id. Stable across tool_call_update events. */
+  id: string;
+  /** Direct passthrough of `tool_call.raw_input`. */
+  definition: AskFormDefinition;
+  /** Set to true locally once the user submits / skips / cancels — the next
+   *  render returns null so the pill disappears. */
+  resolved?: boolean;
+};
+
+type ChatMessage =
+  | {
+      type: "user";
+      content: string;
+      sender?: string;
+      attachments?: Attachment[];
+      terminal?: boolean;
+    }
+  | {
+      type: "assistant";
+      content: string;
+      complete: boolean;
+      /** Per-turn token accounting from the agent's PromptResponse, attached
+       * by the `complete` reducer to the most recent assistant message in
+       * the turn. Absent on streaming messages and on agents that don't
+       * report usage. */
+      usage?: TurnUsageData;
+      /** Wall-clock seconds when grove dispatched the prompt RPC. */
+      startTs?: number;
+      /** Wall-clock seconds when the prompt response arrived. */
+      endTs?: number;
+    }
+  | { type: "thinking"; content: string; collapsed: boolean; complete: boolean }
+  | ToolMessage
+  | AskFormMessage
+  | { type: "system"; content: string }
+  | PermissionMessage
+  | { type: "terminal_output"; chunks: string[]; exitCode?: number | null }
+  | {
+      // ACP -32000 AuthRequired banner. methods 来自 initialize 时 agent 声明
+      // 的 auth_methods 全集 — 每一个渲染成一个登录按钮,用户点哪个就用哪种。
+      // 空数组 = agent 没声明任何方法,显示手动登录提示。
+      type: "auth_required";
+      methods: { id: string; name: string; description?: string }[];
+      agentName: string | null;
+      status: "idle" | "in_progress" | "succeeded" | "failed";
+      // 用户点击的按钮 id;in_progress / succeeded 时用来高亮和显示文案。
+      activeMethodId?: string;
+      errorMessage?: string;
+    };
+
+type ServerEvent = {
+  type: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  [key: string]: any;
+};
+
+interface PlanEntry {
+  content: string;
+  status: string;
+}
+
+interface SlashCommand {
+  name: string;
+  description: string;
+  input_hint?: string;
+}
+
+interface PromptCaps {
+  image: boolean;
+  audio: boolean;
+  embeddedContext: boolean;
+}
+
+type TitleEditSurface = "header" | "sidebar-header" | "sidebar-list";
+
+const AGENT_PICKER_MENU_WIDTH = 192;
+const AGENT_PICKER_MENU_MAX_HEIGHT = 256;
+const AGENT_PICKER_VIEWPORT_MARGIN = 8;
+
+/** Per-chat cached state (preserved across chat switches) */
+interface PerChatState {
+  messages: ChatMessage[];
+  hiddenMessageCount: number;
+  attachmentCounters: AttachmentCounters;
+  isBusy: boolean;
+  selectedModel: string;
+  permissionLevel: string;
+  modelOptions: { label: string; value: string }[];
+  modeOptions: { label: string; value: string }[];
+  /** Thought-level / reasoning-effort selector (0.11 SessionConfigOption) */
+  thoughtLevelOptions: { label: string; value: string }[];
+  thoughtLevel: string;
+  thoughtLevelConfigId: string;
+  planEntries: PlanEntry[];
+  slashCommands: SlashCommand[];
+  isConnected: boolean;
+  agentLabel: string;
+  agentIcon: React.ComponentType<{ size?: number; className?: string }> | null;
+  promptCaps: PromptCaps;
+  /** Agent 是否声明 ACP `session/fork` 能力(`unstable_session_fork`)。
+   * true → 在 chat 菜单的当前 chat 行显示 Fork 按钮。 */
+  forkCapable: boolean;
+  planFilePath: string;
+  planFileContent: string;
+  isRemoteSession: boolean;
+  remoteOwnerName: string;
+  /** Unsent composer draft — innerHTML of the contentEditable input,
+   * preserves text plus any slash/file chips. Restored on chat switch so a
+   * half-typed message isn't lost when the user peeks at another chat. */
+  draftHtml: string;
+  /** Latest ACP usage_update for this chat (null when agent never reported). */
+  contextUsage: {
+    used: number;
+    size: number;
+    cost: { amount: number; currency: string } | null;
+  } | null;
+  /** Pending queue snapshot — kept in cache so chat-tab switches don't
+   * clear queued messages. WS server only re-sends QueueUpdate on reconnect,
+   * not on tab switch (the WS stays alive). */
+  pendingMessages: { id: string; text: string }[];
+}
+
+function defaultPerChatState(): PerChatState {
+  return {
+    messages: [],
+    hiddenMessageCount: 0,
+    attachmentCounters: { image: 0, audio: 0, resource: 0 },
+    isBusy: false,
+    selectedModel: "",
+    permissionLevel: "",
+    modelOptions: [],
+    modeOptions: [],
+    thoughtLevelOptions: [],
+    thoughtLevel: "",
+    thoughtLevelConfigId: "",
+    planEntries: [],
+    slashCommands: [],
+    isConnected: false,
+    agentLabel: "Chat",
+    agentIcon: null,
+    isRemoteSession: false,
+    remoteOwnerName: "",
+    promptCaps: { image: false, audio: false, embeddedContext: false },
+    forkCapable: false,
+    planFilePath: "",
+    planFileContent: "",
+    draftHtml: "",
+    contextUsage: null,
+    pendingMessages: [],
+  };
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result as string;
+      resolve(dataUrl.split(",")[1] ?? "");
+    };
+    reader.onerror = () =>
+      reject(reader.error ?? new Error("Failed to read file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** Convert a `file://` URI (returned by uploadChatAttachment) to an absolute
+ *  local path. Used by terminal launch mode to pipe attachment paths into
+ *  the agent's stdin as `@<path>` references. Returns null for non-file URIs. */
+function fileUrlToPath(uri: string | undefined): string | null {
+  if (!uri || !uri.startsWith("file://")) return null;
+  try {
+    let pathname = decodeURIComponent(new URL(uri).pathname);
+    // Windows: file:///C:/foo → pathname is `/C:/foo` → strip leading slash.
+    if (/^\/[a-zA-Z]:/.test(pathname)) pathname = pathname.slice(1);
+    return pathname;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Render grouping types ───────────────────────────────────────────────────
+
+type ToolSectionItem = { message: ToolMessage; index: number };
+type RenderItem =
+  | { kind: "single"; message: ChatMessage; index: number }
+  | { kind: "tool-section"; sectionId: string; tools: ToolSectionItem[] };
+
+/** Group consecutive tool messages into sections; everything else is a single item */
+function buildRenderItems(messages: ChatMessage[]): RenderItem[] {
+  const items: RenderItem[] = [];
+  let toolBuf: ToolSectionItem[] = [];
+
+  const flush = () => {
+    if (toolBuf.length > 0) {
+      items.push({
+        kind: "tool-section",
+        sectionId: toolBuf[0].message.id,
+        tools: [...toolBuf],
+      });
+      toolBuf = [];
+    }
+  };
+
+  messages.forEach((msg, i) => {
+    if (msg.type === "tool") {
+      toolBuf.push({ message: msg, index: i });
+    } else if (msg.type === "auth_required") {
+      // 不进消息流 — 由 composer panel 统一渲染(同 PermissionRequest)。
+      // 留在 messages 数组里只为方便用 useMemo 派生 activeAuthMessage。
+      flush();
+    } else {
+      flush();
+      items.push({ kind: "single", message: msg, index: i });
+    }
+  });
+  flush();
+  return items;
+}
+
+/** Flatten a render item to a plain text blob for data-layer chat search. */
+function extractRenderItemText(item: RenderItem): string {
+  if (item.kind === "single") {
+    const m = item.message;
+    switch (m.type) {
+      case "user":
+        return [m.sender ?? "", m.content].filter(Boolean).join("\n");
+      case "assistant":
+      case "thinking":
+      case "system":
+        return m.content;
+      case "tool":
+        return [m.title, m.content ?? ""].filter(Boolean).join("\n");
+      case "ask_form":
+        return [
+          m.definition.title,
+          m.definition.description ?? "",
+          ...m.definition.questions.map((q) => q.title),
+        ]
+          .filter(Boolean)
+          .join("\n");
+      case "permission":
+        return m.description;
+      case "terminal_output":
+        return m.chunks.join("");
+      case "auth_required":
+        return [
+          m.agentName ?? "",
+          ...m.methods.map((x) => x.name),
+          "auth required",
+        ]
+          .filter(Boolean)
+          .join("\n");
+    }
+  } else {
+    return item.tools
+      .map((t) => [t.message.title, t.message.content ?? ""].filter(Boolean).join("\n"))
+      .join("\n");
+  }
+}
+
+function getAutoScrollTailSignature(messages: ChatMessage[]): string {
+  const tail = messages.slice(-2);
+  return tail
+    .map((message) => {
+      switch (message.type) {
+        case "assistant":
+          return `assistant:${message.complete ? 1 : 0}:${message.content.length}`;
+        case "thinking":
+          return `thinking:${message.complete ? 1 : 0}:${message.content.length}`;
+        case "tool":
+          return `tool:${message.id}:${message.status}:${(message.content ?? "").length}`;
+        case "ask_form":
+          return `ask_form:${message.id}:${message.resolved ? 1 : 0}`;
+        case "system":
+          return `system:${message.content.length}`;
+        case "permission":
+          return `permission:${message.description}:${message.resolved ?? ""}`;
+        case "terminal_output":
+          return `terminal_output:${message.exitCode ?? ""}:${message.chunks.length}:${message.chunks.reduce((s, c) => s + c.length, 0)}`;
+        case "user":
+          return `user:${message.content.length}:${message.attachments?.length ?? 0}:${message.terminal ? 1 : 0}`;
+        case "auth_required":
+          return `auth_required:${message.status}:${message.activeMethodId ?? ""}:${message.methods.length}`;
+      }
+    })
+    .join("|");
+}
+
+/** Per-type attachment counters. Initialized once from history on chat switch,
+ *  then incremented cheaply on each new attachment. */
+interface AttachmentCounters {
+  image: number;
+  audio: number;
+  resource: number;
+}
+
+function buildAttachmentCounters(messages: ChatMessage[]): AttachmentCounters {
+  const counters: AttachmentCounters = { image: 0, audio: 0, resource: 0 };
+  for (const msg of messages) {
+    if (msg.type === "user" && msg.attachments) {
+      for (const att of msg.attachments) {
+        counters[att.type]++;
+      }
+    }
+  }
+  return counters;
+}
+
+function attachmentLabel(type: "image" | "audio" | "resource", index: number): string {
+  const prefix = type === "image" ? "Image" : type === "audio" ? "Audio" : "File";
+  return `${prefix} #${index}`;
+}
+
+function previewCommentElementLabel(draft: PreviewCommentDraft): string {
+  return `${draft.locator.tagName}${draft.locator.id ? `#${draft.locator.id}` : ""}${draft.locator.className ? `.${draft.locator.className.split(/\s+/).slice(0, 3).join(".")}` : ""}`;
+}
+
+function previewCommentSystemPrompt(draft: PreviewCommentDraft, index: number, total: number): string {
+  const lines = [
+    `Preview comment ${index} of ${total}: address this rendered preview feedback.`,
+    `File: ${draft.filePath}`,
+    `Source: ${draft.source}`,
+    `Renderer: ${draft.rendererId}`,
+    `Element: ${previewCommentElementLabel(draft)}`,
+  ];
+  if (draft.locator.selector) lines.push(`CSS selector: ${draft.locator.selector}`);
+  if (draft.locator.xpath) lines.push(`XPath: ${draft.locator.xpath}`);
+  if (draft.locator.text) lines.push(`Visible text: ${draft.locator.text}`);
+  if (draft.locator.html) lines.push(`HTML snippet: ${draft.locator.html}`);
+  lines.push(`Comment: ${draft.comment}`);
+  return lines.join("\n");
+}
+
+function formatPreviewCommentPrompt(comments: PreviewCommentDraft[]): string {
+  const total = comments.length;
+  const tags = comments.map((draft, idx) =>
+    buildGroveMetaTag(
+      "preview_comment",
+      {
+        index: idx + 1,
+        total,
+        source: draft.source,
+        filePath: draft.filePath,
+        fileName: draft.fileName,
+        rendererId: draft.rendererId,
+        locator: draft.locator as unknown as Record<string, unknown>,
+        comment: draft.comment,
+      },
+      previewCommentSystemPrompt(draft, idx + 1, total),
+    ),
+  );
+
+  return [
+    "Please address these preview comments.",
+    "",
+    ...tags,
+  ].join("\n").trim();
+}
+
+/** Mark all incomplete thinking messages as complete and auto-collapse them */
+/**
+ * Merge locations from a tool_call/tool_call_update into existing ones,
+ * de-duped by (path, line). Preserves insertion order so early-discovered
+ * locations stay on top.
+ */
+function mergeLocations(
+  existing: { path: string; line?: number }[] | undefined,
+  incoming: { path: string; line?: number }[] | undefined,
+): { path: string; line?: number }[] | undefined {
+  if (!incoming || incoming.length === 0) return existing;
+  const base = existing ?? [];
+  const out = [...base];
+  for (const loc of incoming) {
+    if (!out.some((e) => e.path === loc.path && e.line === loc.line)) {
+      out.push(loc);
+    }
+  }
+  return out;
+}
+
+function completeThinking(messages: ChatMessage[]): ChatMessage[] {
+  let changed = false;
+  const result = messages.map((m) => {
+    if (m.type === "thinking" && !m.complete) {
+      changed = true;
+      return { ...m, complete: true, collapsed: true };
+    }
+    return m;
+  });
+  return changed ? result : messages;
+}
+
+function appendSystemMessage(
+  messages: ChatMessage[],
+  content: string,
+): ChatMessage[] {
+  const last = messages[messages.length - 1];
+  if (last?.type === "system" && last.content === content) return messages;
+  return [...messages, { type: "system", content }];
+}
+
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5 MB — Claude API limit
+const MAX_IMAGE_DIMENSION = 2048;
+
+/** Resize + compress an image blob to JPEG via Canvas. Reduces dimensions first,
+ *  then lowers JPEG quality in steps until the result fits within MAX_IMAGE_BYTES. */
+async function compressImageViaCanvas(source: File | Blob): Promise<Blob> {
+  const objectUrl = URL.createObjectURL(source);
+  const img = new Image();
+  img.src = objectUrl;
+  await img.decode();
+  URL.revokeObjectURL(objectUrl);
+
+  let w = img.naturalWidth;
+  let h = img.naturalHeight;
+  if (w > MAX_IMAGE_DIMENSION || h > MAX_IMAGE_DIMENSION) {
+    const ratio = Math.min(MAX_IMAGE_DIMENSION / w, MAX_IMAGE_DIMENSION / h);
+    w = Math.round(w * ratio);
+    h = Math.round(h * ratio);
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  canvas.getContext("2d")!.drawImage(img, 0, 0, w, h);
+
+  let quality = 0.85;
+  let blob: Blob | null = null;
+  while (quality >= 0.3) {
+    blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, "image/jpeg", quality),
+    );
+    if (!blob || blob.size <= MAX_IMAGE_BYTES) break;
+    quality -= 0.1;
+  }
+  if (!blob) throw new Error("Canvas compression failed");
+  return blob;
+}
+
+type ChatRenderWindowSettings = {
+  limit: number;
+  trigger: number;
+};
+
+function normalizeChatRenderWindowSettings(
+  limit?: number,
+  trigger?: number,
+): ChatRenderWindowSettings {
+  const normalizedLimit = Number.isFinite(limit)
+    ? Math.max(0, Math.floor(limit ?? 0))
+    : 0;
+  const normalizedTrigger = Number.isFinite(trigger)
+    ? Math.max(0, Math.floor(trigger ?? 0))
+    : 0;
+
+  if (normalizedLimit === 0) {
+    return {
+      limit: 0,
+      trigger: normalizedTrigger || 1500,
+    };
+  }
+
+  return {
+    limit: normalizedLimit,
+    trigger:
+      normalizedTrigger > normalizedLimit
+        ? normalizedTrigger
+        : normalizedLimit + 500,
+  };
+}
+
+function pruneChatViewMessages(
+  messages: ChatMessage[],
+  hiddenMessageCount: number,
+  settings: ChatRenderWindowSettings,
+): { messages: ChatMessage[]; hiddenMessageCount: number; pruned: boolean } {
+  if (
+    settings.limit <= 0 ||
+    settings.trigger <= settings.limit ||
+    messages.length < settings.trigger
+  ) {
+    return { messages, hiddenMessageCount, pruned: false };
+  }
+
+  const removeCount = messages.length - settings.limit;
+  if (removeCount <= 0) {
+    return { messages, hiddenMessageCount, pruned: false };
+  }
+
+  return {
+    messages: messages.slice(removeCount),
+    hiddenMessageCount: hiddenMessageCount + removeCount,
+    pruned: true,
+  };
+}
+
+function buildDefaultSessionTitle() {
+  const now = new Date();
+  const pad = (value: number) => value.toString().padStart(2, "0");
+  return `New Session ${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}
+
+function OverflowTitle({
+  text,
+  className = "",
+}: {
+  text: string;
+  className?: string;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [hovered, setHovered] = useState(false);
+  const [shift, setShift] = useState(0);
+
+  const measure = useCallback(() => {
+    const container = containerRef.current;
+    const content = contentRef.current;
+    if (!container || !content) return;
+    const overflow = Math.max(0, content.scrollWidth - container.clientWidth);
+    setShift(overflow);
+  }, []);
+
+  useEffect(() => {
+    if (typeof ResizeObserver === "undefined") {
+      measure();
+      window.addEventListener("resize", measure);
+      return () => window.removeEventListener("resize", measure);
+    }
+
+    const container = containerRef.current;
+    const content = contentRef.current;
+    if (!container || !content) return;
+
+    const observer = new ResizeObserver(() => {
+      measure();
+    });
+
+    measure();
+    observer.observe(container);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [measure, text]);
+
+  const shouldAnimate = hovered && shift > 8;
+  const style: (CSSProperties & { "--overflow-shift"?: string }) | undefined =
+    shouldAnimate ? { "--overflow-shift": `-${shift}px` } : undefined;
+
+  return (
+    <div
+      ref={containerRef}
+      className={`min-w-0 overflow-hidden whitespace-nowrap ${className}`}
+      title={text}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
+      <div
+        ref={contentRef}
+        style={style}
+        className={
+          shouldAnimate
+            ? "overflow-title-animate inline-block whitespace-nowrap"
+            : "truncate"
+        }
+      >
+        {text}
+      </div>
+    </div>
+  );
+}
+
+function InlineEditTitle({
+  value,
+  onChange,
+  onSave,
+  onCancel,
+  className,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onSave: () => void;
+  onCancel: () => void;
+  className: string;
+}) {
+  return (
+    <input
+      autoFocus
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      onBlur={onSave}
+      onKeyDown={(e) => {
+        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+        if (e.key === "Enter") onSave();
+        if (e.key === "Escape") onCancel();
+      }}
+      className={className}
+    />
+  );
+}
+
+function resolveLatestPendingPermission(
+  messages: ChatMessage[],
+  optionId: string,
+  fallbackResolvedName: string,
+  /**
+   * Request id (ACP tool_call_id). When present, exactly target the matching
+   * permission so concurrent / out-of-order responses can't accidentally close
+   * an unrelated dialog. Falls back to FIFO matching when empty (legacy
+   * history events without ids).
+   */
+  requestId?: string,
+): ChatMessage[] {
+  let targetIndex = -1;
+
+  if (requestId) {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i];
+      if (message.type !== "permission" || message.resolved) continue;
+      if (message.id === requestId) {
+        targetIndex = i;
+        break;
+      }
+    }
+    if (targetIndex === -1) return messages;
+  } else {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i];
+      if (message.type !== "permission" || message.resolved) continue;
+      if (message.options.some((option) => option.option_id === optionId)) {
+        targetIndex = i;
+        break;
+      }
+      if (targetIndex === -1) {
+        targetIndex = i;
+      }
+    }
+  }
+
+  return messages.map((message, index) =>
+    index === targetIndex && message.type === "permission"
+      ? {
+          ...message,
+          resolved:
+            message.options.find((option) => option.option_id === optionId)
+              ?.name ?? fallbackResolvedName,
+        }
+      : message,
+  );
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Create a non-editable command chip DOM element */
+function createCommandChip(name: string): HTMLSpanElement {
+  const chip = document.createElement("span");
+  chip.contentEditable = "false";
+  chip.dataset.command = name;
+  chip.style.cssText =
+    "display:inline-flex;align-items:center;gap:4px;padding:1px 6px;border-radius:4px;" +
+    "background:color-mix(in srgb,var(--color-highlight) 15%,transparent);" +
+    "border:1px solid color-mix(in srgb,var(--color-highlight) 30%,transparent);" +
+    "font-size:12px;font-weight:500;color:var(--color-highlight);" +
+    "margin:0 2px;user-select:none;vertical-align:baseline;line-height:1.5;";
+
+  const label = document.createElement("span");
+  label.textContent = `/${name}`;
+  chip.appendChild(label);
+
+  const closeBtn = document.createElement("span");
+  closeBtn.dataset.chipClose = "true";
+  closeBtn.textContent = "\u00d7";
+  closeBtn.style.cssText =
+    "margin-left:2px;cursor:pointer;opacity:0.6;font-size:13px;line-height:1;";
+  chip.appendChild(closeBtn);
+
+  return chip;
+}
+
+/** Create a non-editable file chip DOM element */
+function createFileChip(
+  filePath: string,
+  isDir = false,
+  displayLabel?: string,
+  category?: string,
+  favIconUrl?: string,
+): HTMLSpanElement {
+  const chip = document.createElement("span");
+  chip.contentEditable = "false";
+  chip.dataset.file = filePath;
+  if (displayLabel) chip.dataset.label = displayLabel;
+  if (category) chip.dataset.category = category;
+  chip.title = filePath;
+  // Pill-style chip: neutral background + highlight text, matching the
+  // FileChip used in MarkdownRenderer for visual consistency.
+  chip.style.cssText =
+    "display:inline-flex;align-items:center;gap:4px;padding:1px 8px;border-radius:9999px;" +
+    "background:color-mix(in srgb,var(--color-bg-secondary) 80%,var(--color-bg));" +
+    "border:1px solid color-mix(in srgb,var(--color-border) 65%,transparent);" +
+    "font-size:12px;font-weight:500;color:var(--color-highlight);" +
+    "margin:0 2px;user-select:none;vertical-align:baseline;line-height:1.5;";
+
+  const isLink = filePath.toLowerCase().endsWith(".link.json");
+  const baseName = filePath.split("/").filter(Boolean).pop() || "";
+
+  if (category === "Sketch") {
+    // Render Lucide Palette icon in SVG for visual consistency and premium look!
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("width", "13");
+    svg.setAttribute("height", "13");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2.5");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.style.cssText = "display:inline-block;vertical-align:middle;flex-shrink:0;";
+    svg.innerHTML = '<path d="M12 22C17.5228 22 22 17.5228 22 12C22 9.27457 20.8967 6.80675 19.1022 5.01218C18.2562 4.16622 17.2163 3.48624 16.068 3.0182C15.0084 2.58616 13.8341 2.30232 12.593 2.08311C12.2023 2.0141 11.817 2.29631 11.7981 2.6923C11.7644 3.39864 11.4589 4.09345 10.9255 4.62689C10.2224 5.33002 9.21556 5.65655 8.24357 5.51268C7.8485 5.4542 7.47271 5.71961 7.4287 6.11902C7.30403 7.25055 6.85223 8.35825 6.09633 9.22213C5.5564 9.83918 4.8213 10.222 4.02058 10.3168C3.62648 10.3635 3.32356 10.6868 3.32043 11.0857C3.3106 12.3332 3.52458 13.5676 3.9482 14.716C4.4172 15.9877 5.16335 17.1472 6.13682 18.1207C8.7562 20.74 12 22 12 22Z"/><circle cx="7.5" cy="10.5" r="1"/><circle cx="11.5" cy="7.5" r="1"/><circle cx="16.5" cy="9.5" r="1"/><circle cx="15.5" cy="14.5" r="1"/>';
+    chip.appendChild(svg);
+  } else {
+    // Material file icon via shared resolver (same matcher as <VSCodeIcon>).
+    // `.link.json` is grove's worktree-link sentinel; render it as a plain JSON
+    // so the chip reads as "linked file" rather than the generic JSON-anything.
+    const iconUrl = isLink
+      ? iconUrlForFile("link.json")
+      : iconUrlForFile(baseName, { isFolder: isDir });
+
+    const img = document.createElement("img");
+    img.src = favIconUrl || iconUrl;
+    img.alt = "";
+    img.width = 13;
+    img.height = 13;
+    img.style.cssText =
+      "display:inline-block;vertical-align:middle;flex-shrink:0;";
+    if (favIconUrl) {
+      img.style.borderRadius = "2px";
+      img.style.objectFit = "contain";
+      img.onerror = () => {
+        img.src = iconUrl;
+        img.onerror = () => {
+          img.style.display = "none";
+        };
+        img.style.borderRadius = "0";
+      };
+    } else {
+      // Hide the broken-image glyph if the CDN is blocked / offline.
+      // The chip's text label is still meaningful without the icon.
+      img.onerror = () => {
+        img.style.display = "none";
+      };
+    }
+    chip.appendChild(img);
+  }
+
+  const label = document.createElement("span");
+  const text = displayLabel || (isDir ? filePath : filePath.split("/").pop() || filePath);
+  const MAX_CHIP_TITLE = 40;
+  label.textContent = text.length > MAX_CHIP_TITLE ? `${text.slice(0, MAX_CHIP_TITLE).trimEnd()}…` : text;
+  label.style.cssText = "max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+  chip.appendChild(label);
+
+  const closeBtn = document.createElement("span");
+  closeBtn.dataset.chipClose = "true";
+  closeBtn.textContent = "\u00d7";
+  closeBtn.style.cssText =
+    "margin-left:2px;cursor:pointer;opacity:0.6;font-size:13px;line-height:1;color:var(--color-highlight);";
+  chip.appendChild(closeBtn);
+
+  return chip;
+}
+
+/** Create a dynamic browser tab mention pill DOM element.
+ *
+ * `tabId` is the Chrome tab id (when known); stored on the chip so that
+ * `getPromptFromEditable` can serialize it into a `<grove-meta>` envelope —
+ * giving downstream agents enough info to drive the tab via the
+ * `grove_browser_*` MCP tools.
+ */
+function createBrowserTabChip(url: string, title: string, tabId?: number): HTMLSpanElement {
+  const chip = document.createElement("span");
+  chip.contentEditable = "false";
+  chip.dataset.mentionKind = "browsertabs";
+  chip.dataset.tabUrl = url;
+  chip.dataset.tabTitle = title;
+  if (typeof tabId === "number" && Number.isFinite(tabId)) {
+    chip.dataset.tabId = String(tabId);
+  }
+  chip.title = `${title} (${url})`;
+
+  chip.style.cssText =
+    "display:inline-flex;align-items:center;gap:4px;padding:1px 8px;border-radius:9999px;" +
+    "background:color-mix(in srgb,var(--color-bg-secondary) 80%,var(--color-bg));" +
+    "border:1px solid color-mix(in srgb,var(--color-border) 65%,transparent);" +
+    "font-size:12px;font-weight:500;color:var(--color-accent);" +
+    "margin:0 2px;user-select:none;vertical-align:baseline;line-height:1.5;";
+
+  let faviconUrl = "";
+  try {
+    const domain = new URL(url).hostname;
+    faviconUrl = `https://www.google.com/s2/favicons?sz=32&domain=${domain}`;
+  } catch {
+    // Bad URL — leave favicon empty; the chip stays readable without an icon.
+  }
+
+  if (faviconUrl) {
+    const img = document.createElement("img");
+    img.src = faviconUrl;
+    img.alt = "";
+    img.width = 13;
+    img.height = 13;
+    img.style.cssText =
+      "display:inline-block;vertical-align:middle;flex-shrink:0;border-radius:2px;";
+    img.onerror = () => {
+      img.style.display = "none";
+    };
+    chip.appendChild(img);
+  }
+
+  const label = document.createElement("span");
+  // Long titles (e.g. an Open Graph description scraped from <meta>) blow
+  // up the chat input box and the chip itself. Truncate visually while
+  // keeping the full title in dataset.tabTitle for serialization.
+  const MAX_CHIP_TITLE = 40;
+  label.textContent =
+    title.length > MAX_CHIP_TITLE ? `${title.slice(0, MAX_CHIP_TITLE).trimEnd()}…` : title;
+  label.style.cssText = "max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+  chip.appendChild(label);
+
+  const closeBtn = document.createElement("span");
+  closeBtn.dataset.chipClose = "true";
+  closeBtn.textContent = "\u00d7";
+  closeBtn.style.cssText =
+    "margin-left:2px;cursor:pointer;opacity:0.6;font-size:13px;line-height:1;color:var(--color-accent);";
+  chip.appendChild(closeBtn);
+
+  return chip;
+}
+
+/**
+ * Create an agent-graph @-mention pill. Three kinds, all rendered as a single
+ * non-editable inline atom. Metadata is stored on dataset attrs and consumed
+ * by `getPromptFromEditable` at send time to expand into the spec §6 template
+ * string.
+ */
+function createAgentMentionChip(item: MentionItem): HTMLSpanElement {
+  const chip = document.createElement("span");
+  chip.contentEditable = "false";
+  chip.dataset.mentionKind = item.kind ?? "file";
+  // Per-kind metadata; absent fields are simply not serialized.
+  if (item.sessionId) chip.dataset.sessionId = item.sessionId;
+  if (item.msgId) chip.dataset.msgId = item.msgId;
+  if (item.duty != null) chip.dataset.duty = item.duty;
+  if (item.agentName) chip.dataset.agentName = item.agentName;
+  if (item.displayName) chip.dataset.displayName = item.displayName;
+  if (item.historyPath) chip.dataset.historyPath = item.historyPath;
+
+  // Neutral surface — readable in any theme. Type is conveyed by the brand
+  // icon + the optional ↩ glyph for reply, not by tinted color.
+  chip.style.cssText =
+    "display:inline-flex;align-items:center;gap:4px;padding:1px 6px;border-radius:4px;" +
+    "background:var(--color-bg-tertiary);" +
+    "border:1px solid var(--color-border);" +
+    "font-size:12px;font-weight:500;color:var(--color-text);" +
+    "margin:0 2px;user-select:none;vertical-align:baseline;line-height:1.5;";
+  if (item.kind === "agent_send" && item.duty) {
+    chip.title = `${item.displayName ?? ""} — ${item.duty}`;
+  }
+  if (item.kind === "agent_reply" && item.msgId) {
+    chip.title = `Reply to ${item.displayName ?? ""} (msg ${item.msgId})`;
+  }
+  if (item.kind === "chat_history" && item.historyPath) {
+    chip.title = `Share history of "${item.displayName ?? ""}" — ${item.historyPath}`;
+  }
+
+  // Layout: <verb> <agent_icon> <name>
+  //   - mention_spawn        → "Spawn  <icon> <agent>"
+  //   - mention_send         → "Send To <icon> <session>"
+  //   - mention_reply        → "Reply To <icon> <session>"
+  //   - mention_chat_history → "Share History <icon> <chat>"
+  const name = item.displayName ?? item.agentName ?? "";
+  const action =
+    item.kind === "agent_spawn"
+      ? "Spawn"
+      : item.kind === "agent_send"
+        ? "Send To"
+        : item.kind === "chat_history"
+          ? "Share History"
+          : "Reply To";
+  const verb = document.createElement("span");
+  verb.textContent = action;
+  verb.style.cssText = "opacity:0.7;font-weight:500;";
+  chip.appendChild(verb);
+
+  const iconUrl = agentIconUrl(item.agentName);
+  if (iconUrl) {
+    const img = document.createElement("img");
+    img.src = iconUrl;
+    img.alt = "";
+    img.style.cssText =
+      "width:12px;height:12px;flex-shrink:0;display:inline-block;vertical-align:-2px;";
+    chip.appendChild(img);
+  }
+
+  const label = document.createElement("span");
+  label.textContent = name;
+  chip.appendChild(label);
+
+  const closeBtn = document.createElement("span");
+  closeBtn.dataset.chipClose = "true";
+  closeBtn.textContent = "×";
+  closeBtn.style.cssText =
+    "margin-left:2px;cursor:pointer;opacity:0.6;font-size:13px;line-height:1;";
+  chip.appendChild(closeBtn);
+
+  return chip;
+}
+
+/**
+ * Expand an agent-graph @-mention chip into a `<grove-meta>` envelope. The
+ * envelope's `system-prompt` field carries the spec §6 instruction text the AI
+ * reads; the `data` field carries the rendering metadata the receiving chat's
+ * frontend uses to draw a pill. Grove never calls the underlying
+ * `grove_agent_*` tools itself — the AI decides whether to act on the hint.
+ */
+function expandAgentMentionChip(node: HTMLElement): string {
+  const kind = node.dataset.mentionKind;
+  if (kind === "agent_spawn") {
+    const agent = node.dataset.agentName ?? node.dataset.displayName ?? "";
+    return buildGroveMetaTag(
+      "mention_spawn",
+      { agent },
+      `@[agent=${agent} · use grove_agent_graph_spawn to create a Session, then grove_agent_graph_send to dispatch]`,
+    );
+  }
+  if (kind === "agent_send") {
+    const id = node.dataset.sessionId ?? "";
+    const name = node.dataset.displayName ?? "";
+    const duty = node.dataset.duty ?? "";
+    const agent = node.dataset.agentName ?? "";
+    const data: Record<string, unknown> = { sid: id, name };
+    if (duty) data.duty = duty;
+    if (agent) data.agent = agent;
+    return buildGroveMetaTag(
+      "mention_send",
+      data,
+      `@[session id=${id}, name=${name}, duty="${duty}" · use grove_agent_graph_send(to="${id}") to dispatch]`,
+    );
+  }
+  if (kind === "agent_reply") {
+    const id = node.dataset.sessionId ?? "";
+    const name = node.dataset.displayName ?? "";
+    const msg = node.dataset.msgId ?? "";
+    const agent = node.dataset.agentName ?? "";
+    const data: Record<string, unknown> = { sid: id, name, msg_id: msg };
+    if (agent) data.agent = agent;
+    return buildGroveMetaTag(
+      "mention_reply",
+      data,
+      `@[session id=${id}, name=${name}, pending_msg=${msg} · use grove_agent_graph_reply(msg_id="${msg}") to respond]`,
+    );
+  }
+  if (kind === "chat_history") {
+    const cid = node.dataset.sessionId ?? "";
+    const name = node.dataset.displayName ?? "";
+    const file = node.dataset.historyPath ?? "";
+    const agent = node.dataset.agentName ?? "";
+    const data: Record<string, unknown> = { chat_id: cid, name, file };
+    if (agent) data.agent = agent;
+    return buildGroveMetaTag(
+      "mention_chat_history",
+      data,
+      `@[chat_history name="${name}" file="${file}" · this is another chat's history.jsonl in the same task; read the file to see the conversation]`,
+    );
+  }
+  return "";
+}
+
+/** Extract prompt text from a contentEditable element, converting chips to /command */
+function getPromptFromEditable(el: HTMLElement): string {
+  const parts: string[] = [];
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parts.push(node.textContent || "");
+    } else if (node instanceof HTMLElement) {
+      if (node.dataset.mentionKind === "browsertabs") {
+        const url = node.dataset.tabUrl || "";
+        const title = node.dataset.tabTitle || "";
+        const tabIdRaw = node.dataset.tabId;
+        const tabId = tabIdRaw ? Number(tabIdRaw) : undefined;
+        if (url) {
+          // Standard <grove-meta v=1> envelope:
+          // - `type` dispatches to a frontend renderer (browser_tab → pill chip)
+          // - `data` carries the machine-readable payload
+          // - `system-prompt` is the human-readable fallback used by the agent
+          //   AND by the UI when the renderer is missing / errors
+          const data: { url: string; title: string; tab_id?: number } = {
+            url,
+            title,
+          };
+          if (typeof tabId === "number" && Number.isFinite(tabId)) {
+            data.tab_id = tabId;
+          }
+          const tabIdHint =
+            typeof tabId === "number" && Number.isFinite(tabId)
+              ? ` Use this tab_id (${tabId}) with the grove_browser_* MCP tools to drive the tab.`
+              : "";
+          const envelope = {
+            v: 1,
+            type: "browser_tab",
+            data,
+            "system-prompt": `Browser tab reference: ${title || url} (${url}).${tabIdHint}`,
+          };
+          // Encode `<` / `>` as unicode escapes so a title containing
+          // `</grove-meta>` doesn't accidentally close the envelope tag
+          // (the receiver's non-greedy regex matches the first
+          // `</grove-meta>` and would feed truncated JSON to JSON.parse).
+          const safeJson = JSON.stringify(envelope)
+            .replace(/</g, "\\u003c")
+            .replace(/>/g, "\\u003e");
+          parts.push(`<grove-meta>${safeJson}</grove-meta>`);
+        }
+      } else if (node.dataset.mentionKind && node.dataset.mentionKind !== "file") {
+        parts.push(expandAgentMentionChip(node));
+      } else if (node.dataset.command) {
+        parts.push(`/${node.dataset.command}`);
+      } else if (node.dataset.ref) {
+        parts.push(`[${node.dataset.ref}]`);
+      } else if (node.dataset.file) {
+        // Studio-categorized chips carry a friendly label separate from the
+        // raw path — serialize as "Name(path)" so both the reader and the
+        // agent see what the chip means. Fall back to the bare path for
+        // ordinary file mentions.
+        const file = node.dataset.file;
+        const lbl = node.dataset.label;
+        parts.push(lbl && lbl !== file ? `${lbl}(${file})` : file);
+      } else if (node.tagName === "BR") {
+        parts.push("\n");
+      } else if (node.tagName === "DIV" || node.tagName === "P") {
+        if (parts.length > 0 && parts[parts.length - 1] !== "\n")
+          parts.push("\n");
+        node.childNodes.forEach(walk);
+      } else {
+        node.childNodes.forEach(walk);
+      }
+    }
+  };
+  el.childNodes.forEach(walk);
+  return parts.join("").trim();
+}
+
+function reduceHistoryMessages(
+  messages: ChatMessage[],
+  msg: ServerEvent,
+): ChatMessage[] {
+  switch (msg.type) {
+    case "message_chunk": {
+      // OpenCode (and possibly others) emit trailing `session_update.AgentMessageChunk`
+      // events AFTER `PromptResponse` has already resolved — so the chunk arrives
+      // when the assistant bubble is already `complete=true`. Appending to whichever
+      // assistant is most recent (regardless of complete flag), as long as no
+      // user/tool boundary intervenes, merges that orphan tail back into the
+      // bubble it belongs to. Without this, the tail creates a new bubble that
+      // then incorrectly inherits the NEXT turn's usage from the complete-handler
+      // mapper (which targets all `!complete` assistants).
+      const prev = completeThinking(messages);
+      for (let i = prev.length - 1; i >= 0; i -= 1) {
+        const m = prev[i];
+        if (m.type === "assistant") {
+          const updated = [...prev];
+          updated[i] = { ...m, content: m.content + msg.text };
+          return updated;
+        }
+        if (m.type === "user" || m.type === "tool") break;
+      }
+      if (!msg.text?.trim()) return prev;
+      return [
+        ...prev,
+        { type: "assistant", content: msg.text, complete: false },
+      ];
+    }
+    case "thought_chunk": {
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const m = messages[i];
+        if (m.type === "thinking") {
+          const updated = [...messages];
+          updated[i] = { ...m, content: m.content + msg.text };
+          return updated;
+        }
+        if (m.type === "user" || m.type === "assistant") break;
+      }
+      return [
+        ...messages,
+        {
+          type: "thinking",
+          content: msg.text,
+          collapsed: false,
+          complete: false,
+        },
+      ];
+    }
+    case "tool_call": {
+      const prev = completeThinking(messages);
+      if (prev.some((m) => m.type === "tool" && m.id === msg.id)) {
+        return prev.map((m) =>
+          m.type === "tool" && m.id === msg.id
+            ? {
+                ...m,
+                title: msg.title,
+                // locations 按增量合并，按 (path,line) 去重保序
+                locations: mergeLocations(m.locations, msg.locations),
+                // raw_input 后到优先（agent 在 update 阶段才补全 input 时不抹掉）
+                rawInput: msg.raw_input !== undefined ? msg.raw_input : m.rawInput,
+              }
+            : m,
+        );
+      }
+      const completed = prev.map((m) =>
+        m.type === "assistant" && !m.complete ? { ...m, complete: true } : m,
+      );
+      return [
+        ...completed,
+        {
+          type: "tool",
+          id: msg.id,
+          title: msg.title,
+          status: "running",
+          collapsed: false,
+          locations: msg.locations,
+          rawInput: msg.raw_input,
+        },
+      ];
+    }
+    case "tool_call_update": {
+      // 按 ACP 规范，每条 tool_call_update 的 content 是增量内容，应在已有
+      // content 上追加（去重），而不是覆盖。覆盖会让早期的命令/进度被最终
+      // 的结果/错误挤掉。
+      const mergeContent = (
+        prev: string | undefined,
+        next: string | undefined,
+      ): string | undefined => {
+        if (!next) return prev;
+        if (!prev) return next;
+        // 见后端 compact_events 同名逻辑：三种 agent 行为
+        //   1. 纯增量（next 是 delta）→ 拼接
+        //   2. 累积快照（next 以 prev 为前缀）→ 用 next 替换，避免 O(n²)
+        //   3. 重复广播（next 已包含在 prev 中）→ 跳过
+        if (prev.includes(next)) return prev;
+        if (next.startsWith(prev)) return next;
+        return prev.endsWith("\n") ? prev + next : prev + "\n" + next;
+      };
+      const exists = messages.some((m) => m.type === "tool" && m.id === msg.id);
+      if (exists) {
+        return messages.map((m) =>
+          m.type === "tool" && m.id === msg.id
+            ? {
+                ...m,
+                status: msg.status,
+                content: mergeContent(m.content, msg.content),
+                locations: mergeLocations(m.locations, msg.locations),
+                rawInput:
+                  msg.raw_input !== undefined ? msg.raw_input : m.rawInput,
+              }
+            : m,
+        );
+      }
+      return [
+        ...messages,
+        {
+          type: "tool",
+          id: msg.id,
+          title: msg.id,
+          status: msg.status,
+          content: msg.content,
+          collapsed: true,
+          locations: msg.locations ?? [],
+          rawInput: msg.raw_input,
+        },
+      ];
+    }
+    case "permission_request":
+      return [
+        ...messages,
+        {
+          type: "permission",
+          id: typeof msg.id === "string" ? msg.id : "",
+          description: msg.description,
+          options: msg.options ?? [],
+        },
+      ];
+    case "ask_form": {
+      // grove_ask_form MCP tool pushes this directly via AcpUpdate::AskForm.
+      // Idempotent on form_id: duplicate broadcasts (e.g. reconnect replay
+      // before the history-persistence exclusion takes effect) merge in
+      // place instead of stacking pills.
+      const formId = typeof msg.form_id === "string" ? msg.form_id : "";
+      // Empty form_id can't dedup correctly — the first empty-id form would
+      // block every subsequent form. Drop malformed payloads outright.
+      if (!formId) return messages;
+      if (messages.some((m) => m.type === "ask_form" && m.id === formId)) {
+        return messages;
+      }
+      return [
+        ...messages,
+        {
+          type: "ask_form",
+          id: formId,
+          definition: msg.definition as AskFormDefinition,
+        },
+      ];
+    }
+    case "permission_response":
+      return resolveLatestPendingPermission(
+        messages,
+        msg.option_id,
+        msg.option_id,
+        typeof msg.id === "string" ? msg.id : undefined,
+      );
+    case "complete": {
+      const completed = completeThinking(messages);
+      const usage: TurnUsageData | undefined = msg.usage
+        ? {
+            inputTokens: Number(msg.usage.input_tokens) || 0,
+            outputTokens: Number(msg.usage.output_tokens) || 0,
+            totalTokens: Number(msg.usage.total_tokens) || 0,
+            cachedReadTokens:
+              msg.usage.cached_read_tokens != null
+                ? Number(msg.usage.cached_read_tokens)
+                : undefined,
+          }
+        : undefined;
+      const startTs =
+        typeof msg.start_ts === "number" ? msg.start_ts : undefined;
+      const endTs = typeof msg.end_ts === "number" ? msg.end_ts : undefined;
+      return completed.map((m) =>
+        m.type === "assistant" && !m.complete
+          ? { ...m, complete: true, usage, startTs, endTs }
+          : m,
+      );
+    }
+    case "user_message":
+      return [
+        ...messages,
+        {
+          type: "user",
+          content: msg.text,
+          terminal: !!msg.terminal,
+          sender: msg.sender || undefined,
+          attachments: msg.attachments?.map((a: ServerEvent) => ({
+            type:
+              a.type === "resource_link"
+                ? "resource"
+                : (a.type as "image" | "audio" | "resource"),
+            data: a.data ?? "",
+            mimeType: a.mime_type ?? "",
+            name: a.name ?? "",
+            label: a.label ?? a.name ?? "",
+            uri: a.uri ?? undefined,
+            size: a.size ?? undefined,
+            previewUrl:
+              a.type === "image"
+                ? `data:${a.mime_type};base64,${a.data}`
+                : undefined,
+          })),
+        },
+      ];
+    case "terminal_execute":
+      return [
+        ...messages,
+        { type: "user", content: msg.command, terminal: true },
+        { type: "terminal_output", chunks: [], exitCode: undefined },
+      ];
+    case "terminal_chunk": {
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        if (messages[i].type === "terminal_output") {
+          const updated = [...messages];
+          const terminalMessage = messages[i] as {
+            type: "terminal_output";
+            chunks: string[];
+            exitCode?: number | null;
+          };
+          updated[i] = {
+            ...terminalMessage,
+            chunks: [...terminalMessage.chunks, msg.output],
+          };
+          return updated;
+        }
+      }
+      return [...messages, { type: "terminal_output", chunks: [msg.output] }];
+    }
+    case "terminal_complete": {
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        if (messages[i].type === "terminal_output") {
+          const updated = [...messages];
+          const terminalMessage = messages[i] as {
+            type: "terminal_output";
+            chunks: string[];
+            exitCode?: number | null;
+          };
+          updated[i] = { ...terminalMessage, exitCode: msg.exit_code ?? 0 };
+          return updated;
+        }
+      }
+      return messages;
+    }
+    default:
+      return messages;
+  }
+}
+
+// Standalone elapsed-time label for the npx pre-warm phase. Owns its own
+// 1Hz interval so updating the seconds counter does not re-render the
+// 7000-line TaskChat parent. Compact vs. full label format selectable so
+// the same component serves both the fullscreen header and the inline
+// session rail.
+function DownloadingLabel({ startedAt, compact }: { startedAt: number; compact?: boolean }) {
+  const computeSeconds = useCallback(
+    () => Math.floor((Date.now() - startedAt) / 1000),
+    [startedAt],
+  );
+  const [seconds, setSeconds] = useState(computeSeconds);
+  useEffect(() => {
+    const id = setInterval(() => setSeconds(computeSeconds()), 1000);
+    return () => clearInterval(id);
+  }, [computeSeconds]);
+  return compact
+    ? <>{`Downloading ${seconds}s`}</>
+    : <>{`Downloading agent via npx (first run, ~30s) · ${seconds}s`}</>;
+}
+
+// ─── Main Component ──────────────────────────────────────────────────────────
+
+export function TaskChat({
+  projectId,
+  task,
+  collapsed = false,
+  onExpand,
+  onCollapse,
+  onConnected: onConnectedProp,
+  onDisconnected: onDisconnectedProp,
+  fullscreen = false,
+  onToggleFullscreen,
+  hideHeader = false,
+  onNavigateToFile,
+  onChatBecameIdle,
+  onUserMessageSent,
+  onBusyStateChange,
+}: TaskChatProps) {
+  // Three sub-concerns have been extracted into their own hooks
+  // (useChatPositioning, useACPAvailability, useInitialChatLoad) — those
+  // hooks ARE Compiler-optimized. The remaining TaskChat body still has
+  // multiple captured-mutable-`let` patterns (history reducer, WS event
+  // dispatch, DOM walkers, attachment lifecycle) that React Compiler 1.0
+  // can't reconcile in a single function this large. Unlocking it
+  // requires a structural split into more sub-components/hooks — a
+  // dedicated refactor for a future version, not a 0.10.4 task.
+
+  const sessionModeStorageKey = `taskchat:session-mode:${projectId}`;
+  // ─── Multi-chat state ───────────────────────────────────────────────────
+  const [chats, setChats] = useState<ChatSessionResponse[]>([]);
+  // Mirror of `chats` for stable callbacks/event handlers that shouldn't
+  // re-register every time the chat list changes.
+  const chatsRef = useRef<ChatSessionResponse[]>([]);
+  useEffect(() => {
+    chatsRef.current = chats;
+  }, [chats]);
+  const {
+    activeChatId,
+    getActiveChatId,
+    setActiveChatId,
+  } = useActiveChatId(null);
+  useReportDebugId("chatId", activeChatId);
+  const [showChatMenu, setShowChatMenu] = useState(false);
+  const [editingTitle, setEditingTitle] = useState<{
+    chatId: string;
+    surface: TitleEditSurface;
+  } | null>(null);
+  const [editTitleValue, setEditTitleValue] = useState("");
+  const chatMenuRef = useRef<HTMLDivElement>(null);
+  const [showAgentPicker, setShowAgentPicker] = useState(false);
+  const {
+    baseAgents,
+    customAgents,
+    customAgentPersonas,
+    acpAvailabilityLoaded,
+  } = useACPAvailability();
+  const headerAgentPickerRef = useRef<HTMLDivElement>(null);
+  const sidebarAgentPickerRef = useRef<HTMLDivElement>(null);
+  const agentPickerMenuRef = useRef<HTMLDivElement>(null);
+  const [agentPickerAnchor, setAgentPickerAnchor] = useState<{
+    top: number;
+    left: number;
+  } | null>(null);
+  const showAgentPickerRef = useRef(false);
+  const [sessionRailCollapsed, setSessionRailCollapsed] = useState<boolean>(
+    () => {
+      if (typeof window === "undefined") return true;
+      return window.localStorage.getItem(sessionModeStorageKey) !== "sidebar";
+    },
+  );
+
+  // Per-chat state cache (preserved across chat switches)
+  const perChatStateRef = useRef<Map<string, PerChatState>>(new Map());
+  // Per-chat WebSocket connections
+  const wsMapRef = useRef<Map<string, WebSocket>>(new Map());
+  // Track intentionally closed WebSockets (don't auto-reconnect these)
+  const intentionalCloseRef = useRef<Set<string>>(new Set());
+  // Per-chat reconnect attempt count for exponential backoff. Reset on
+  // successful open. Stops auto-reconnect after WS_MAX_RECONNECT_ATTEMPTS
+  // to avoid hammering the agent on permanent failures (e.g. stale saved_id).
+  const reconnectAttemptRef = useRef<Map<string, number>>(new Map());
+  // Track scheduled reconnect timers so they can be cancelled on unmount /
+  // chat switch / intentional close — otherwise an in-flight 30s backoff
+  // resurrects a zombie WebSocket after the component is gone, triggering
+  // setState on an unmounted component.
+  const reconnectTimerRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  // Helper: clear any pending reconnect for a chat. Call before any path that
+  // removes the chat (delete, ChatListChanged prune, Take Control). Without
+  // this, a backoff-scheduled timer fires later, tries to connect a now-gone
+  // chat, gets 404, loops the 5-attempt ladder pointlessly.
+  const cancelPendingReconnectRef = useRef((chatId: string) => {
+    const timer = reconnectTimerRef.current.get(chatId);
+    if (timer) {
+      clearTimeout(timer);
+      reconnectTimerRef.current.delete(chatId);
+    }
+    reconnectAttemptRef.current.delete(chatId);
+  });
+  // Track in-flight connection attempts to prevent async TOCTOU race
+  const connectingRef = useRef<Set<string>>(new Set());
+  // Debounce timer for auto-saving composer draft to localStorage
+  const draftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Wall-clock anchor for the max-debounce: the first keystroke since
+  // the last successful save. We force a flush 5s after this anchor so
+  // a fast-typing user can never leave the page without ANY save.
+  const draftLastFlushRef = useRef<number>(0);
+
+  // ─── Active chat's live state ─────────────────────────────────────────
+  const [isConnected, setIsConnected] = useState(false);
+  // Pre-spawn UI hint pushed by backend when an agent is being installed via
+  // npx for the first time (~30s on cold cache). Cleared on session_ready or
+  // when backend sends phase: "ready". Purely cosmetic — the actual spawn
+  // continues regardless.
+  const [connectPhase, setConnectPhase] = useState<string | null>(null);
+  const [connectPhaseStartedAt, setConnectPhaseStartedAt] = useState<number | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [hiddenMessageCount, setHiddenMessageCount] = useState(0);
+  const hiddenMessageCountRef = useRef(0);
+  const [hasContent, setHasContent] = useState(false);
+  const [isBusy, setIsBusy] = useState(false);
+  const busyRef = useRef(false);
+  // True from the moment the user clicks a cancel-emitting button (Send Now /
+  // Stop) until the server acks by transitioning busy → false. Prevents the
+  // "click 11 times spams 11 CancelNotifications" pattern that previously
+  // drove the agent's request channel into a broken state.
+  const [isCancelling, setIsCancelling] = useState(false);
+  const updateBusy = useCallback((value: boolean) => {
+    busyRef.current = value;
+    setIsBusy(value);
+    if (!value) setIsCancelling(false);
+    onBusyStateChange?.(value);
+  }, [onBusyStateChange]);
+  const terminalRunningRef = useRef(false);
+  const composingRef = useRef(false);
+  const [selectedModel, setSelectedModel] = useState("");
+  const [permissionLevel, setPermissionLevel] = useState("");
+  const [modelOptions, setModelOptions] = useState<
+    { label: string; value: string }[]
+  >([]);
+  const [modeOptions, setModeOptions] = useState<
+    { label: string; value: string }[]
+  >([]);
+  const [thoughtLevel, setThoughtLevel] = useState("");
+  const [thoughtLevelConfigId, setThoughtLevelConfigId] = useState("");
+  const [thoughtLevelOptions, setThoughtLevelOptions] = useState<
+    { label: string; value: string }[]
+  >([]);
+  const [showThoughtLevelMenu, setShowThoughtLevelMenu] = useState(false);
+  const [showModelMenu, setShowModelMenu] = useState(false);
+  const [showPermMenu, setShowPermMenu] = useState(false);
+  const [planEntries, setPlanEntries] = useState<PlanEntry[]>([]);
+  const [showPlan, setShowPlan] = useState(false);
+  // Latest ACP `usage_update` for the current chat. `null` until the agent
+  // pushes one (or attach hydrates from session.json). Drives the context-
+  // window pill — when null, the pill is hidden.
+  const [contextUsage, setContextUsage] = useState<{
+    used: number;
+    size: number;
+    cost: { amount: number; currency: string } | null;
+  } | null>(null);
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+  const [lightboxSvg, setLightboxSvg] = useState<string | null>(null);
+  const [planFilePath, setPlanFilePath] = useState("");
+  const [planFileContent, setPlanFileContent] = useState("");
+  const [showPlanFile, setShowPlanFile] = useState(false);
+  const [showPermissionPanel, setShowPermissionPanel] = useState(false);
+  const [showFormPanel, setShowFormPanel] = useState(false);
+  const [showAuthPanel, setShowAuthPanel] = useState(false);
+  const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
+  const [showSlashMenu, setShowSlashMenu] = useState(false);
+  const [slashFilter, setSlashFilter] = useState("");
+  const [slashSelectedIdx, setSlashSelectedIdx] = useState(0);
+  const [isTerminalMode, setIsTerminalMode] = useState(false);
+  const [expandedSections, setExpandedSections] = useState<Set<string>>(
+    new Set(),
+  );
+  // The sectionId of the currently auto-expanded tool section (null = none)
+  // Set on tool_call, cleared on message_chunk or complete
+  const [, setAutoExpandSectionId] = useState<string | null>(null);
+  // pending 消息现在带 id(uuid,后端在入队时分配);所有 edit/delete 都用
+  // id 精准定位 — index 在网络往返期间可能因为队首被 drain 而漂移。
+  const [pendingMessages, setPendingMessages] = useState<
+    { id: string; text: string }[]
+  >([]);
+  // Stable React keys for pending messages that arrive without a server-side
+  // id. Pure derivation off `(index, text)` — no Math.random / crypto, no
+  // ref mutation during render — so React Compiler is happy. Two identical
+  // texts at different indices still get distinct keys, and identical
+  // (index, text) cells across queue_update echoes map to the same key so
+  // an in-progress <input> edit isn't torn down. When the backend supplies
+  // a real id we honour it directly.
+  const sawEmptyPendingIdRef = useRef(false);
+  const pendingMessageKeys = useMemo(
+    () =>
+      pendingMessages.map((msg, idx) =>
+        msg.id ? msg.id : `local-${idx}-${msg.text}`,
+      ),
+    [pendingMessages],
+  );
+  useEffect(() => {
+    // One-shot warn when empty-id queue messages first appear — backend bug
+    // upstream; edits will fall back to position-keyed identity, which still
+    // preserves focus across queue_update echoes but loses identity across
+    // queue reorders.
+    if (pendingMessages.some((m) => !m.id) && !sawEmptyPendingIdRef.current) {
+      sawEmptyPendingIdRef.current = true;
+      console.warn(
+        "[TaskChat] queue messages arriving without ids — backend bug; edits will be position-keyed",
+      );
+    }
+  }, [pendingMessages]);
+  const [showPendingQueue, setShowPendingQueue] = useState(true);
+  const [editingPendingId, setEditingPendingId] = useState<string | null>(null);
+  // 给 websocket onmessage 这种长生命周期闭包用 — useState 值会过期,ref 不会
+  const editingPendingIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    editingPendingIdRef.current = editingPendingId;
+  }, [editingPendingId]);
+  const [editingPendingValue, setEditingPendingValue] = useState("");
+  // Subscribe to persona registry — re-renders this tree (and the picker /
+  // chip / icon descendants that read `agentIconComponent` / `resolveAgentIcon`)
+  // whenever a persona is created / edited / deleted from any page.
+  usePersonaRegistry();
+  const [agentLabel, setAgentLabel] = useState("Chat");
+  const [AgentIcon, setAgentIcon] = useState<React.ComponentType<{
+    size?: number;
+    className?: string;
+  }> | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const messagesViewportRef = useRef<HTMLDivElement>(null);
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  // Bumped whenever Virtuoso renders a different range of items. Drives
+  // useChatSearch's "re-apply highlights to freshly mounted DOM" effect.
+  const [renderToken, setRenderToken] = useState(0);
+  // Footer height = current input area height + slack. Stored in state so
+  // Virtuoso can pad the bottom of the scroll area, ensuring the last
+  // message is never obscured by the input composer. Initial value is
+  // intentionally generous (composer with banners / multiline / panels can
+  // be 240–400 px tall) so the first paint doesn't briefly hide the tail
+  // before ResizeObserver fires.
+  const [inputAreaHeight, setInputAreaHeight] = useState(220);
+  const editableRef = useRef<HTMLDivElement>(null);
+  const modelMenuRef = useRef<HTMLDivElement>(null);
+  const permMenuRef = useRef<HTMLDivElement>(null);
+  const thoughtLevelMenuRef = useRef<HTMLDivElement>(null);
+  const slashMenuRef = useRef<HTMLDivElement>(null);
+  const slashItemRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const [taskFiles, setTaskFiles] = useState<string[]>([]);
+  const [taskFilesMeta, setTaskFilesMeta] = useState<import("../../../api/tasks").FileMetadata[]>([]);
+  const [sketchMeta, setSketchMeta] = useState<SketchMeta[]>([]);
+  const taskFilesFetchTimeRef = useRef(0);
+  const taskFilesLoadingRef = useRef(false);
+  const { selectedProject, projects } = useProject();
+  const { config: appConfig } = useConfig();
+  const { drafts: previewCommentDrafts, removeDraft: removePreviewCommentDraft, clearDrafts: clearPreviewCommentDrafts } = usePreviewComments();
+  // Resolve project from the task's own projectId, not the globally-selected
+  // one — Blitz can open a task from a different project than the sidebar
+  // selection (same pattern as TaskInfoPanel / FlexLayoutContainer).
+  const taskProject = projects.find((p) => p.id === projectId) ?? selectedProject;
+  const isStudioProject = taskProject?.projectType === "studio";
+  const chatRenderWindowSettings = useMemo(
+    () =>
+      normalizeChatRenderWindowSettings(
+        appConfig?.acp?.render_window_limit,
+        appConfig?.acp?.render_window_trigger,
+      ),
+    [
+      appConfig?.acp?.render_window_limit,
+      appConfig?.acp?.render_window_trigger,
+    ],
+  );
+  const updateHiddenMessageCount = useCallback((value: number) => {
+    hiddenMessageCountRef.current = value;
+    setHiddenMessageCount(value);
+  }, []);
+  const pruneActiveChatMessages = useCallback(
+    (nextMessages: ChatMessage[]) => {
+      const pruned = pruneChatViewMessages(
+        nextMessages,
+        hiddenMessageCountRef.current,
+        chatRenderWindowSettings,
+      );
+      if (pruned.pruned) {
+        updateHiddenMessageCount(pruned.hiddenMessageCount);
+        perfMark("TaskChat:prune", {
+          hidden: pruned.hiddenMessageCount,
+          remaining: pruned.messages.length,
+        });
+      }
+      return pruned.messages;
+    },
+    [chatRenderWindowSettings, updateHiddenMessageCount],
+  );
+  const [showFileMenu, setShowFileMenu] = useState(false);
+  const [fileFilter, setFileFilter] = useState("");
+  const [fileSelectedIdx, setFileSelectedIdx] = useState(0);
+  const fileMenuRef = useRef<HTMLDivElement>(null);
+  // Agent-graph @-mention candidates (spawn / send / reply). Cohabits the
+  // same `@` popover as file mentions — see `combinedMentionItems`.
+  const [agentMentionItems, setAgentMentionItems] = useState<MentionItem[]>([]);
+
+  // States for multi-level category @-mention menu
+  const [activeCategory, setActiveCategory] = useState<string | null>(null);
+  const [browserTabs, setBrowserTabs] = useState<MentionItem[]>([]);
+
+  useEffect(() => {
+    if (activeCategory !== "browsertabs") return;
+    let active = true;
+    void (async () => {
+      let tabs: Awaited<ReturnType<typeof listExtensionTabs>> = [];
+      try {
+        tabs = await listExtensionTabs();
+      } catch {
+        // Extension offline / backend unreachable — render an empty list
+        // rather than a fake fallback tab.
+      }
+      if (!active) return;
+      const items: MentionItem[] = tabs.map((tab) => ({
+        path: tab.url,
+        displayName: tab.title || tab.url,
+        category: "Browser Tab",
+        kind: "browsertabs",
+        isDir: false,
+        sessionId: tab.id?.toString(),
+        favIconUrl: tab.favIconUrl,
+      }));
+      setBrowserTabs(items);
+    })();
+    return () => {
+      active = false;
+    };
+  }, [activeCategory]);
+
+  // Fetched once on mount. No polling — if the user plugs in the extension
+  // after opening this chat, they need to reload the tab to see
+  // `@browsertabs:` in the mention category list.
+  const [isExtensionConnected, setIsExtensionConnected] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    getExtensionStatus().then((c) => { if (!cancelled) setIsExtensionConnected(c); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const [allProjects, setAllProjects] = useState<ProjectListItem[]>([]);
+  const [projectFiles, setProjectFiles] = useState<{ [projId: string]: string[] }>({});
+  const [loadingProjId, setLoadingProjId] = useState<string | null>(null);
+
+  const CATEGORY_SELECTORS = useMemo<MentionItem[]>(() => {
+    const base: MentionItem[] = [
+      { path: "conversation", displayName: "Conversation", category: "category_selector", kind: "chat_history", isDir: false },
+      { path: "file", displayName: "Files", category: "category_selector", kind: "file", isDir: true },
+      { path: "agent", displayName: "Agents", category: "category_selector", kind: "agent_spawn", isDir: false },
+      { path: "project", displayName: "Projects", category: "category_selector", kind: "file", isDir: true },
+    ];
+    if (isStudioProject) {
+      base.push(
+        { path: "sketch", displayName: "Sketches", category: "category_selector", kind: "file", isDir: true }
+      );
+    }
+    if (isExtensionConnected) {
+      base.push({ path: "browsertabs", displayName: "Browser Tabs", category: "category_selector", kind: "browsertabs", isDir: false });
+    }
+    return base;
+  }, [isExtensionConnected, isStudioProject]);
+
+  const [promptCaps, setPromptCaps] = useState<PromptCaps>({
+    image: false,
+    audio: false,
+    embeddedContext: false,
+  });
+  const [forkCapable, setForkCapable] = useState(false);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const attachCountersRef = useRef<AttachmentCounters>({ image: 0, audio: 0, resource: 0 });
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isInputExpanded, setIsInputExpanded] = useState(false);
+  const [isInputFocused, setIsInputFocused] = useState(false);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [showPreviewComments, setShowPreviewComments] = useState(false);
+  const [chatSearchOpen, setChatSearchOpen] = useState(false);
+  const [chatSearchQuery, setChatSearchQuery] = useState("");
+  const planFilePathRef = useRef("");
+  const planFileToolIdsRef = useRef<Set<string>>(new Set());
+  const autoStickToBottomRef = useRef(true);
+  const suppressNextSmoothScrollRef = useRef(false);
+  const messagesCountRef = useRef(messages.length);
+  useEffect(() => {
+    messagesCountRef.current = messages.length;
+  }, [messages.length]);
+  const inputAreaRef = useRef<HTMLDivElement>(null);
+  const chatboxContainerRef = useRef<HTMLDivElement>(null);
+  const taskChatRootRef = useRef<HTMLDivElement>(null);
+  // Composer width budget — when the chat panel is squeezed (e.g. opened
+  // alongside a Graph / Editor split), drop the Model / Mode / Thinking
+  // dropdowns so the Send button doesn't get clipped. Two tiers: below
+  // HIDE_ALL we drop everything; between HIDE_ALL and HIDE_THINKING we
+  // keep Model + Mode but drop the Thinking pill (which was added later
+  // and tips the row over the edge in mid-width panels).
+  const COMPOSER_HIDE_ALL_WIDTH = 420;
+  const COMPOSER_HIDE_THINKING_WIDTH = 560;
+  const [composerNarrow, setComposerNarrow] = useState(false);
+  const [composerHideThinking, setComposerHideThinking] = useState(false);
+
+  // ─── Read-only observation mode state ──────────────────────────────────
+  const [isRemoteSession, setIsRemoteSession] = useState(false);
+  const [remoteOwnerName, setRemoteOwnerName] = useState("");
+  const [isTakingControl, setIsTakingControl] = useState(false);
+  const [isSavingToNote, setIsSavingToNote] = useState(false);
+  const [saveToNoteDone, setSaveToNoteDone] = useState(false);
+  const pollingOffsetRef = useRef(0);
+  const pollingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Buffer WS events while HTTP history is loading to avoid race condition
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const wsEventBufferRef = useRef<any[]>([]);
+  const historyLoadingRef = useRef(false);
+
+  const activeChat = chats.find((c) => c.id === activeChatId);
+  // Terminal-mode chat: agent CLI runs under a PTY (no ACP). Messages area
+  // becomes xterm.js; chatbox input writes to PTY stdin instead of session/prompt.
+  const isTerminalLaunchMode = activeChat?.launch_mode === "terminal";
+  const agentPtyWsUrl = useMemo(() => {
+    if (!isTerminalLaunchMode || !activeChatId) return null;
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}/api/v1/projects/${projectId}/tasks/${task.id}/chats/${activeChatId}/agent-pty`;
+  }, [isTerminalLaunchMode, activeChatId, projectId, task.id]);
+  // Quota for built-in AI coding agents (Claude Code / Codex / Gemini).
+  // Unsupported agents return null, which hides the quota badge entirely.
+  const {
+    usage: agentQuota,
+    refreshing: quotaRefreshing,
+    refresh: refreshAgentQuota,
+  } = useAgentQuota(activeChat?.agent ?? null, isBusy, selectedModel || undefined);
+  const quotaBadgePercentRemaining = agentQuota
+    ? quotaBadgePercent(agentQuota)
+    : null;
+  const orderedChats = useMemo(() => [...chats].reverse(), [chats]);
+  const hasTodoPanel = planEntries.length > 0;
+  const hasPlanPanel = !!planFileContent;
+  const hasPendingPanel = pendingMessages.length > 0;
+  const activePermissionMessage = useMemo(
+    () =>
+      [...messages]
+        .reverse()
+        .find(
+          (m): m is PermissionMessage => m.type === "permission" && !m.resolved,
+        ) ?? null,
+    [messages],
+  );
+  /** Latest unresolved ask_form message. Drives the composer panel + pill. */
+  type AskFormMsg = Extract<ChatMessage, { type: "ask_form" }>;
+  const activeFormMessage = useMemo(
+    () =>
+      [...messages]
+        .reverse()
+        .find((m): m is AskFormMsg => m.type === "ask_form" && !m.resolved) ??
+      null,
+    [messages],
+  );
+  /** 最近一条仍在生效的 auth_required(succeeded 视为已结束,自动让位)。
+   *  composer panel 据此渲染登录卡片,与 PermissionRequest 共用同一套 panel
+   *  机制 — 优先级最高,因为没登录前其它操作都不能进行。 */
+  type AuthRequiredMsg = Extract<ChatMessage, { type: "auth_required" }>;
+  const activeAuthMessage = useMemo(
+    () =>
+      [...messages]
+        .reverse()
+        .find(
+          (m): m is AuthRequiredMsg =>
+            m.type === "auth_required" && m.status !== "succeeded",
+        ) ?? null,
+    [messages],
+  );
+  /** auth 消息所在的索引(handleAuthLogin 需要根据它定位状态切换)。 */
+  const activeAuthMessageIndex = useMemo(() => {
+    if (!activeAuthMessage) return -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i] === activeAuthMessage) return i;
+    }
+    return -1;
+  }, [activeAuthMessage, messages]);
+  const taskPreviewCommentDrafts = useMemo(
+    () => previewCommentDrafts.filter((draft) => draft.projectId === projectId && draft.taskId === task.id),
+    [previewCommentDrafts, projectId, task.id],
+  );
+  const hasPreviewCommentsPanel = taskPreviewCommentDrafts.length > 0;
+  const activeComposerPanel =
+    showAuthPanel && activeAuthMessage
+      ? "auth"
+      : showPermissionPanel && activePermissionMessage
+        ? "permission"
+        : showFormPanel && activeFormMessage
+          ? "ask_form"
+          : showPlan && hasTodoPanel
+            ? "todo"
+            : showPlanFile && hasPlanPanel
+              ? "plan"
+              : showPendingQueue && hasPendingPanel
+                ? "pending"
+                : showPreviewComments && hasPreviewCommentsPanel
+                  ? "previewComments"
+                  : null;
+  const composerPanelOpen = activeComposerPanel !== null;
+
+  // When a permission message appears, force the permission panel open and
+  // close any rival panels. When it goes away, close the panel. Done via
+  // the prev-prop comparison pattern (set-state-during-render) instead of
+  // useEffect so React Compiler / eslint don't flag a setState-in-effect.
+  // Mount: prev === current means no side effects fire — intentional, since
+  // panels start closed and there's no permission message at mount.
+  const [prevActivePermissionMessage, setPrevActivePermissionMessage] = useState(activePermissionMessage);
+  if (activePermissionMessage !== prevActivePermissionMessage) {
+    setPrevActivePermissionMessage(activePermissionMessage);
+    if (activePermissionMessage) {
+      setShowPermissionPanel(true);
+      setShowPlan(false);
+      setShowPlanFile(false);
+      setShowPendingQueue(false);
+      setShowPreviewComments(false);
+    } else {
+      setShowPermissionPanel(false);
+    }
+  }
+
+  // Same prev-prop pattern for ask_form: auto-open the form panel when a new
+  // ask_form message arrives, auto-close when it resolves.
+  const [prevActiveFormMessage, setPrevActiveFormMessage] = useState(activeFormMessage);
+  if (activeFormMessage !== prevActiveFormMessage) {
+    setPrevActiveFormMessage(activeFormMessage);
+    if (activeFormMessage) {
+      setShowFormPanel(true);
+      setShowPlan(false);
+      setShowPlanFile(false);
+      setShowPendingQueue(false);
+      setShowPreviewComments(false);
+    } else {
+      setShowFormPanel(false);
+    }
+  }
+
+  // 同样的 prev-prop 模式:auth 卡片出现 → 强制打开 auth 面板并压住其它面板;
+  // auth_succeeded 后 activeAuthMessage 变 null → 自动关闭。auth 优先级最高。
+  const [prevActiveAuthMessage, setPrevActiveAuthMessage] = useState(activeAuthMessage);
+  if (activeAuthMessage !== prevActiveAuthMessage) {
+    setPrevActiveAuthMessage(activeAuthMessage);
+    if (activeAuthMessage) {
+      setShowAuthPanel(true);
+      setShowPermissionPanel(false);
+      setShowPlan(false);
+      setShowPlanFile(false);
+      setShowPendingQueue(false);
+      setShowPreviewComments(false);
+    } else {
+      setShowAuthPanel(false);
+    }
+  }
+
+  // Reset preview-comments toggle when drafts become empty — otherwise a
+  // stale `true` reopens the panel next time a draft is added.
+  if (!hasPreviewCommentsPanel && showPreviewComments) {
+    setShowPreviewComments(false);
+  }
+
+  // ── Chat search (Cmd/Ctrl+F) ────────────────────────────────────────
+  // Skip thinking blocks (data-grove-search-skip) and our own UI.
+  // chatSearch is wired below once `renderItems` is computed.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key !== "f" || !(e.metaKey || e.ctrlKey)) return;
+      const root = taskChatRootRef.current;
+      if (!root) return;
+      const target = document.activeElement;
+      if (!target || !root.contains(target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      setChatSearchOpen((v) => !v);
+    };
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, []);
+
+  const [prevChatIdForSearch, setPrevChatIdForSearch] = useState(activeChatId);
+  if (activeChatId !== prevChatIdForSearch) {
+    setPrevChatIdForSearch(activeChatId);
+    setChatSearchOpen(false);
+    setChatSearchQuery("");
+  }
+
+  const deferredSlashFilter = useDeferredValue(slashFilter);
+  const filteredSlashCommands = useMemo(() => {
+    if (!deferredSlashFilter) return slashCommands;
+    const lower = deferredSlashFilter.toLowerCase();
+    return slashCommands.filter((c) =>
+      c.name.toLowerCase().includes(lower),
+    );
+  }, [slashCommands, deferredSlashFilter]);
+
+  const mentionItems = useMemo(
+    () =>
+      isStudioProject
+        ? buildStudioMentionItems(taskFiles, sketchMeta, taskFilesMeta)
+        : buildMentionItems(taskFiles),
+    [isStudioProject, taskFiles, sketchMeta, taskFilesMeta],
+  );
+
+  const combinedMentionItems = useMemo(
+    () => [...agentMentionItems, ...mentionItems],
+    [agentMentionItems, mentionItems],
+  );
+
+  const deferredFileFilter = useDeferredValue(fileFilter);
+  const filteredFiles = useMemo(() => {
+    // 1. Separate combined items into categories
+    const conversationItems = combinedMentionItems.filter(item => 
+      item.kind === "chat_history"
+    );
+
+    const agentItems = combinedMentionItems.filter(item => 
+      item.kind === "agent_spawn" || 
+      item.kind === "agent_send" || 
+      item.kind === "agent_reply"
+    );
+
+    const fileItems = combinedMentionItems.filter(item => 
+      !conversationItems.includes(item) && 
+      !agentItems.includes(item)
+    );
+
+    // 2. Filter based on activeCategory
+    if (activeCategory === "conversation") {
+      return filterMentionItems(conversationItems, deferredFileFilter, 20);
+    }
+    if (activeCategory === "agent") {
+      return filterMentionItems(agentItems, deferredFileFilter, 20);
+    }
+    if (activeCategory === "file") {
+      return filterMentionItems(fileItems, deferredFileFilter, 20);
+    }
+    if (activeCategory === "browsertabs") {
+      return filterMentionItems(browserTabs, deferredFileFilter, 20);
+    }
+    if (activeCategory === "sketch") {
+      const sketchItems = fileItems.filter(item => item.category === "Sketch");
+      return filterMentionItems(sketchItems, deferredFileFilter, 20);
+    }
+
+    if (activeCategory === "project") {
+      const slashIdx = deferredFileFilter.indexOf("/");
+      if (slashIdx >= 0) {
+        // User typed "@project:MyProject/something"
+        const projectName = deferredFileFilter.slice(0, slashIdx).toLowerCase();
+        const subFilter = deferredFileFilter.slice(slashIdx + 1);
+        
+        // Find matching project
+        const project = allProjects.find(p => p.name.toLowerCase() === projectName);
+        if (project) {
+          const files = projectFiles[project.id];
+          if (files) {
+            // First item: Select Project Root Path!
+            const rootItem: MentionItem = {
+              path: project.path, // absolute root path
+              isDir: true,
+              displayName: project.name,
+              category: "Project Root",
+              kind: "file",
+              sessionId: project.id,
+            };
+            
+            // Extract directories from flat project files to allow selecting folders!
+            // Defensive normalization: strip trailing slash so dir-listed entries
+            // (like "src/lib/") don't double-count, and skip empty / absolute paths
+            // since `${project.path}/${dirPath}` only makes sense for relative input.
+            const dirs = new Set<string>();
+            for (const file of files) {
+              const normalized = file.replace(/\/+$/, "");
+              if (!normalized || normalized.startsWith("/")) continue;
+              const parts = normalized.split("/");
+              for (let i = 1; i < parts.length; i++) {
+                dirs.add(parts.slice(0, i).join("/"));
+              }
+            }
+            
+            const dirItemsList: MentionItem[] = Array.from(dirs).sort().map(dirPath => {
+              const absPath = `${project.path}/${dirPath}`;
+              return {
+                path: absPath,
+                isDir: true,
+                displayName: dirPath,
+                category: project.project_type === "studio" ? "Shared Asset · Folder" : "Project Folder",
+                kind: "file",
+              };
+            });
+            
+            const fileItemsList: MentionItem[] = files.map(filePath => {
+              const absPath = `${project.path}/${filePath}`;
+              const isDir = filePath.endsWith("/");
+              const display = filePath;
+              const categoryBadge = project.project_type === "studio" ? "Shared Asset" : "Project File";
+              
+              return {
+                path: absPath,
+                isDir,
+                displayName: display,
+                category: categoryBadge,
+                kind: "file",
+              };
+            });
+
+            const combinedList = [...dirItemsList, ...fileItemsList];
+            
+            // Filter files and folders
+            const filteredFilesList = filterMentionItems(combinedList, subFilter, 20);
+            
+            // If the query is empty or matches "Select", put the root item at the top!
+            if (!subFilter || rootItem.displayName?.toLowerCase().includes(subFilter.toLowerCase())) {
+              return [{ ...rootItem, score: 9999, indices: [] }, ...filteredFilesList] as FilteredMentionItem[];
+            }
+            
+            return filteredFilesList;
+          } else {
+            // While files are loading, show a loading status row!
+            return [
+              {
+                path: `loading-${project.id}`,
+                isDir: false,
+                displayName: `Loading files for ${project.name}...`,
+                category: "Loading",
+                kind: "file",
+              } as MentionItem
+            ].map(i => ({ ...i, score: 0, indices: [] })) as FilteredMentionItem[];
+          }
+        }
+      }
+      
+      // If no project selected yet or no slash typed, list matching projects!
+      const projectItems: MentionItem[] = allProjects.map(p => ({
+        path: p.name, // path holds project name for Category trigger
+        isDir: p.project_type === "studio",
+        displayName: p.name,
+        category: p.project_type === "studio" ? "Studio Project" : "Coding Project",
+        kind: p.project_type === "studio" ? "agent_spawn" : "file",
+        sessionId: p.id,
+      }));
+      
+      return filterMentionItems(projectItems, deferredFileFilter, 15);
+    }
+
+    // 3. Aggregated Search (activeCategory is null)
+    if (!deferredFileFilter) {
+      // Empty query: Show Category Selectors at the top!
+      const selectors = CATEGORY_SELECTORS.map(s => ({
+        ...s,
+        score: 0,
+        indices: [],
+      }));
+      
+      // Also append top 2-3 items from conversation, agent for quick access
+      const quickConvs = conversationItems.slice(0, 3).map(i => ({ ...i, score: 0, indices: [] }));
+      const quickAgents = agentItems.slice(0, 3).map(i => ({ ...i, score: 0, indices: [] }));
+      
+      return [...selectors, ...quickConvs, ...quickAgents] as FilteredMentionItem[];
+    }
+
+    // Non-empty query: search across all categories (with limited files to avoid noise)
+    const matchedSelectors = filterMentionItems(CATEGORY_SELECTORS, deferredFileFilter, 4);
+    const matchedConvs = filterMentionItems(conversationItems, deferredFileFilter, 10);
+    const matchedAgents = filterMentionItems(agentItems, deferredFileFilter, 10);
+    const matchedFiles = filterMentionItems(fileItems, deferredFileFilter, 5); // Limit files to 5 in aggregated search to avoid clutter!
+
+    // Combine them, sort by score descending
+    const combined = [...matchedConvs, ...matchedAgents, ...matchedFiles];
+    const sortedCombined = combined.sort((a, b) => b.score - a.score);
+    return [...matchedSelectors, ...sortedCombined];
+  }, [
+    combinedMentionItems,
+    deferredFileFilter,
+    activeCategory,
+    allProjects,
+    projectFiles,
+    CATEGORY_SELECTORS,
+    browserTabs,
+  ]);
+
+  // ACP agent availability check is encapsulated in useACPAvailability.
+
+  // Compute available ACP agent options from backend availability. Hide
+  // unavailable agents entirely — they live in the Marketplace modal now.
+  // While availability is still loading, fall back to the static list so
+  // the chat-create flow isn't blank during the first fetch.
+  const acpAgentOptions = useMemo(() => {
+    if (!acpAvailabilityLoaded) {
+      return agentOptions.filter((opt) => opt.acpCheck);
+    }
+    return baseAgents
+      .filter((base) => base.available)
+      .map((base) => {
+        const local = agentOptions.find((a) => a.value === base.id || a.id === base.id);
+        const option = local ?? { id: base.id, label: base.display_name, value: base.id };
+        return { ...option, label: base.display_name, value: base.id };
+      });
+  }, [baseAgents, acpAvailabilityLoaded]);
+
+  const getChatIcon = (agentId: string) => {
+    // Custom Agent Server (user-configured remote / local) takes precedence
+    // over the static brand table — servers aren't registered with
+    // agentIconComponent. Personas are resolved transparently by the util
+    // (it consults the persona registry seeded at fetch time).
+    const custom = customAgents.find((agent) => agent.id === agentId);
+    if (custom?.type === "remote") return Globe;
+    if (custom) return Terminal;
+    return agentIconComponent(agentId);
+  };
+
+  // Resolve a message sender id ("user" | "agent:<chat_id>" | other) into a
+  // human-readable label + an icon component. For agent-to-agent injects
+  // (sender = "agent:<chat_id>") we look up the chat's title and agent kind
+  // so the receiving panel shows e.g. "测试子 Session" with the codex icon
+  // instead of the raw "agent:chat-0daa3a" + generic robot.
+  // Plain function — React Compiler memoizes based on actual reads (chats,
+  // customAgents, getChatIcon's own closure). agentIconComponent is module-
+  // imported and stable; persona registry is consulted via a singleton util.
+  const resolveSender = (sender?: string): { label: string; Icon: React.ComponentType<{ size?: number; className?: string }> } => {
+    if (!sender) return { label: "", Icon: Bot };
+    if (sender === "user") return { label: "user", Icon: User };
+    if (sender.startsWith("agent:")) {
+      const chatId = sender.slice("agent:".length);
+      const chat = chats.find((c) => c.id === chatId);
+      if (chat) {
+        return { label: chat.title, Icon: getChatIcon(chat.agent) };
+      }
+    }
+    return { label: sender, Icon: Bot };
+  };
+
+  // Resolve agent label and icon from active chat's agent
+  useEffect(() => {
+    const resolve = (cmd: string, customAgents?: CustomAgentServer[]) => {
+      const match = agentOptions.find((a) => a.value === cmd);
+      if (match) {
+        setAgentLabel(match.label);
+        if (match.icon) setAgentIcon(() => match.icon!);
+        return;
+      }
+      // Check Custom Agents (personas) first — their id starts with "ca-"
+      const persona = customAgentPersonas.find((p) => p.id === cmd);
+      if (persona) {
+        setAgentLabel(persona.name);
+        // Icon falls through to whatever the base agent's icon is. Look it up.
+        const base = agentOptions.find((a) => a.id === persona.base_agent);
+        if (base?.icon) setAgentIcon(() => base.icon!);
+        return;
+      }
+      // Custom Agent Servers
+      const custom = customAgents?.find((a) => a.id === cmd);
+      if (custom) {
+        setAgentLabel(custom.name);
+      } else {
+        setAgentLabel(cmd);
+      }
+    };
+
+    if (activeChat) {
+      // Load config to get custom agents for resolution
+      getConfig()
+        .then((cfg) => resolve(activeChat.agent, cfg.acp?.custom_agents))
+        .catch(() => resolve(activeChat.agent));
+    } else {
+      getConfig()
+        .then((cfg) =>
+          resolve(cfg.layout.agent_command || "claude", cfg.acp?.custom_agents),
+        )
+        .catch(() => resolve("claude"));
+    }
+  }, [activeChat, customAgentPersonas]);
+
+  // ─── @ mention file list with TTL cache (5s) ──────────────────────
+  const TASK_FILES_TTL_MS = 10_000;
+
+  const refreshTaskFilesIfNeeded = useCallback(() => {
+    if (taskFilesLoadingRef.current) return;
+    const now = Date.now();
+    if (now - taskFilesFetchTimeRef.current < TASK_FILES_TTL_MS) {
+      taskFilesFetchTimeRef.current = now;
+      return;
+    }
+    taskFilesLoadingRef.current = true;
+    taskFilesFetchTimeRef.current = now;
+
+    getTaskFiles(projectId, task.id)
+      .then((res) => {
+        setTaskFiles(res.files);
+        setTaskFilesMeta(res.metadata || []);
+      })
+      .catch(() => {})
+      .finally(() => {
+        taskFilesLoadingRef.current = false;
+      });
+
+    if (isStudioProject) {
+      listSketches(projectId, task.id).catch(() => {});
+    }
+  }, [projectId, task.id, isStudioProject]);
+
+  const refreshProjectsIfNeeded = useCallback(() => {
+    if (allProjects.length > 0) return;
+    listProjects()
+      .then((res) => {
+        setAllProjects(res.projects || []);
+      })
+      .catch(() => {});
+  }, [allProjects.length]);
+
+  // Initial load on mount / task switch. refreshTaskFilesIfNeeded is a
+  // useCallback whose deps are [projectId, task.id, isStudioProject], so
+  // including it here only adds isStudioProject as a transitive dep.
+  // Workspace-level isStudioProject changes already imply a task switch,
+  // so the extra refire is harmless.
+  useEffect(() => {
+    taskFilesFetchTimeRef.current = 0; // force stale on task switch
+    refreshTaskFilesIfNeeded();
+  }, [projectId, task.id, refreshTaskFilesIfNeeded]);
+
+  // Refresh agent-graph @-mention candidates whenever the active chat changes
+  // or the user opens the popover. Spawn candidates come from `acpAgentOptions`
+  // (same source as the "+" new-chat picker) so icons line up; send / reply
+  // candidates come from the backend's contacts view of the caller chat.
+  const refreshAgentMentionCandidates = useCallback(() => {
+    if (!activeChatId) {
+      setAgentMentionItems([]);
+      return;
+    }
+    const spawnAgents = acpAgentOptions
+      .filter((o) => !o.disabled)
+      .map((o) => ({ value: o.value, label: o.label }));
+    const spawnPersonas = customAgentPersonas.map((p) => ({
+      id: p.id,
+      name: p.name,
+      base_agent: p.base_agent,
+      duty: p.duty,
+    }));
+    // Sibling chats in the same task (excluding the active one) — feed
+    // `Read History` mentions so the AI can inspect another chat's
+    // history.jsonl by absolute path.
+    const siblingChats = chats
+      .filter((c) => c.id !== activeChatId)
+      .map((c) => ({
+        chat_id: c.id,
+        name: c.title,
+        agent: c.agent,
+        history_path: c.history_path,
+      }));
+    getMentionCandidates(projectId, task.id, activeChatId)
+      .then((resp) => {
+        setAgentMentionItems(
+          buildAgentMentionItems({
+            spawnAgents,
+            spawnPersonas,
+            outgoing: resp.outgoing,
+            pending_replies: resp.pending_replies,
+            siblingChats,
+          }),
+        );
+      })
+      .catch(() => {
+        setAgentMentionItems(
+          buildAgentMentionItems({
+            spawnAgents,
+            spawnPersonas,
+            outgoing: [],
+            pending_replies: [],
+            siblingChats,
+          }),
+        );
+      });
+  }, [projectId, task.id, activeChatId, acpAgentOptions, customAgentPersonas, chats]);
+
+  // Defer to a microtask so the synchronous setAgentMentionItems([]) path
+  // for !activeChatId doesn't trip the set-state-in-effect rule. We still
+  // run after every dep change. `cancelled` guards against unmount/dep-change
+  // racing with the microtask flush.
+  useEffect(() => {
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      refreshAgentMentionCandidates();
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshAgentMentionCandidates]);
+
+  // Studio: also load sketches so @ mentions can surface sketch names.
+  // Wrapped in queueMicrotask so the synchronous setSketchMeta([]) path
+  // doesn't trip eslint's setState-in-effect cascade-render rule.
+  useEffect(() => {
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      if (!isStudioProject) {
+        setSketchMeta([]);
+        return;
+      }
+      listSketches(projectId, task.id)
+        .then((meta) => {
+          if (!cancelled) setSketchMeta(meta);
+        })
+        .catch(() => {
+          if (!cancelled) setSketchMeta([]);
+        });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isStudioProject, projectId, task.id]);
+
+  // Dynamically measure the input area height. With Virtuoso, we feed this
+  // into the Footer component's height so the last message is never
+  // obscured by the composer (banners, expanded input, etc. all change
+  // this value over time).
+  useEffect(() => {
+    const el = inputAreaRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const apply = () => {
+      const h = el.getBoundingClientRect().height;
+      setInputAreaHeight((prev) => (Math.abs(prev - h) > 1 ? h : prev));
+    };
+    const ro = new ResizeObserver(apply);
+    ro.observe(el);
+    apply();
+    return () => ro.disconnect();
+  }, [activeChatId]);
+
+  // Watch the chatbox container width — flip to narrow mode when the
+  // composer can't comfortably fit the Model / Mode / Thinking dropdowns
+  // alongside the input + Send button.
+  useEffect(() => {
+    const el = chatboxContainerRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      const w = el.getBoundingClientRect().width;
+      setComposerNarrow(w > 0 && w < COMPOSER_HIDE_ALL_WIDTH);
+      setComposerHideThinking(w > 0 && w < COMPOSER_HIDE_THINKING_WIDTH);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Set while a programmatic scrollToIndex is in flight. Virtuoso fires
+  // isScrolling(true) for ANY scroll (including ours), which would
+  // otherwise let a transient atBottom=false (caused by layout reflow
+  // during the same window) wrongly disable auto-stick. We clear it on
+  // the next animation frames so any post-scroll bottom flutter is also
+  // ignored.
+  const programmaticScrollRef = useRef(false);
+  const programmaticScrollClearTimerRef = useRef<number | null>(null);
+  const markProgrammaticScroll = useCallback(() => {
+    programmaticScrollRef.current = true;
+    if (programmaticScrollClearTimerRef.current !== null) {
+      cancelAnimationFrame(programmaticScrollClearTimerRef.current);
+    }
+    // Two rAFs covers: (1) the scroll-induced isScrolling burst, (2) any
+    // atBottomStateChange that fires immediately after the scroll lands.
+    // Note: ~32ms total. A user wheel/touch scroll arriving in this
+    // window will be absorbed (their atBottom=false is ignored). Trade
+    // is intentional — the alternative is letting layout reflow during
+    // streaming auto-scroll wrongly disable auto-stick.
+    programmaticScrollClearTimerRef.current = requestAnimationFrame(() => {
+      programmaticScrollClearTimerRef.current = requestAnimationFrame(() => {
+        programmaticScrollRef.current = false;
+        programmaticScrollClearTimerRef.current = null;
+      });
+    });
+  }, []);
+
+  // Cancel any pending programmatic-scroll-clear rAFs on unmount so the
+  // closure doesn't fire against a torn-down component.
+  useEffect(() => {
+    return () => {
+      if (programmaticScrollClearTimerRef.current !== null) {
+        cancelAnimationFrame(programmaticScrollClearTimerRef.current);
+        programmaticScrollClearTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const scrollMessagesToBottom = useCallback(
+    (behavior: ScrollBehavior = "smooth") => {
+      const handle = virtuosoRef.current;
+      if (!handle) return; // Virtuoso not mounted yet — no useful fallback.
+      // Virtuoso accepts only "auto" | "smooth"; coerce "instant" → "auto".
+      const vBehavior: "auto" | "smooth" =
+        behavior === "smooth" ? "smooth" : "auto";
+      markProgrammaticScroll();
+      handle.scrollToIndex({
+        index: "LAST",
+        align: "end",
+        behavior: vBehavior,
+      });
+    },
+    [markProgrammaticScroll],
+  );
+
+  const enableAutoStickToBottom = useCallback(
+    (behavior: ScrollBehavior = "smooth") => {
+      autoStickToBottomRef.current = true;
+      scrollMessagesToBottom(behavior);
+      requestAnimationFrame(() => setShowScrollToBottom(false));
+    },
+    [scrollMessagesToBottom],
+  );
+
+  // Auto-stick state is driven by Virtuoso callbacks. To distinguish
+  // "user actively scrolled away" from "layout reflow nudged us off
+  // bottom" (e.g. composer grew by a line, banner appeared), we only
+  // disable auto-stick when atBottom flips while isScrolling is true —
+  // i.e. there's a live user-driven scroll in progress. Re-enabling
+  // happens unconditionally when atBottom becomes true.
+  const isUserScrollingRef = useRef(false);
+  const handleIsScrolling = useCallback((scrolling: boolean) => {
+    isUserScrollingRef.current = scrolling;
+  }, []);
+
+  // The tail-signature autoscroll path used to fire scrollMessagesToBottom
+  // on every streaming token. With Virtuoso, `followOutput` already
+  // handles "follow new content while at bottom", and running BOTH causes
+  // the two scroll commands to fight each other (visible chunkiness).
+  // We keep the signature memo only because the chat-switch effect reads
+  // autoScrollTailSignatureRef to seed prevAutoScrollTailRef.
+  const autoScrollTailSignature = useMemo(
+    () => getAutoScrollTailSignature(messages),
+    [messages],
+  );
+  const prevAutoScrollTailRef = useRef(autoScrollTailSignature);
+  const autoScrollTailSignatureRef = useRef(autoScrollTailSignature);
+  useEffect(() => {
+    autoScrollTailSignatureRef.current = autoScrollTailSignature;
+  }, [autoScrollTailSignature]);
+
+  // Pin to bottom once per chat. Markdown messages have wildly variable
+  // heights (code blocks, mermaid, images) that only stabilize after
+  // their content actually renders — sometimes 5–10 frames after Virtuoso
+  // mounts the row. A single scrollToIndex on mount lands at whatever
+  // position Virtuoso ESTIMATED, which is usually wrong. Solution: retry
+  // the scroll across ~12 animation frames (~200ms) so we keep snapping
+  // to the (continuously updating) real bottom until heights settle.
+  const initialPinChatIdRef = useRef<string | null>(null);
+  // While true, the Virtuoso list is rendered invisibly so the user
+  // doesn't see the "first row → snap to last row" flash. Revealed as
+  // soon as either (a) atBottomStateChange confirms we landed at the
+  // bottom, or (b) a hard fallback timeout fires.
+  const { chatPositioning, notifyPositionedAtBottom } = useChatPositioning({
+    activeChatId,
+    messagesLength: messages.length,
+    scrollMessagesToBottom,
+    initialPinChatIdRef,
+    suppressNextSmoothScrollRef,
+    prevAutoScrollTailRef,
+    autoScrollTailSignatureRef,
+    autoStickToBottomRef,
+    setShowScrollToBottom,
+  });
+
+  // Defined after useChatPositioning so notifyPositionedAtBottom is in scope
+  // for the useCallback's dependency array.
+  const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
+    if (atBottom) {
+      autoStickToBottomRef.current = true;
+      // Chat-switch reveal: as soon as Virtuoso confirms we're at bottom,
+      // fade the list in (vs waiting the hard fallback timeout).
+      notifyPositionedAtBottom();
+    } else if (
+      isUserScrollingRef.current &&
+      !programmaticScrollRef.current
+    ) {
+      autoStickToBottomRef.current = false;
+    }
+    setShowScrollToBottom(!atBottom && messagesCountRef.current > 0);
+  }, [notifyPositionedAtBottom]);
+
+  // Auto-scroll slash menu to keep selected item visible
+  useEffect(() => {
+    slashItemRefs.current[slashSelectedIdx]?.scrollIntoView({
+      block: "nearest",
+    });
+  }, [slashSelectedIdx]);
+
+  // Close dropdown menus when clicking outside
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(
+      sessionModeStorageKey,
+      sessionRailCollapsed ? "header" : "sidebar",
+    );
+  }, [sessionModeStorageKey, sessionRailCollapsed]);
+
+  // Reload session-rail preference from localStorage when the storage key
+  // changes (project switch). Set-state-during-render with a prev-key guard
+  // is the documented pattern that avoids the cascading-render warning.
+  // Mount: prev === current means no read fires — intentional, since
+  // sessionRailCollapsed already loads from localStorage via its lazy
+  // useState initializer at mount.
+  const [prevSessionModeStorageKey, setPrevSessionModeStorageKey] = useState(sessionModeStorageKey);
+  if (sessionModeStorageKey !== prevSessionModeStorageKey) {
+    setPrevSessionModeStorageKey(sessionModeStorageKey);
+    if (typeof window !== "undefined") {
+      setSessionRailCollapsed(
+        window.localStorage.getItem(sessionModeStorageKey) !== "sidebar",
+      );
+    }
+  }
+
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      if (
+        modelMenuRef.current &&
+        !modelMenuRef.current.contains(e.target as Node)
+      )
+        setShowModelMenu(false);
+      if (
+        permMenuRef.current &&
+        !permMenuRef.current.contains(e.target as Node)
+      )
+        setShowPermMenu(false);
+      if (
+        thoughtLevelMenuRef.current &&
+        !thoughtLevelMenuRef.current.contains(e.target as Node)
+      )
+        setShowThoughtLevelMenu(false);
+      if (
+        chatMenuRef.current &&
+        !chatMenuRef.current.contains(e.target as Node)
+      )
+        setShowChatMenu(false);
+      const insideHeaderAgentPicker =
+        headerAgentPickerRef.current?.contains(e.target as Node) ?? false;
+      const insideSidebarAgentPicker =
+        sidebarAgentPickerRef.current?.contains(e.target as Node) ?? false;
+      const insideAgentPickerMenu =
+        agentPickerMenuRef.current?.contains(e.target as Node) ?? false;
+      if (
+        !insideHeaderAgentPicker &&
+        !insideSidebarAgentPicker &&
+        !insideAgentPickerMenu
+      ) {
+        setShowAgentPicker(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, []);
+
+  useEffect(() => {
+    showAgentPickerRef.current = showAgentPicker;
+  }, [showAgentPicker]);
+
+  const toggleAgentPicker = useCallback((el: HTMLElement) => {
+    if (showAgentPickerRef.current) {
+      setShowAgentPicker(false);
+      return;
+    }
+
+    const rect = el.getBoundingClientRect();
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const preferredLeft = rect.right + AGENT_PICKER_VIEWPORT_MARGIN;
+    const preferredTop = rect.top;
+
+    setAgentPickerAnchor({
+      top: Math.max(
+        AGENT_PICKER_VIEWPORT_MARGIN,
+        Math.min(
+          preferredTop,
+          viewportHeight - AGENT_PICKER_MENU_MAX_HEIGHT - AGENT_PICKER_VIEWPORT_MARGIN,
+        ),
+      ),
+      left: Math.max(
+        AGENT_PICKER_VIEWPORT_MARGIN,
+        Math.min(
+          preferredLeft,
+          viewportWidth - AGENT_PICKER_MENU_WIDTH - AGENT_PICKER_VIEWPORT_MARGIN,
+        ),
+      ),
+    });
+    setShowChatMenu(false);
+    setShowAgentPicker(true);
+  }, []);
+
+  useEffect(() => {
+    if (!showAgentPicker) return;
+
+    const close = () => setShowAgentPicker(false);
+    const onScroll = (e: Event) => {
+      // Don't close when the user scrolls inside the dropdown itself.
+      const menu = agentPickerMenuRef.current;
+      if (menu && e.target instanceof Node && menu.contains(e.target)) return;
+      close();
+    };
+    window.addEventListener("resize", close);
+    window.addEventListener("scroll", onScroll, true);
+
+    return () => {
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", onScroll, true);
+    };
+  }, [showAgentPicker]);
+
+  // ─── Save/Restore per-chat state on switch ─────────────────────────────
+
+  /** Save current active chat state to cache */
+  const saveCurrentChatState = useCallback(() => {
+    if (!activeChatId) return;
+    perChatStateRef.current.set(activeChatId, {
+      messages,
+      hiddenMessageCount,
+      attachmentCounters: { ...attachCountersRef.current },
+      isBusy,
+      selectedModel,
+      permissionLevel,
+      modelOptions,
+      modeOptions,
+      thoughtLevelOptions,
+      thoughtLevel,
+      thoughtLevelConfigId,
+      planEntries,
+      slashCommands,
+      isConnected,
+      agentLabel,
+      agentIcon: AgentIcon,
+      promptCaps,
+      forkCapable,
+      planFilePath,
+      planFileContent,
+      isRemoteSession,
+      remoteOwnerName,
+      draftHtml: editableRef.current?.innerHTML ?? "",
+      contextUsage,
+      pendingMessages,
+    });
+    saveChatDraft(activeChatId, editableRef.current?.innerHTML ?? "");
+  }, [
+    activeChatId,
+    messages,
+    hiddenMessageCount,
+    isBusy,
+    selectedModel,
+    permissionLevel,
+    modelOptions,
+    modeOptions,
+    thoughtLevelOptions,
+    thoughtLevel,
+    thoughtLevelConfigId,
+    planEntries,
+    slashCommands,
+    isConnected,
+    agentLabel,
+    AgentIcon,
+    promptCaps,
+    forkCapable,
+    planFilePath,
+    planFileContent,
+    isRemoteSession,
+    remoteOwnerName,
+    contextUsage,
+    pendingMessages,
+  ]);
+
+  /** Restore chat state from cache */
+  const restoreChatState = useCallback((chatId: string) => {
+    const cached = perChatStateRef.current.get(chatId);
+    if (cached) {
+      setMessages(cached.messages);
+      updateHiddenMessageCount(cached.hiddenMessageCount);
+      updateBusy(cached.isBusy);
+      setSelectedModel(cached.selectedModel);
+      setPermissionLevel(cached.permissionLevel);
+      setModelOptions(cached.modelOptions);
+      setModeOptions(cached.modeOptions);
+      setThoughtLevelOptions(cached.thoughtLevelOptions);
+      setThoughtLevel(cached.thoughtLevel);
+      setThoughtLevelConfigId(cached.thoughtLevelConfigId);
+      setPlanEntries(cached.planEntries);
+      setSlashCommands(cached.slashCommands);
+      setIsConnected(cached.isConnected);
+      setAgentLabel(cached.agentLabel);
+      if (cached.agentIcon) setAgentIcon(() => cached.agentIcon);
+      setPromptCaps(cached.promptCaps);
+      // 不从 cache 恢复 forkCapable:cache 是 chat 切换前的快照,可能 stale
+      // (agent 升级 / 能力被关掉)。等 SessionReady / snapshot 到达由 live
+      // 信号刷新;在那之前先按"未知 → 隐藏"处理,避免误显示按钮。
+      setForkCapable(false);
+      setPlanFilePath(cached.planFilePath);
+      setPlanFileContent(cached.planFileContent);
+      planFilePathRef.current = cached.planFilePath;
+      setShowPlanFile(!!cached.planFileContent);
+      setIsRemoteSession(cached.isRemoteSession);
+      setRemoteOwnerName(cached.remoteOwnerName);
+      setContextUsage(cached.contextUsage);
+    } else {
+      setMessages([]);
+      updateHiddenMessageCount(0);
+      updateBusy(false);
+      setSelectedModel("");
+      setPermissionLevel("");
+      setModelOptions([]);
+      setModeOptions([]);
+      setThoughtLevelOptions([]);
+      setThoughtLevel("");
+      setThoughtLevelConfigId("");
+      setPlanEntries([]);
+      setContextUsage(null);
+      setSlashCommands([]);
+      setIsConnected(false);
+      setConnectPhase(null);
+      setConnectPhaseStartedAt(null);
+      setIsTerminalMode(false);
+      setPromptCaps({ image: false, audio: false, embeddedContext: false });
+      setForkCapable(false);
+      setPlanFilePath("");
+      setPlanFileContent("");
+      planFilePathRef.current = "";
+      setShowPlanFile(false);
+      setIsRemoteSession(false);
+      setRemoteOwnerName("");
+    }
+    // 从缓存恢复 pending queue;tab 切换时 WS 不会断,server 也不会主动
+    // 重发 queue_update,只能靠本地缓存 — 若 cache miss(首次进入此 chat)
+    // 才置空,等首条 queue_update 灌入。
+    setPendingMessages(cached?.pendingMessages ?? []);
+    // Clear attachments on chat switch (revoke blob URLs to avoid leaks)
+    setAttachments((prev) => {
+      prev.forEach((att) => { if (att.previewUrl) URL.revokeObjectURL(att.previewUrl); });
+      return [];
+    });
+    const restoredMessages = perChatStateRef.current.get(chatId)?.messages ?? [];
+    attachCountersRef.current =
+      cached?.attachmentCounters ?? buildAttachmentCounters(restoredMessages);
+    // Point wsRef to this chat's WebSocket
+    wsRef.current = wsMapRef.current.get(chatId) ?? null;
+    // Restore the unsent composer draft for this chat. innerHTML round-trip
+    // preserves slash/file chips because click handlers are delegated on the
+    // editable container, not attached to individual chip DOM nodes.
+    // If the chat is in the in-memory cache, use the cached draft even
+    // when it's the empty string (the user intentionally cleared it on
+    // a tab switch). Falling through to localStorage in that case would
+    // resurrect an older saved draft.
+    const draftHtml = cached ? cached.draftHtml : loadChatDraft(chatId);
+    const el = editableRef.current;
+    if (el) {
+      el.innerHTML = draftHtml;
+      // Refresh hasContent since we bypassed onInput; attachments were just
+      // cleared above, so drive the flag off the draft alone.
+      const text = el.textContent?.trim() || "";
+      const hasChips = el.querySelector("[data-command],[data-file]") !== null;
+      setHasContent(text.length > 0 || hasChips);
+    }
+  }, [updateBusy, updateHiddenMessageCount]);
+
+  // Initial chat list load is encapsulated in useInitialChatLoad.
+  useInitialChatLoad({
+    projectId,
+    taskId: task.id,
+    setChats,
+    setActiveChatId,
+  });
+
+  // Forward-declared ref for connectChatWs so handlers defined before its
+  // useCallback (e.g. the ChatListChanged refetch handler) can call it
+  // without creating a TDZ reference that React Compiler refuses to compile.
+  const connectChatWsRef = useRef<(chatId: string) => Promise<void>>(
+    async () => {},
+  );
+
+  // ─── Auto-refetch chat list on RadioEvent::ChatListChanged ─────────────
+  // Fired by the `grove_agent_graph_spawn` MCP tool after a sibling session is
+  // spawned. Without this hook, an agent-spawned chat would be invisible in
+  // the UI until the user manually refreshed.
+  useRadioEvents({
+    onChatListChanged: (evtProjectId, evtTaskId) => {
+      if (evtProjectId !== projectId || evtTaskId !== task.id) return;
+      void (async () => {
+        let fresh: ChatSessionResponse[];
+        try {
+          fresh = await listChats(projectId, task.id);
+        } catch (err) {
+          console.error("Failed to refetch chats after ChatListChanged:", err);
+          return;
+        }
+        const freshIds = new Set(fresh.map((chat) => chat.id));
+        wsMapRef.current.forEach((ws, chatId) => {
+          if (freshIds.has(chatId)) return;
+          intentionalCloseRef.current.add(chatId);
+          ws.close();
+          wsMapRef.current.delete(chatId);
+          perChatStateRef.current.delete(chatId);
+          cancelPendingReconnectRef.current(chatId);
+        });
+
+        setChats(fresh);
+
+        // If a tray/notification deep-link was waiting on this chat to
+        // appear (race: Open clicked before grove_agent_graph_spawn's chat is in
+        // listChats yet), satisfy it now.
+        const pending = (window as unknown as Record<string, unknown>)
+          .__grove_pending_chat as
+          | { projectId: string; taskId: string; chatId: string }
+          | undefined;
+        const pendingMatches =
+          pending !== undefined &&
+          pending.projectId === projectId &&
+          pending.taskId === task.id &&
+          freshIds.has(pending.chatId);
+        if (pendingMatches && pending) {
+          const targetId = pending.chatId;
+          delete (window as unknown as Record<string, unknown>).__grove_pending_chat;
+          setActiveChatId(targetId);
+          writeLastActiveTab("chat", projectId, task.id, targetId);
+          restoreChatState(targetId);
+          await connectChatWsRef.current(targetId);
+          wsRef.current = wsMapRef.current.get(targetId) ?? null;
+          return;
+        }
+
+        const current = getActiveChatId();
+        if (current && freshIds.has(current)) return;
+
+        const next = fresh[fresh.length - 1];
+        if (next) {
+          setActiveChatId(next.id);
+          writeLastActiveTab("chat", projectId, task.id, next.id);
+          restoreChatState(next.id);
+          await connectChatWsRef.current(next.id);
+          wsRef.current = wsMapRef.current.get(next.id) ?? null;
+        } else {
+          setActiveChatId(null);
+          restoreChatState("__deleted__");
+          wsRef.current = null;
+        }
+      })();
+    },
+  });
+
+  // ─── External chat switch (Radio → Blitz) ──────────────────────────────
+
+  const switchChatRef = useRef<(chatId: string) => void>(() => {});
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (!detail?.chatId) return;
+      if (detail.projectId !== projectId || detail.taskId !== task.id) return;
+      // If the target chat isn't in our list yet (just spawned, MCP write
+      // hasn't propagated to listChats), park it as pending so the
+      // ChatListChanged handler picks it up. Otherwise switch immediately.
+      const known = chatsRef.current.some((c) => c.id === detail.chatId);
+      if (!known) {
+        (window as unknown as Record<string, unknown>).__grove_pending_chat = {
+          projectId: detail.projectId,
+          taskId: detail.taskId,
+          chatId: detail.chatId,
+        };
+        return;
+      }
+      switchChatRef.current(detail.chatId);
+    };
+    window.addEventListener("grove:switch-chat", handler);
+    return () => window.removeEventListener("grove:switch-chat", handler);
+  }, [projectId, task.id]);
+
+  // ─── Per-chat WebSocket management ─────────────────────────────────────
+
+  // Refs for WS callbacks so connectChatWs doesn't need them as deps
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handleServerMessageRef = useRef<(msg: any) => void>(() => {});
+  const handleServerMessageForCacheRef = useRef<
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (chatId: string, msg: any) => void
+  >(() => {});
+  const onConnectedPropRef = useRef(onConnectedProp);
+  const onDisconnectedPropRef = useRef(onDisconnectedProp);
+  useEffect(() => {
+    onConnectedPropRef.current = onConnectedProp;
+    onDisconnectedPropRef.current = onDisconnectedProp;
+  }, [onConnectedProp, onDisconnectedProp]);
+
+  /** Connect a WebSocket for a given chat ID (idempotent) */
+  const connectChatWs = useCallback(
+    async (chatId: string) => {
+      if (wsMapRef.current.has(chatId)) return; // Already connected
+      if (connectingRef.current.has(chatId)) return; // Connection already in-flight
+      // Terminal-mode chats have no ACP WebSocket — they speak PTY only.
+      // Bailing here keeps wsRef.current null for those chats; handleSend
+      // already branches on isTerminalLaunchMode before touching wsRef.
+      const chat = chatsRef.current.find((c) => c.id === chatId);
+      if (!chat) {
+        // Chats list hasn't loaded yet — we'd be guessing whether this chat
+        // is ACP or terminal mode. Bail; caller retries after the chats
+        // fetch completes via the [activeChatId, chats] effect below.
+        connectingRef.current.delete(chatId);
+        return;
+      }
+      if (chat.launch_mode === "terminal") {
+        connectingRef.current.delete(chatId);
+        return;
+      }
+      connectingRef.current.add(chatId);
+
+      const host = getApiHost();
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const url = await appendHmacToUrl(
+        `${protocol}//${host}/api/v1/projects/${projectId}/tasks/${task.id}/chats/${chatId}/ws`,
+      );
+
+      connectingRef.current.delete(chatId);
+      // Re-check after async gap: another call may have connected while we awaited
+      if (wsMapRef.current.has(chatId)) return;
+
+      const ws = new WebSocket(url);
+      wsMapRef.current.set(chatId, ws);
+
+      ws.onopen = () => {
+        // Successful connect — reset backoff so the next disconnect retries fast.
+        reconnectAttemptRef.current.delete(chatId);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          // Permanent-failure check: if backend says "Resume session failed"
+          // (commit 5ec92be), the saved_id is stale and retries with the same
+          // id will keep failing. Mark this chat as intentionally closing so
+          // the onclose handler skips the exponential-backoff ladder.
+          //
+          // Use `includes` (not `startsWith`) because run_acp_session's caller
+          // wraps the inner error: the message may arrive as the raw
+          // "Resume session failed: ..." OR as the wrapped
+          // "ACP session error: Internal error: \"Resume session failed: ...\"".
+          // Substring match survives either format.
+          if (
+            data?.type === "error" &&
+            typeof data.message === "string" &&
+            data.message.includes("Resume session failed")
+          ) {
+            intentionalCloseRef.current.add(chatId);
+            cancelPendingReconnectRef.current(chatId);
+          }
+          if (chatId === getActiveChatId()) {
+            if (historyLoadingRef.current) {
+              wsEventBufferRef.current.push(data);
+            } else {
+              handleServerMessageRef.current(data);
+            }
+          } else {
+            // Buffer into per-chat cache
+            handleServerMessageForCacheRef.current(chatId, data);
+          }
+        } catch {
+          /* ignore */
+        }
+      };
+
+      ws.onclose = () => {
+        wsMapRef.current.delete(chatId);
+        if (chatId === getActiveChatId()) {
+          setIsConnected(false);
+          onDisconnectedPropRef.current?.();
+        } else {
+          const cached = perChatStateRef.current.get(chatId);
+          if (cached) cached.isConnected = false;
+        }
+        // Auto-reconnect after unexpected close (e.g., session killed by Take Control).
+        // Skip if this was an intentional close (unmount, chat switch, etc.)
+        if (intentionalCloseRef.current.has(chatId)) {
+          intentionalCloseRef.current.delete(chatId);
+          cancelPendingReconnectRef.current(chatId);
+        } else {
+          // Exponential backoff: 1s, 2s, 4s, 8s, 16s — cap at 30s. Give up after 5
+          // attempts to avoid hammering the agent on permanent failures (stale
+          // saved_id, agent crashed). User can manually retry by re-opening the chat.
+          const attempt = reconnectAttemptRef.current.get(chatId) ?? 0;
+          const WS_MAX_RECONNECT_ATTEMPTS = 5;
+          if (attempt >= WS_MAX_RECONNECT_ATTEMPTS) {
+            if (chatId === getActiveChatId()) {
+              setMessages((prev) =>
+                appendSystemMessage(
+                  prev,
+                  "Unable to reconnect after multiple attempts. Reopen the chat to retry.",
+                ),
+              );
+            }
+            reconnectAttemptRef.current.delete(chatId);
+            return;
+          }
+          const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
+          reconnectAttemptRef.current.set(chatId, attempt + 1);
+          const timer = setTimeout(() => {
+            reconnectTimerRef.current.delete(chatId);
+            if (!wsMapRef.current.has(chatId)) {
+              connectChatWsRef.current(chatId).then(() => {
+                if (chatId === getActiveChatId()) {
+                  wsRef.current = wsMapRef.current.get(chatId) ?? null;
+                }
+              });
+            }
+          }, delay);
+          reconnectTimerRef.current.set(chatId, timer);
+        }
+      };
+
+      ws.onerror = () => {
+        if (chatId === getActiveChatId()) {
+          setMessages((prev) => appendSystemMessage(prev, "Connection error."));
+        }
+      };
+    },
+    [projectId, task.id, getActiveChatId],
+  );
+
+
+  useEffect(() => {
+    connectChatWsRef.current = connectChatWs;
+  }, [connectChatWs]);
+
+  // activeChatIdRef is owned by useActiveChatId — no separate declaration here.
+
+  // Connect WS first (for real-time events + SessionReady), then load history via HTTP
+  useEffect(() => {
+    if (!activeChatId) return;
+    const chatId = activeChatId;
+    historyLoadingRef.current = true;
+    wsEventBufferRef.current = [];
+    (async () => {
+      // Step 1: Connect WS for real-time events
+      await connectChatWs(chatId);
+      wsRef.current = wsMapRef.current.get(chatId) ?? null;
+      // Step 2: Load history from HTTP (one-shot, avoids "过电影" effect)
+      if (chatId !== getActiveChatId()) return;
+      let res: Awaited<ReturnType<typeof getChatHistory>>;
+      try {
+        res = await getChatHistory(projectId, task.id, chatId);
+      } catch {
+        historyLoadingRef.current = false;
+        wsEventBufferRef.current = [];
+        return;
+      }
+      if (chatId !== getActiveChatId()) return;
+      {
+        let msgs: ChatMessage[] = [];
+        for (const evt of res.events) {
+          msgs = reduceHistoryMessages(msgs, evt);
+        }
+        // Drain buffered WS events that arrived during HTTP load
+        const buffered = wsEventBufferRef.current;
+        wsEventBufferRef.current = [];
+        historyLoadingRef.current = false;
+        // Reduce buffered message events into msgs locally (avoids React batching concerns)
+        for (const evt of buffered) {
+          msgs = reduceHistoryMessages(msgs, evt);
+        }
+        const attachmentCounters = buildAttachmentCounters(msgs);
+        const prunedHistory = pruneChatViewMessages(
+          msgs,
+          0,
+          chatRenderWindowSettings,
+        );
+        msgs = prunedHistory.messages;
+        setMessages(msgs);
+        updateHiddenMessageCount(prunedHistory.hiddenMessageCount);
+        // Keep attachment numbering based on full history, even when old
+        // rendered messages are hidden from the view.
+        attachCountersRef.current = attachmentCounters;
+        // Process non-message side effects from buffered events
+        for (const evt of buffered) {
+          switch (evt.type) {
+            case "session_ready":
+              setIsConnected(true);
+              onConnectedPropRef.current?.();
+              if (evt.available_modes?.length) {
+                setModeOptions(
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  evt.available_modes.map((m: any) => ({
+                    label: m.name,
+                    value: m.id,
+                  })),
+                );
+              }
+              if (evt.current_mode_id) setPermissionLevel(evt.current_mode_id);
+              if (evt.available_models?.length) {
+                setModelOptions(
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  evt.available_models.map((m: any) => ({
+                    label: m.name,
+                    value: m.id,
+                  })),
+                );
+              }
+              if (evt.current_model_id) setSelectedModel(evt.current_model_id);
+              if (evt.available_thought_levels?.length) {
+                setThoughtLevelOptions(
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  evt.available_thought_levels.map((t: any) => ({
+                    label: t.name,
+                    value: t.id,
+                  })),
+                );
+              }
+              if (evt.current_thought_level_id)
+                setThoughtLevel(evt.current_thought_level_id);
+              if (evt.thought_level_config_id)
+                setThoughtLevelConfigId(evt.thought_level_config_id);
+              if (evt.prompt_capabilities) {
+                setPromptCaps({
+                  image: evt.prompt_capabilities.image ?? false,
+                  audio: evt.prompt_capabilities.audio ?? false,
+                  embeddedContext:
+                    evt.prompt_capabilities.embedded_context ?? false,
+                });
+              }
+              setForkCapable(!!evt.fork_capable);
+              break;
+            case "thought_levels_update":
+              setThoughtLevelOptions(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                (evt.available ?? []).map((t: any) => ({
+                  label: t.name,
+                  value: t.id,
+                })),
+              );
+              setThoughtLevel(evt.current ?? "");
+              setThoughtLevelConfigId(evt.config_id ?? "");
+              break;
+            case "busy":
+              updateBusy(true);
+              break;
+            case "complete":
+              updateBusy(false);
+              break;
+            case "plan_update":
+              setPlanEntries(evt.entries || []);
+              break;
+            case "queue_update":
+              setPendingMessages(
+                (evt.messages ?? []).map(
+                  (m: { id?: string; text: string } | string) =>
+                    typeof m === "string"
+                      ? { id: "", text: m }
+                      : { id: m.id ?? "", text: m.text },
+                ),
+              );
+              break;
+            case "available_commands":
+              setSlashCommands(evt.commands ?? []);
+              break;
+            case "usage_update":
+              setContextUsage({
+                used: Number(evt.used) || 0,
+                size: Number(evt.size) || 0,
+                cost: evt.cost
+                  ? {
+                      amount: Number(evt.cost.amount) || 0,
+                      currency: String(evt.cost.currency ?? ""),
+                    }
+                  : null,
+              });
+              break;
+            case "session_ended":
+              setIsConnected(false);
+              setConnectPhase(null);
+              setConnectPhaseStartedAt(null);
+              break;
+            case "connect_phase":
+              if (evt.phase === "downloading") {
+                setConnectPhase("downloading");
+                setConnectPhaseStartedAt(Date.now());
+              } else {
+                setConnectPhase(null);
+                setConnectPhaseStartedAt(null);
+              }
+              break;
+          }
+        }
+        // Hydrate session settings/metadata from session.json snapshot when no live
+        // session_ready was buffered. Covers cold-open and chat-switch before live WS events arrive.
+        const hadSessionReady = buffered.some((e) => e.type === "session_ready");
+        if (!hadSessionReady && res.session) {
+          const s = res.session;
+          if (s.available_modes?.length) {
+            setModeOptions(
+              s.available_modes.map(([id, name]) => ({
+                label: name,
+                value: id,
+              })),
+            );
+          }
+          if (s.current_mode_id) setPermissionLevel(s.current_mode_id);
+          if (s.available_models?.length) {
+            setModelOptions(
+              s.available_models.map(([id, name]) => ({
+                label: name,
+                value: id,
+              })),
+            );
+          }
+          if (s.current_model_id) setSelectedModel(s.current_model_id);
+          if (s.available_thought_levels?.length) {
+            setThoughtLevelOptions(
+              s.available_thought_levels.map(([id, name]) => ({
+                label: name,
+                value: id,
+              })),
+            );
+          }
+          if (s.current_thought_level_id)
+            setThoughtLevel(s.current_thought_level_id);
+          if (s.thought_level_config_id)
+            setThoughtLevelConfigId(s.thought_level_config_id);
+          if (s.prompt_capabilities) {
+            setPromptCaps({
+              image: s.prompt_capabilities.image ?? false,
+              audio: s.prompt_capabilities.audio ?? false,
+              embeddedContext:
+                s.prompt_capabilities.embedded_context ?? false,
+            });
+          }
+          if (s.available_commands?.length) {
+            setSlashCommands(
+              s.available_commands.map((c) => ({
+                name: c.name,
+                description: c.description,
+                input_hint: c.input_hint,
+              })),
+            );
+          }
+        }
+
+        // Hydrate context window from session.json snapshot when no live
+        // usage_update was buffered. Covers chat-switch back to a chat whose
+        // WS is already in wsMapRef — backend only auto-pushes UsageUpdate on
+        // first attach, so without this the pill stays stale/blank.
+        const hadUsageEvent = buffered.some((e) => e.type === "usage_update");
+        if (!hadUsageEvent) {
+          const snap = res.session?.current_usage;
+          if (snap) {
+            setContextUsage({
+              used: Number(snap.used) || 0,
+              size: Number(snap.size) || 0,
+              cost: snap.cost
+                ? {
+                    amount: Number(snap.cost.amount) || 0,
+                    currency: String(snap.cost.currency ?? ""),
+                  }
+                : null,
+            });
+          }
+        }
+      }
+    })();
+    // Note: activeChat?.launch_mode is in deps so that when chats finish
+    // loading after this effect's first run (when launch_mode was still
+    // undefined → connectChatWs bailed), the effect re-fires with the
+    // resolved mode and routes the chat correctly (ACP WS vs PTY-only).
+  }, [activeChatId, activeChat?.launch_mode, connectChatWs, projectId, task.id, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId]);
+
+  // Cleanup all WebSockets on unmount, plus any pending reconnect timers —
+  // otherwise an in-flight backoff timer fires after unmount and creates a
+  // zombie WS that calls setState on a gone component.
+  useEffect(() => {
+    const wsMap = wsMapRef.current;
+    const intentional = intentionalCloseRef.current;
+    const timers = reconnectTimerRef.current;
+    const attempts = reconnectAttemptRef.current;
+    return () => {
+      timers.forEach((t) => clearTimeout(t));
+      timers.clear();
+      attempts.clear();
+      wsMap.forEach((_, id) => intentional.add(id));
+      wsMap.forEach((ws) => ws.close());
+      wsMap.clear();
+    };
+  }, []);
+
+  // Save composer draft to localStorage on page unload / navigation /
+  // tab hide. `beforeunload` is unreliable on mobile and on fast tab
+  // close — `visibilitychange` (state="hidden") fires consistently
+  // across all browsers and is the recommended hook for "user is
+  // leaving" persistence work.
+  useEffect(() => {
+    const flush = () => {
+      const chatId = getActiveChatId();
+      if (chatId) saveChatDraft(chatId, editableRef.current?.innerHTML ?? "");
+    };
+    const visHandler = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    window.addEventListener("beforeunload", flush);
+    document.addEventListener("visibilitychange", visHandler);
+    return () => {
+      window.removeEventListener("beforeunload", flush);
+      document.removeEventListener("visibilitychange", visHandler);
+    };
+  }, [getActiveChatId]);
+
+  // GC stale chat drafts from prior sessions on first mount of any
+  // TaskChat. Idempotent across mounts thanks to a module-level guard.
+  useEffect(() => {
+    gcChatDraftsOnce();
+  }, []);
+
+  // Save draft on unmount and clear the debounce timer
+  useEffect(() => {
+    const editableEl = editableRef.current;
+    return () => {
+      if (draftSaveTimerRef.current) clearTimeout(draftSaveTimerRef.current);
+      const chatId = getActiveChatId();
+      if (chatId) saveChatDraft(chatId, editableEl?.innerHTML ?? "");
+    };
+  }, [getActiveChatId]);
+
+  // ─── WebSocket message handler ───────────────────────────────────────────
+
+  const handleServerMessage = useCallback(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (msg: any) => {
+      switch (msg.type) {
+        case "connect_phase":
+          if (msg.phase === "downloading") {
+            setConnectPhase("downloading");
+            setConnectPhaseStartedAt(Date.now());
+          } else {
+            setConnectPhase(null);
+            setConnectPhaseStartedAt(null);
+          }
+          break;
+        case "session_ready":
+          setIsConnected(true);
+          setConnectPhase(null);
+          setConnectPhaseStartedAt(null);
+          onConnectedProp?.();
+          // Dynamic modes/models from agent
+          if (msg.available_modes?.length) {
+            setModeOptions(
+              msg.available_modes.map((m: { id: string; name: string }) => ({
+                label: m.name,
+                value: m.id,
+              })),
+            );
+          }
+          if (msg.current_mode_id) setPermissionLevel(msg.current_mode_id);
+          if (msg.available_models?.length) {
+            setModelOptions(
+              msg.available_models.map((m: { id: string; name: string }) => ({
+                label: m.name,
+                value: m.id,
+              })),
+            );
+          }
+          if (msg.current_model_id) setSelectedModel(msg.current_model_id);
+          if (msg.available_thought_levels?.length) {
+            setThoughtLevelOptions(
+              msg.available_thought_levels.map(
+                (t: { id: string; name: string }) => ({
+                  label: t.name,
+                  value: t.id,
+                }),
+              ),
+            );
+          }
+          if (msg.current_thought_level_id)
+            setThoughtLevel(msg.current_thought_level_id);
+          if (msg.thought_level_config_id)
+            setThoughtLevelConfigId(msg.thought_level_config_id);
+          // Extract prompt capabilities
+          if (msg.prompt_capabilities) {
+            setPromptCaps({
+              image: msg.prompt_capabilities.image ?? false,
+              audio: msg.prompt_capabilities.audio ?? false,
+              embeddedContext:
+                msg.prompt_capabilities.embedded_context ?? false,
+            });
+          }
+          setForkCapable(!!msg.fork_capable);
+          break;
+        case "message_chunk":
+          // Auto-close the current tool section (one-time)
+          setAutoExpandSectionId((prev) => {
+            if (prev) {
+              setExpandedSections((s) => {
+                const n = new Set(s);
+                n.delete(prev);
+                return n;
+              });
+            }
+            return null;
+          });
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          break;
+        case "thought_chunk":
+          // Auto-close the current tool section (same as message_chunk)
+          setAutoExpandSectionId((prev) => {
+            if (prev) {
+              setExpandedSections((s) => {
+                const n = new Set(s);
+                n.delete(prev);
+                return n;
+              });
+            }
+            return null;
+          });
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          break;
+        case "tool_call":
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          // Default-expand: new section gets expanded once; existing section untouched
+          setAutoExpandSectionId((prev) => {
+            if (prev === null) {
+              // New section — default expand it once
+              setExpandedSections((s) => {
+                const n = new Set(s);
+                n.add(msg.id);
+                return n;
+              });
+              return msg.id;
+            }
+            // Same section continues — don't touch expandedSections
+            return prev;
+          });
+          // Track tool_call IDs that touch the plan file (for re-fetch on completion)
+          if (
+            planFilePathRef.current &&
+            msg.locations?.some(
+              (l: { path: string }) => l.path === planFilePathRef.current,
+            )
+          ) {
+            planFileToolIdsRef.current.add(msg.id);
+          }
+          break;
+        case "tool_call_update":
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          // Re-fetch plan file content if a completed tool touches the plan file
+          if (
+            msg.status === "completed" &&
+            planFilePathRef.current &&
+            planFileToolIdsRef.current.has(msg.id)
+          ) {
+            planFileToolIdsRef.current.delete(msg.id);
+            readFile(planFilePathRef.current)
+              .then((res) => setPlanFileContent(res.content))
+              .catch(() => {});
+          }
+          break;
+        case "permission_request":
+          setShowPermissionPanel(true);
+          setShowPlan(false);
+          setShowPlanFile(false);
+          setShowPendingQueue(false);
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          break;
+        case "permission_response":
+          setShowPermissionPanel(false);
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          break;
+        case "ask_form":
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          break;
+        case "complete":
+          setAutoExpandSectionId((prev) => {
+            if (prev) {
+              setExpandedSections((s) => {
+                const n = new Set(s);
+                n.delete(prev);
+                return n;
+              });
+            }
+            return null;
+          });
+          setMessages((prev) => {
+            const updated = prev.map((m) =>
+              m.type === "auth_required" &&
+              (m.status === "idle" || m.status === "in_progress")
+                ? { ...m, status: "succeeded" as const }
+                : m
+            );
+            return pruneActiveChatMessages(reduceHistoryMessages(updated, msg));
+          });
+          updateBusy(false);
+          onChatBecameIdle?.();
+          break;
+        case "busy":
+          updateBusy(msg.value);
+          if (!msg.value) {
+            setMessages((prev) => pruneActiveChatMessages(prev));
+            onChatBecameIdle?.();
+          }
+          break;
+        case "error": {
+          const isStalePermission = msg.message?.includes("No pending permission");
+          if (isStalePermission) {
+            // The permission we tried to respond to no longer exists on the backend.
+            // Resolve all unresolved permissions as cancelled so the UI unblocks.
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.type === "permission" && !m.resolved
+                  ? { ...m, resolved: "Cancelled" }
+                  : m,
+              ),
+            );
+            setShowPermissionPanel(false);
+          } else {
+            setMessages((prev) => [
+              ...prev,
+              { type: "system", content: `Error: ${msg.message}` },
+            ]);
+            updateBusy(false);
+            onChatBecameIdle?.();
+          }
+          break;
+        }
+        case "user_message": {
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          enableAutoStickToBottom("smooth");
+          break;
+        }
+        case "auth_required": {
+          // 推一条 banner 消息:对每个 auth method 渲染一个登录按钮,
+          // 点击后发 authenticate(method_id),后端会自动重试暂存的 prompt
+          // (见 acp::run_acp_session 的 Authenticate 分支)。
+          const methods: { id: string; name: string; description?: string }[] =
+            Array.isArray(msg.methods) ? msg.methods : [];
+          setMessages((prev) => [
+            ...prev,
+            {
+              type: "auth_required",
+              methods,
+              agentName: msg.agent_name ?? null,
+              status: "idle",
+            },
+          ]);
+          updateBusy(false);
+          onChatBecameIdle?.();
+          break;
+        }
+        case "auth_succeeded": {
+          // 把所有 idle / in_progress 的 auth_required 都标 succeeded。
+          // 之前的 `i === prev.length-1` 兜底在尾部不是 auth 时静默漏掉,
+          // 导致登录已成功但 banner 仍以 idle 残留。
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.type === "auth_required" &&
+              (m.status === "idle" || m.status === "in_progress")
+                ? { ...m, status: "succeeded" }
+                : m,
+            ),
+          );
+          break;
+        }
+        case "mode_changed":
+          setPermissionLevel(msg.mode_id);
+          break;
+        case "model_changed":
+          setSelectedModel(msg.model_id);
+          break;
+        case "thought_levels_update":
+          setThoughtLevelOptions(
+            (msg.available ?? []).map(
+              (t: { id: string; name: string }) => ({
+                label: t.name,
+                value: t.id,
+              }),
+            ),
+          );
+          setThoughtLevel(msg.current ?? "");
+          setThoughtLevelConfigId(msg.config_id ?? "");
+          break;
+        case "plan_update": {
+          const entries: PlanEntry[] = msg.entries ?? [];
+          setPlanEntries(entries);
+          // Auto-expand while in progress, auto-collapse when all done
+          const allDone =
+            entries.length > 0 &&
+            entries.every((e: PlanEntry) => e.status === "completed");
+          const shouldOpen = !allDone;
+          setShowPlan(shouldOpen);
+          if (shouldOpen) {
+            setShowPlanFile(false);
+            setShowPendingQueue(false);
+          }
+          break;
+        }
+        case "plan_file_update":
+          setPlanFilePath(msg.path);
+          planFilePathRef.current = msg.path;
+          if (msg.content) {
+            setPlanFileContent(msg.content);
+            setShowPlanFile(true);
+            setShowPlan(false);
+            setShowPendingQueue(false);
+          } else {
+            readFile(msg.path)
+              .then((res) => {
+                setPlanFileContent(res.content);
+                setShowPlanFile(true);
+                setShowPlan(false);
+                setShowPendingQueue(false);
+              })
+              .catch(() => {});
+          }
+          break;
+        case "available_commands":
+          setSlashCommands(msg.commands ?? []);
+          break;
+        case "usage_update":
+          // ACP `unstable_session_usage` — context window pill data.
+          // Agent decides cadence (typically once per turn). No debouncing.
+          setContextUsage({
+            used: Number(msg.used) || 0,
+            size: Number(msg.size) || 0,
+            cost: msg.cost
+              ? {
+                  amount: Number(msg.cost.amount) || 0,
+                  currency: String(msg.cost.currency ?? ""),
+                }
+              : null,
+          });
+          break;
+        case "queue_update":
+          // Server now always sends QueuedMessage[] with id+text.
+          setPendingMessages(
+            (msg.messages ?? []).map(
+              (m: { id?: string; text: string } | string) =>
+                typeof m === "string"
+                  ? { id: "", text: m }
+                  : { id: m.id ?? "", text: m.text },
+            ),
+          );
+          break;
+        case "queue_message_gone":
+          // 用户编辑/删除的消息已经在服务端被 drain 出去发给 agent 了。
+          // 关闭编辑态并提示。
+          if (editingPendingIdRef.current === msg.id) {
+            setEditingPendingId(null);
+            setEditingPendingValue("");
+            // Project does not currently expose a global toast/notification
+            // surface — log to console so the loss is at least visible in
+            // devtools. Promote to a real toast when the UI gains one.
+            console.warn(
+              "Your queued message was already sent to the agent before the edit landed.",
+            );
+          }
+          break;
+        case "remote_session":
+          // Session is owned by another process — enter read-only observation mode
+          setIsRemoteSession(true);
+          setRemoteOwnerName(msg.agent_name || "Unknown");
+          break;
+        case "terminal_execute":
+          // User-initiated terminal command — show as terminal user message
+          terminalRunningRef.current = true;
+          updateBusy(true);
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          break;
+        case "terminal_chunk":
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          break;
+        case "terminal_complete":
+          terminalRunningRef.current = false;
+          updateBusy(false);
+          onChatBecameIdle?.();
+          setMessages((prev) =>
+            pruneActiveChatMessages(reduceHistoryMessages(prev, msg)),
+          );
+          break;
+        case "session_ended":
+          setIsConnected(false);
+          setConnectPhase(null);
+          setConnectPhaseStartedAt(null);
+          break;
+      }
+    },
+    [onConnectedProp, enableAutoStickToBottom, onChatBecameIdle, updateBusy, pruneActiveChatMessages, setAutoExpandSectionId],
+  );
+
+  /** Buffer a server message into the per-chat cache (for non-active chats) */
+  const handleServerMessageForCache = useCallback(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (chatId: string, msg: any) => {
+      const state =
+        perChatStateRef.current.get(chatId) ?? defaultPerChatState();
+      switch (msg.type) {
+        case "session_ready":
+          state.isConnected = true;
+          if (msg.available_modes?.length)
+            state.modeOptions = msg.available_modes.map(
+              (m: { id: string; name: string }) => ({
+                label: m.name,
+                value: m.id,
+              }),
+            );
+          if (msg.current_mode_id) state.permissionLevel = msg.current_mode_id;
+          if (msg.available_models?.length)
+            state.modelOptions = msg.available_models.map(
+              (m: { id: string; name: string }) => ({
+                label: m.name,
+                value: m.id,
+              }),
+            );
+          if (msg.current_model_id) state.selectedModel = msg.current_model_id;
+          if (msg.available_thought_levels?.length)
+            state.thoughtLevelOptions = msg.available_thought_levels.map(
+              (t: { id: string; name: string }) => ({
+                label: t.name,
+                value: t.id,
+              }),
+            );
+          if (msg.current_thought_level_id)
+            state.thoughtLevel = msg.current_thought_level_id;
+          if (msg.thought_level_config_id)
+            state.thoughtLevelConfigId = msg.thought_level_config_id;
+          if (msg.prompt_capabilities) {
+            state.promptCaps = {
+              image: msg.prompt_capabilities.image ?? false,
+              audio: msg.prompt_capabilities.audio ?? false,
+              embeddedContext:
+                msg.prompt_capabilities.embedded_context ?? false,
+            };
+          }
+          state.forkCapable = !!msg.fork_capable;
+          break;
+        case "thought_levels_update":
+          state.thoughtLevelOptions = (msg.available ?? []).map(
+            (t: { id: string; name: string }) => ({
+              label: t.name,
+              value: t.id,
+            }),
+          );
+          state.thoughtLevel = msg.current ?? "";
+          state.thoughtLevelConfigId = msg.config_id ?? "";
+          break;
+        case "usage_update":
+          state.contextUsage = {
+            used: Number(msg.used) || 0,
+            size: Number(msg.size) || 0,
+            cost: msg.cost
+              ? {
+                  amount: Number(msg.cost.amount) || 0,
+                  currency: String(msg.cost.currency ?? ""),
+                }
+              : null,
+          };
+          break;
+        case "message_chunk":
+        case "tool_call":
+        case "thought_chunk":
+        case "tool_call_update":
+        case "permission_request":
+        case "permission_response":
+        case "complete":
+        case "user_message":
+        case "terminal_execute":
+        case "terminal_chunk":
+        case "terminal_complete":
+          state.messages = reduceHistoryMessages(state.messages, msg);
+          if (msg.type === "complete" || msg.type === "terminal_complete") {
+            const pruned = pruneChatViewMessages(
+              state.messages,
+              state.hiddenMessageCount,
+              chatRenderWindowSettings,
+            );
+            state.messages = pruned.messages;
+            state.hiddenMessageCount = pruned.hiddenMessageCount;
+            state.isBusy = false;
+          }
+          break;
+        case "queue_update":
+          // 即使该 chat 当前不是 active,也得把 queue 写进 cache,
+          // 否则用户切回来时只能看到空 queue(WS 不会主动再发一次)。
+          state.pendingMessages = (msg.messages ?? []).map(
+            (m: { id?: string; text: string } | string) =>
+              typeof m === "string"
+                ? { id: "", text: m }
+                : { id: m.id ?? "", text: m.text },
+          );
+          break;
+        case "queue_message_gone":
+          // 后台 chat 的编辑状态由前端 active 路径管理,这里只需让 cache
+          // 不要保留已发出的消息;cache 的 pendingMessages 会被下一条
+          // queue_update 自然覆盖,这里不用手动处理。
+          break;
+        case "busy":
+          state.isBusy = msg.value;
+          if (!msg.value) {
+            const pruned = pruneChatViewMessages(
+              state.messages,
+              state.hiddenMessageCount,
+              chatRenderWindowSettings,
+            );
+            state.messages = pruned.messages;
+            state.hiddenMessageCount = pruned.hiddenMessageCount;
+          }
+          break;
+        case "plan_update":
+          state.planEntries = msg.entries ?? [];
+          break;
+        case "plan_file_update":
+          state.planFilePath = msg.path;
+          if (msg.content) {
+            state.planFileContent = msg.content;
+          }
+          break;
+        case "available_commands":
+          state.slashCommands = msg.commands ?? [];
+          break;
+        case "session_ended":
+          state.isConnected = false;
+          break;
+      }
+      perChatStateRef.current.set(chatId, state);
+    },
+    [chatRenderWindowSettings],
+  );
+
+  // Keep refs in sync so connectChatWs WS handlers always call latest versions
+  useEffect(() => {
+    handleServerMessageRef.current = handleServerMessage;
+    handleServerMessageForCacheRef.current = handleServerMessageForCache;
+  }, [handleServerMessage, handleServerMessageForCache]);
+
+  // ─── Read-only observation polling ─────────────────────────────────────
+  useEffect(() => {
+    if (!isRemoteSession || !activeChatId) {
+      if (pollingTimerRef.current) {
+        clearInterval(pollingTimerRef.current);
+        pollingTimerRef.current = null;
+      }
+      return;
+    }
+
+    // Load initial history
+    const chatId = activeChatId;
+    getChatHistory(projectId, task.id, chatId, 0)
+      .then((res) => {
+        if (res.events.length > 0) {
+          for (const evt of res.events) {
+            handleServerMessageRef.current(evt);
+          }
+          pollingOffsetRef.current = res.total;
+        }
+      })
+      .catch(() => {});
+
+    // Poll every 5 seconds for incremental updates
+    const loadLatest = async () => {
+      let res: Awaited<ReturnType<typeof getChatHistory>>;
+      try {
+        res = await getChatHistory(
+          projectId,
+          task.id,
+          chatId,
+          pollingOffsetRef.current,
+        );
+      } catch {
+        return;
+      }
+      if (res.events.length > 0) {
+        for (const evt of res.events) {
+          handleServerMessageRef.current(evt);
+        }
+        pollingOffsetRef.current = res.total;
+      }
+      // If session is gone, auto-exit read-only mode
+      if (!res.session) {
+        setIsRemoteSession(false);
+        setRemoteOwnerName("");
+      }
+    };
+    const timer = setInterval(loadLatest, 5000);
+    pollingTimerRef.current = timer;
+
+    return () => {
+      clearInterval(timer);
+      pollingTimerRef.current = null;
+    };
+  }, [isRemoteSession, activeChatId, projectId, task.id]);
+
+  // ─── Chat switching ────────────────────────────────────────────────────
+
+  const switchChat = useCallback(
+    async (chatId: string) => {
+      if (chatId === activeChatId) return;
+      perfMark("TaskChat:switchChat", { from: activeChatId, to: chatId });
+      saveCurrentChatState();
+      setActiveChatId(chatId);
+      writeLastActiveTab("chat", projectId, task.id, chatId);
+      restoreChatState(chatId);
+      setShowChatMenu(false);
+      // Connect WS if needed
+      await connectChatWs(chatId);
+      wsRef.current = wsMapRef.current.get(chatId) ?? null;
+    },
+    [activeChatId, projectId, task.id, saveCurrentChatState, restoreChatState, connectChatWs, setActiveChatId],
+  );
+  useEffect(() => {
+    switchChatRef.current = switchChat;
+  }, [switchChat]);
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { chatId } = (e as CustomEvent<{ chatId: string }>).detail;
+      if (chatId && chats.some((c) => c.id === chatId)) {
+        switchChat(chatId);
+      }
+    };
+    window.addEventListener("grove:select-chat", handler);
+    return () => window.removeEventListener("grove:select-chat", handler);
+  }, [chats, switchChat]);
+
+  // ─── New chat creation ─────────────────────────────────────────────────
+
+  const handleNewChatWithAgent = useCallback(
+    async (agent: string) => {
+      setShowAgentPicker(false);
+      try {
+        const newChat = await createChat(
+          projectId,
+          task.id,
+          buildDefaultSessionTitle(),
+          agent,
+        );
+        setChats((prev) => [...prev, newChat]);
+        switchChat(newChat.id);
+      } catch (err) {
+        console.error("Failed to create chat:", err);
+      }
+    },
+    [projectId, task.id, switchChat],
+  );
+
+  // ─── Chat title editing ─────────────────────────────────────────────────
+
+  const handleTitleSave = useCallback(async () => {
+    if (!editingTitle || !editTitleValue.trim()) {
+      setEditingTitle(null);
+      return;
+    }
+    try {
+      await updateChatTitle(
+        projectId,
+        task.id,
+        editingTitle.chatId,
+        editTitleValue.trim(),
+      );
+      setChats((prev) =>
+        prev.map((c) =>
+          c.id === editingTitle.chatId
+            ? { ...c, title: editTitleValue.trim() }
+            : c,
+        ),
+      );
+    } catch (err) {
+      console.error("Failed to update chat title:", err);
+    }
+    setEditingTitle(null);
+  }, [editingTitle, editTitleValue, projectId, task.id]);
+
+  // ─── Chat deletion ─────────────────────────────────────────────────────
+
+  const handleDeleteChat = useCallback(
+    async (chatId: string) => {
+      if (chats.length <= 1) return; // Don't delete the last chat
+      try {
+        await deleteChat(projectId, task.id, chatId);
+        // Close WebSocket if connected; cancel any pending reconnect timer so
+        // it doesn't fire later trying to reconnect a deleted chat.
+        const ws = wsMapRef.current.get(chatId);
+        if (ws) {
+          intentionalCloseRef.current.add(chatId);
+          ws.close();
+          wsMapRef.current.delete(chatId);
+        }
+        cancelPendingReconnectRef.current(chatId);
+        perChatStateRef.current.delete(chatId);
+        setChats((prev) => {
+          const updated = prev.filter((c) => c.id !== chatId);
+          if (chatId === activeChatId && updated.length > 0) {
+            const next = updated[updated.length - 1];
+            setActiveChatId(next.id);
+            writeLastActiveTab("chat", projectId, task.id, next.id);
+            restoreChatState(next.id);
+          }
+          return updated;
+        });
+      } catch (err) {
+        console.error("Failed to delete chat:", err);
+      }
+      setShowChatMenu(false);
+    },
+    [chats.length, projectId, task.id, activeChatId, restoreChatState, setActiveChatId],
+  );
+
+  // ─── Chat fork ─────────────────────────────────────────────────────────
+
+  /** 调用 ACP `session/fork` 派生新 chat:成功后切到新 chat,新 chat 会通过
+   * 标准 reconnect 路径 + load_session(forked_id) 把对话上下文复活。 */
+  const handleForkChat = useCallback(
+    async (chatId: string) => {
+      try {
+        const created = await forkChat(projectId, task.id, chatId);
+        setChats((prev) => [...prev, created]);
+        setActiveChatId(created.id);
+        writeLastActiveTab("chat", projectId, task.id, created.id);
+        restoreChatState(created.id);
+      } catch (err) {
+        // Fork 通常因 source agent 进程已退出 / agent busy / agent 拒绝
+        // 而失败。把错误以 system 消息推到当前 chat 让用户能看到 — 之前
+        // 只 console.error,UI 上完全无反馈。
+        const message = err instanceof Error ? err.message : String(err);
+        console.error("Failed to fork chat:", err);
+        setMessages((prev) => [
+          ...prev,
+          { type: "system", content: `Fork failed: ${message}` },
+        ]);
+      }
+      setShowChatMenu(false);
+    },
+    [projectId, task.id, restoreChatState, setActiveChatId],
+  );
+
+  // ─── User actions ────────────────────────────────────────────────────────
+
+  /** Check if the editable has any content (text, chips, or attachments) */
+  const checkContent = useCallback(() => {
+    const el = editableRef.current;
+    if (!el) {
+      setHasContent(attachments.length > 0);
+      return;
+    }
+    const text = el.textContent?.trim() || "";
+    const hasChips = el.querySelector("[data-command],[data-file]") !== null;
+    setHasContent(text.length > 0 || hasChips || attachments.length > 0);
+  }, [attachments.length]);
+
+  /** Convert a File to an Attachment and add to state */
+  const addFileAsAttachment = useCallback(
+    async (file: File) => {
+      if (!file.type.startsWith("image/") && !file.type.startsWith("audio/")) {
+        // Defer upload until the prompt is actually sent
+        attachCountersRef.current.resource += 1;
+        const label = attachmentLabel("resource", attachCountersRef.current.resource);
+        setAttachments((prev) => [
+          ...prev,
+          {
+            type: "resource",
+            data: "",
+            mimeType: file.type || "application/octet-stream",
+            name: file.name,
+            label,
+            size: file.size,
+            pendingFile: file,
+          },
+        ]);
+        return;
+      }
+
+      if (file.type.startsWith("audio/")) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          const base64 = dataUrl.split(",")[1];
+          attachCountersRef.current.audio += 1;
+          const label = attachmentLabel("audio", attachCountersRef.current.audio);
+          setAttachments((prev) => [
+            ...prev,
+            { type: "audio", data: base64, mimeType: file.type, name: file.name, label },
+          ]);
+        };
+        reader.readAsDataURL(file);
+        return;
+      }
+
+      // Image handling: pass through supported formats, convert others via Canvas
+      const SUPPORTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+      if (SUPPORTED_IMAGE_TYPES.has(file.type)) {
+        // GIF: never re-encode via Canvas (would lose animation)
+        if (file.type === "image/gif" && file.size > MAX_IMAGE_BYTES) {
+          setMessages((prev) =>
+            appendSystemMessage(prev, `GIF 文件过大（${(file.size / 1024 / 1024).toFixed(1)} MB），请压缩后重试。`),
+          );
+          return;
+        }
+
+        // Oversized image: compress to JPEG via Canvas
+        if (file.size > MAX_IMAGE_BYTES) {
+          try {
+            const blob = await compressImageViaCanvas(file);
+            const reader = new FileReader();
+            reader.onload = () => {
+              const dataUrl = reader.result as string;
+              const base64 = dataUrl.split(",")[1];
+              const previewUrl = URL.createObjectURL(blob);
+              attachCountersRef.current.image += 1;
+              const label = attachmentLabel("image", attachCountersRef.current.image);
+              const compressedName = file.name.replace(/\.[^.]+$/, ".jpg");
+              setAttachments((prev) => [
+                ...prev,
+                { type: "image", data: base64, mimeType: "image/jpeg", name: compressedName, label, previewUrl },
+              ]);
+            };
+            reader.readAsDataURL(blob);
+          } catch {
+            setMessages((prev) =>
+              appendSystemMessage(prev, `图片压缩失败（${file.name}），请手动压缩后重试。`),
+            );
+          }
+          return;
+        }
+
+        // Check dimensions even for small files — Claude enforces a 2000px limit in multi-image requests
+        const dimCheckUrl = URL.createObjectURL(file);
+        const dimImg = new Image();
+        dimImg.src = dimCheckUrl;
+        await dimImg.decode().catch(() => {});
+        URL.revokeObjectURL(dimCheckUrl);
+        if (dimImg.naturalWidth > MAX_IMAGE_DIMENSION || dimImg.naturalHeight > MAX_IMAGE_DIMENSION) {
+          try {
+            const blob = await compressImageViaCanvas(file);
+            const reader = new FileReader();
+            reader.onload = () => {
+              const dataUrl = reader.result as string;
+              const base64 = dataUrl.split(",")[1];
+              const previewUrl = URL.createObjectURL(blob);
+              attachCountersRef.current.image += 1;
+              const label = attachmentLabel("image", attachCountersRef.current.image);
+              const resizedName = file.name.replace(/\.[^.]+$/, ".jpg");
+              setAttachments((prev) => [
+                ...prev,
+                { type: "image", data: base64, mimeType: "image/jpeg", name: resizedName, label, previewUrl },
+              ]);
+            };
+            reader.readAsDataURL(blob);
+          } catch {
+            setMessages((prev) =>
+              appendSystemMessage(prev, `Image is too large and resizing failed (${file.name}). Please resize it manually and try again.`),
+            );
+          }
+          return;
+        }
+
+        // Small supported image with acceptable dimensions: pass through directly
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          const base64 = dataUrl.split(",")[1];
+          const previewUrl = URL.createObjectURL(file);
+          attachCountersRef.current.image += 1;
+          const label = attachmentLabel("image", attachCountersRef.current.image);
+          setAttachments((prev) => [
+            ...prev,
+            { type: "image", data: base64, mimeType: file.type, name: file.name, label, previewUrl },
+          ]);
+        };
+        reader.readAsDataURL(file);
+        return;
+      }
+
+      // Unsupported image format — try Canvas decode/convert to JPEG (with size cap)
+      try {
+        const blob = await compressImageViaCanvas(file);
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          const base64 = dataUrl.split(",")[1];
+          const previewUrl = URL.createObjectURL(blob);
+          attachCountersRef.current.image += 1;
+          const label = attachmentLabel("image", attachCountersRef.current.image);
+          const convertedName = file.name.replace(/\.[^.]+$/, ".jpg");
+          setAttachments((prev) => [
+            ...prev,
+            { type: "image", data: base64, mimeType: "image/jpeg", name: convertedName, label, previewUrl },
+          ]);
+        };
+        reader.readAsDataURL(blob);
+      } catch {
+        setMessages((prev) =>
+          appendSystemMessage(prev, `Unsupported image format (${file.name}). Please convert to JPEG or PNG and try again.`),
+        );
+      }
+    },
+    [],
+  );
+
+  const removeAttachment = useCallback((index: number) => {
+    setAttachments((prev) => {
+      const att = prev[index];
+      if (att?.previewUrl) URL.revokeObjectURL(att.previewUrl);
+      const remaining = prev.filter((_, i) => i !== index);
+      // Re-label all remaining attachments so numbering stays contiguous
+      const counters: AttachmentCounters = { ...attachCountersRef.current };
+      // Reset counters to history baseline, then re-number pending attachments
+      const historyBase = { ...counters };
+      // Count how many of each type exist in remaining
+      const pendingCounts: AttachmentCounters = { image: 0, audio: 0, resource: 0 };
+      for (const a of remaining) pendingCounts[a.type]++;
+      // History base = current counter - old pending count (before removal)
+      const oldPendingCounts: AttachmentCounters = { image: 0, audio: 0, resource: 0 };
+      for (const a of prev) oldPendingCounts[a.type]++;
+      historyBase.image = counters.image - oldPendingCounts.image;
+      historyBase.audio = counters.audio - oldPendingCounts.audio;
+      historyBase.resource = counters.resource - oldPendingCounts.resource;
+      // Re-assign labels sequentially
+      // Plain for-loop instead of `.map` so the counter mutation is local
+      // (not captured in a lambda) — React Compiler flags captured-mutable
+      // variables as "Expected references to be consistently local".
+      const reCount: AttachmentCounters = { ...historyBase };
+      const relabeled: Attachment[] = [];
+      for (const a of remaining) {
+        reCount[a.type] += 1;
+        relabeled.push({
+          ...a,
+          label: attachmentLabel(a.type, reCount[a.type]),
+        });
+      }
+      attachCountersRef.current = reCount;
+      return relabeled;
+    });
+  }, []);
+
+  /** Insert an attachment reference chip (e.g. [Image #1]) into the input */
+  const insertAttachmentReference = useCallback(
+    (label: string) => {
+      const el = editableRef.current;
+      if (!el) return;
+      // Build a non-editable chip span
+      const chip = document.createElement("span");
+      chip.contentEditable = "false";
+      chip.setAttribute("data-ref", label);
+      chip.className =
+        "inline-flex items-center gap-0.5 rounded-md bg-[color-mix(in_srgb,var(--color-highlight)_14%,transparent)] text-[var(--color-highlight)] text-xs font-medium px-1.5 py-0.5 mx-0.5 align-baseline select-none cursor-default";
+      chip.textContent = label;
+
+      // Insert at cursor or append at end
+      el.focus();
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount > 0 && el.contains(sel.anchorNode)) {
+        const range = sel.getRangeAt(0);
+        range.deleteContents();
+        range.insertNode(chip);
+        // Move cursor after chip
+        range.setStartAfter(chip);
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      } else {
+        el.appendChild(chip);
+      }
+      // Trigger content check
+      setHasContent(true);
+    },
+    [],
+  );
+
+  /** Take control of a remote session */
+  const handleTakeControl = useCallback(async () => {
+    if (!activeChatId || isTakingControl) return;
+    setIsTakingControl(true);
+    let ok = true;
+    try {
+      await takeControl(projectId, task.id, activeChatId);
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          type: "system",
+          content: "Failed to take control. Please try again.",
+        },
+      ]);
+      setIsTakingControl(false);
+      return;
+    }
+    // Clear polling and remote state
+    setIsRemoteSession(false);
+    setRemoteOwnerName("");
+    // Resolve any pending permission requests (session was killed, permissions are void)
+    setShowPermissionPanel(false);
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.type === "permission" && !m.resolved
+          ? { ...m, resolved: "Cancelled" }
+          : m.type === "ask_form" && !m.resolved
+            ? { ...m, resolved: true }
+            : m,
+      ),
+    );
+    pollingOffsetRef.current = 0;
+    // Reconnect via WebSocket (normal flow). Cancel any pending backoff timer
+    // first so the explicit reconnect path below isn't racing a scheduled one.
+    cancelPendingReconnectRef.current(activeChatId);
+    intentionalCloseRef.current.add(activeChatId);
+    const existingWs = wsMapRef.current.get(activeChatId);
+    if (existingWs) existingWs.close();
+    wsMapRef.current.delete(activeChatId);
+    await connectChatWs(activeChatId);
+    wsRef.current = wsMapRef.current.get(activeChatId) ?? null;
+    setIsTakingControl(false);
+  }, [activeChatId, isTakingControl, projectId, task.id, connectChatWs]);
+
+  const handleSavePlanToNote = useCallback(async () => {
+    if (!planFileContent || isSavingToNote) return;
+    setIsSavingToNote(true);
+    setSaveToNoteDone(false);
+    try {
+      await updateNotes(projectId, task.id, planFileContent);
+      setSaveToNoteDone(true);
+      setTimeout(() => setSaveToNoteDone(false), 2000);
+    } catch {
+      setMessages((prev) => [
+        ...prev,
+        { type: "system", content: "Failed to save plan to note." },
+      ]);
+    }
+    setIsSavingToNote(false);
+  }, [planFileContent, isSavingToNote, projectId, task.id]);
+
+  // Bundle current model/mode/thought_level into a `config` object for every
+  // prompt/queue_message send. The backend cmd_loop applies these as ACP
+  // SetSessionMode/Model/ThoughtLevel requests right before the prompt itself —
+  // so per-prompt config swaps land in the correct order even when the user
+  // toggles selectors between rapid sends. Replaces the old set_mode/set_model/
+  // set_thought_level standalone WS messages.
+  const buildPromptConfig = useCallback(() => {
+    const cfg: {
+      model?: string;
+      mode?: string;
+      thought_level?: string;
+      thought_level_config_id?: string;
+    } = {};
+    if (selectedModel) cfg.model = selectedModel;
+    if (permissionLevel) cfg.mode = permissionLevel;
+    if (thoughtLevel && thoughtLevelConfigId) {
+      cfg.thought_level = thoughtLevel;
+      cfg.thought_level_config_id = thoughtLevelConfigId;
+    }
+    return Object.keys(cfg).length === 0 ? undefined : cfg;
+  }, [selectedModel, permissionLevel, thoughtLevel, thoughtLevelConfigId]);
+
+  const handleSend = useCallback(async () => {
+    const el = editableRef.current;
+    if (!el) return;
+    // Guard activeChatId before consuming any UI state — if we return after
+    // clearing the editable, the user's typed message is silently lost.
+    if (!activeChatId) return;
+    const prompt = getPromptFromEditable(el);
+
+    // Terminal launch mode: chatbox forwards the typed text + any attachment
+    // file paths to the agent's PTY stdin. Attachments (images, files) are
+    // uploaded to the chat's on-disk attachments dir first, then each one is
+    // injected as `@<absolute-path>` so claude reads them via its Read tool.
+    if (isTerminalLaunchMode) {
+      if ((!prompt && attachments.length === 0) || !agentPtyWsUrl) return;
+
+      // Upload anything that doesn't have a server URI yet. Image/audio
+      // attachments arrive as base64 in `att.data`; resource attachments
+      // arrive as a pending File ref and need to be base64-encoded first.
+      let resolved = attachments;
+      const needUpload = attachments.filter(
+        (a) => !a.uri && (a.data || a.pendingFile),
+      );
+      if (needUpload.length > 0) {
+        try {
+          const uploads = await Promise.all(
+            needUpload.map(async (att) => {
+              const data = att.pendingFile
+                ? await fileToBase64(att.pendingFile)
+                : att.data;
+              return uploadChatAttachment(projectId, task.id, activeChatId, {
+                name: att.pendingFile?.name ?? att.name,
+                mime_type: att.mimeType || undefined,
+                data,
+              });
+            }),
+          );
+          const map = new Map(needUpload.map((a, i) => [a, uploads[i]]));
+          resolved = attachments.map((a) => {
+            const r = map.get(a);
+            return r
+              ? {
+                  ...a,
+                  uri: r.uri,
+                  name: r.name,
+                  mimeType: r.mime_type ?? a.mimeType,
+                  size: r.size,
+                  pendingFile: undefined,
+                }
+              : a;
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setMessages((prev) => [
+            ...prev,
+            { type: "system", content: `Failed to upload attachment: ${msg}` },
+          ]);
+          return;
+        }
+      }
+
+      const paths = resolved
+        .map((a) => a.uri)
+        .map((u) => fileUrlToPath(u))
+        .filter((p): p is string => !!p);
+      // Natural-language attachment hint instead of `@path` — claude's
+      // picker autocomplete for `@` doesn't fire inside bracketed paste,
+      // but it scans prompt text for paths and calls Read on its own.
+      const filesNote =
+        paths.length > 0 ? `Files attached: ${paths.join(", ")}\n\n` : "";
+      const finalPrompt = filesNote + (prompt || "");
+      if (!finalPrompt) return;
+
+      // Wrap in bracketed paste (\x1b[200~ ... \x1b[201~) so claude treats
+      // the body as one paste — any embedded newlines stay as newlines, and
+      // the trailing \r AFTER the paste-end marker is the one that submits.
+      // A bare \r without wrapping gets eaten as a newline once claude's
+      // own paste-detection kicks in on the burst of bytes.
+      const prefix = `url:${agentPtyWsUrl}`;
+      const wrapped = `\x1b[200~${finalPrompt}\x1b[201~\r`;
+      const ok = sendInputToTerminal(prefix, wrapped);
+      if (!ok) return; // PTY not connected yet — keep the draft, user retries
+      el.innerHTML = "";
+      clearChatDraft(activeChatId);
+      setHasContent(false);
+      setAttachments((prev) => {
+        prev.forEach((att) => {
+          if (att.previewUrl) URL.revokeObjectURL(att.previewUrl);
+        });
+        return [];
+      });
+      el.focus();
+      return;
+    }
+
+    if (
+      (!prompt && attachments.length === 0) ||
+      !wsRef.current ||
+      wsRef.current.readyState !== WebSocket.OPEN
+    )
+      return;
+
+    // Shell mode → send terminal_execute directly (bypasses AI)
+    if (isTerminalMode) {
+      if (!prompt || isBusy) return;
+      enableAutoStickToBottom("auto");
+      wsRef.current.send(
+        JSON.stringify({ type: "terminal_execute", command: prompt }),
+      );
+      el.innerHTML = "";
+      clearChatDraft(activeChatId);
+      setHasContent(false);
+      setAttachments([]);
+      setIsTerminalMode(false);
+      setIsInputExpanded(false);
+      el.focus();
+      return;
+    }
+
+    const text = prompt;
+
+    // Upload any pending files now (deferred from drag/drop time)
+    let resolvedAttachments = attachments;
+    const pendingOnes = attachments.filter((a) => a.pendingFile);
+    if (pendingOnes.length > 0) {
+      if (!activeChatId) return;
+      try {
+        const uploadResults = await Promise.all(
+          pendingOnes.map(async (att) => {
+            const data = await fileToBase64(att.pendingFile!);
+            return uploadChatAttachment(projectId, task.id, activeChatId, {
+              name: att.pendingFile!.name,
+              mime_type: att.pendingFile!.type || undefined,
+              data,
+            });
+          }),
+        );
+        // Map each pending attachment to its upload result by identity, then
+        // walk attachments to apply. Avoids a mutated counter captured in
+        // a lambda (which the React Compiler flags).
+        const resultByAtt = new Map(pendingOnes.map((att, i) => [att, uploadResults[i]]));
+        resolvedAttachments = attachments.map((att) => {
+          if (!att.pendingFile) return att;
+          const result = resultByAtt.get(att)!;
+          return {
+            ...att,
+            uri: result.uri,
+            name: result.name,
+            mimeType: result.mime_type ?? att.mimeType,
+            size: result.size,
+            pendingFile: undefined,
+          };
+        });
+      } catch (err) {
+        console.error("Failed to upload attachment:", err);
+        const errMessage = err instanceof Error ? err.message : String(err);
+        setMessages((prev) => [
+          ...prev,
+          { type: "system", content: `Failed to upload attachment: ${errMessage}` },
+        ]);
+        return;
+      }
+    }
+
+    // Build attachments payload for server
+    const contentAttachments = resolvedAttachments.map((att) => ({
+      ...(att.type === "resource"
+        ? {
+            type: "resource_link",
+            uri: att.uri,
+            name: att.name,
+            label: att.label,
+            mime_type: att.mimeType || undefined,
+            size: att.size,
+          }
+        : {
+            type: att.type,
+            data: att.data,
+            label: att.label,
+            mime_type: att.mimeType,
+          }),
+    }));
+
+    if (isBusy) {
+      // Queue message on server when agent is busy
+      enableAutoStickToBottom("auto");
+      wsRef.current.send(
+        JSON.stringify({
+          type: "queue_message",
+          text,
+          attachments: contentAttachments,
+          // FR2: queued messages must carry the same per-prompt config the
+          // user has selected (model / thinking / agent overrides). Without
+          // it the backend falls back to whatever snapshot was current when
+          // the agent was last spawned, silently dropping the user's choice.
+          config: buildPromptConfig(),
+        }),
+      );
+      el.innerHTML = "";
+      clearChatDraft(activeChatId);
+      setHasContent(false);
+      setAttachments((prev) => {
+        prev.forEach((att) => { if (att.previewUrl) URL.revokeObjectURL(att.previewUrl); });
+        return [];
+      });
+      setShowSlashMenu(false);
+      setShowFileMenu(false);
+      setIsTerminalMode(false);
+      setIsInputExpanded(false);
+      setShowPendingQueue(true);
+      setShowPlan(false);
+      setShowPlanFile(false);
+      onUserMessageSent?.();
+      el.focus();
+    } else {
+      enableAutoStickToBottom("auto");
+      wsRef.current.send(
+        JSON.stringify({
+          type: "prompt",
+          text,
+          attachments: contentAttachments,
+          config: buildPromptConfig(),
+        }),
+      );
+      el.innerHTML = "";
+      clearChatDraft(activeChatId);
+      setHasContent(false);
+      setAttachments((prev) => {
+        prev.forEach((att) => { if (att.previewUrl) URL.revokeObjectURL(att.previewUrl); });
+        return [];
+      });
+      setShowSlashMenu(false);
+      setShowFileMenu(false);
+      setIsTerminalMode(false);
+      setIsInputExpanded(false);
+      // Part B: 不再乐观 updateBusy(true)。busy 状态由后端 "busy" / "user_message"
+      // 事件驱动 — 收到后才翻 true。乐观更新会和后端事件 race,产生短暂"可发送"
+      // 窗口让用户连点出 bug。延迟期间发送按钮短暂仍可点也行,backend 会自己处理。
+      onUserMessageSent?.();
+      el.focus();
+    }
+  }, [isTerminalMode, isBusy, attachments, activeChatId, projectId, task.id, enableAutoStickToBottom, onUserMessageSent, buildPromptConfig, isTerminalLaunchMode, agentPtyWsUrl]);
+
+  const sendPreviewComments = useCallback((comments: PreviewCommentDraft[]) => {
+    if (
+      comments.length === 0 ||
+      !activeChatId ||
+      !wsRef.current ||
+      wsRef.current.readyState !== WebSocket.OPEN ||
+      isTerminalMode
+    ) {
+      return;
+    }
+
+    const text = formatPreviewCommentPrompt(comments);
+    enableAutoStickToBottom("auto");
+    wsRef.current.send(
+      JSON.stringify({
+        type: isBusy ? "queue_message" : "prompt",
+        text,
+        attachments: [],
+        // FR2: send config on both prompt and queue_message paths so the
+        // user's per-prompt overrides (model / thinking / agent) survive
+        // queueing instead of getting backfilled from a stale snapshot.
+        config: buildPromptConfig(),
+      }),
+    );
+    clearPreviewCommentDrafts(comments.map((comment) => comment.id));
+    setShowPreviewComments(false);
+    setShowSlashMenu(false);
+    setShowFileMenu(false);
+    setShowPendingQueue(isBusy);
+    setShowPlan(false);
+    setShowPlanFile(false);
+    // Part B: 删乐观 updateBusy — 等后端事件
+    onUserMessageSent?.();
+  }, [
+    activeChatId,
+    buildPromptConfig,
+    clearPreviewCommentDrafts,
+    enableAutoStickToBottom,
+    isBusy,
+    isTerminalMode,
+    onUserMessageSent,
+  ]);
+
+  const handleCompact = useCallback(() => {
+    if (
+      !activeChatId ||
+      !wsRef.current ||
+      wsRef.current.readyState !== WebSocket.OPEN ||
+      isTerminalMode
+    ) {
+      return;
+    }
+    enableAutoStickToBottom("auto");
+    wsRef.current.send(
+      JSON.stringify({
+        type: isBusy ? "queue_message" : "prompt",
+        text: "/compact",
+        attachments: [],
+        // FR2: queue path must carry config too (see prompt-send above).
+        config: buildPromptConfig(),
+      }),
+    );
+    setShowSlashMenu(false);
+    setShowFileMenu(false);
+    setShowPendingQueue(isBusy);
+    // Part B: 删乐观 updateBusy — 等后端事件
+    onUserMessageSent?.();
+  }, [
+    activeChatId,
+    buildPromptConfig,
+    enableAutoStickToBottom,
+    isBusy,
+    isTerminalMode,
+    onUserMessageSent,
+  ]);
+
+  const hasCompactCommand = useMemo(
+    () => slashCommands.some((c) => c.name === "compact"),
+    [slashCommands],
+  );
+
+  /** Cancel current agent work — server auto-sends next queued message after Complete */
+  const handleSendNow = useCallback(() => {
+    if (isCancelling) return;
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    setIsCancelling(true);
+    wsRef.current.send(JSON.stringify({ type: "cancel" }));
+  }, [isCancelling]);
+
+  /** Stop agent or kill running terminal command */
+  const handleStopAgent = useCallback(() => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    if (terminalRunningRef.current) {
+      wsRef.current.send(JSON.stringify({ type: "terminal_kill" }));
+      return;
+    }
+    if (isCancelling) return;
+    setIsCancelling(true);
+    wsRef.current.send(JSON.stringify({ type: "cancel" }));
+  }, [isCancelling]);
+
+  // 不再发 pause_queue:后端不暂停队列,而是在 save/delete 时按 id 定位 —
+  // 找不到(已被 drain 走)就回一个 queue_message_gone 让前端关编辑态。
+  const handleEditPending = useCallback(
+    (msg: { id: string; text: string }) => {
+      setEditingPendingId(msg.id);
+      setEditingPendingValue(msg.text);
+    },
+    [],
+  );
+
+  const handleSavePendingEdit = useCallback(() => {
+    if (
+      editingPendingId === null ||
+      !wsRef.current ||
+      wsRef.current.readyState !== WebSocket.OPEN
+    )
+      return;
+    const trimmed = editingPendingValue.trim();
+    if (!trimmed) {
+      wsRef.current.send(
+        JSON.stringify({ type: "dequeue_message", id: editingPendingId }),
+      );
+    } else {
+      wsRef.current.send(
+        JSON.stringify({
+          type: "update_queued_message",
+          id: editingPendingId,
+          text: trimmed,
+        }),
+      );
+    }
+    setEditingPendingId(null);
+    setEditingPendingValue("");
+  }, [editingPendingId, editingPendingValue]);
+
+  const handleCancelPendingEdit = useCallback(() => {
+    setEditingPendingId(null);
+    setEditingPendingValue("");
+  }, []);
+
+  const handleDeletePending = useCallback(
+    (id: string) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+      wsRef.current.send(JSON.stringify({ type: "dequeue_message", id }));
+      if (editingPendingId === id) {
+        setEditingPendingId(null);
+        setEditingPendingValue("");
+      }
+    },
+    [editingPendingId],
+  );
+
+  const handleClearPending = useCallback(() => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    wsRef.current.send(JSON.stringify({ type: "clear_queue" }));
+    setEditingPendingId(null);
+    setEditingPendingValue("");
+  }, []);
+
+  /** Submit an ask_form response as a regular user prompt. Mirrors the queue /
+   *  prompt branch in onSendPrompt — busy session gets queued, idle session
+   *  posts directly. Attachments are always empty (form responses are pure
+   *  text). The form-pill resolution itself is handled separately by
+   *  resolveAskForm so the markdown send and the local UI removal aren't
+   *  coupled to each other. */
+  const sendFormResponse = useCallback(
+    (text: string) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+      enableAutoStickToBottom("auto");
+      wsRef.current.send(
+        JSON.stringify(
+          isBusy
+            ? {
+                type: "queue_message",
+                text,
+                attachments: [],
+                config: buildPromptConfig(),
+              }
+            : {
+                type: "prompt",
+                text,
+                attachments: [],
+                config: buildPromptConfig(),
+              },
+        ),
+      );
+      onUserMessageSent?.();
+    },
+    [isBusy, enableAutoStickToBottom, buildPromptConfig, onUserMessageSent],
+  );
+
+  const resolveAskForm = useCallback((id: string) => {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.type === "ask_form" && m.id === id ? { ...m, resolved: true } : m,
+      ),
+    );
+  }, []);
+
+  /** Respond to a permission request. `requestId` correlates with the server's
+   * live pending permission so a stale dialog (rendered from history but
+   * already cancelled by reconcile) can't be silently accepted. */
+  const handlePermissionResponse = useCallback(
+    (optionId: string, requestId: string) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+      wsRef.current.send(
+        JSON.stringify({
+          type: "permission_response",
+          id: requestId,
+          option_id: optionId,
+        }),
+      );
+    },
+    [],
+  );
+
+  /** AuthRequired banner login click. 乐观把对应消息切到 in_progress,
+   *  authenticate 由后端处理:成功 → AuthSucceeded(切 succeeded)+ 重发原 prompt;
+   *  失败 → Error 通过 system 消息呈现并把 banner 切回 idle 让用户重试。 */
+  const handleAuthLogin = useCallback(
+    (index: number, methodId: string) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+      setMessages((prev) =>
+        prev.map((m, i) =>
+          i === index && m.type === "auth_required"
+            ? { ...m, status: "in_progress", activeMethodId: methodId }
+            : m,
+        ),
+      );
+      wsRef.current.send(
+        JSON.stringify({ type: "authenticate", method_id: methodId }),
+      );
+    },
+    [],
+  );
+
+  const triggerProjectFilesLoad = useCallback((projectName: string) => {
+    const project = allProjects.find(p => p.name.toLowerCase() === projectName.toLowerCase());
+    if (!project) return;
+    if (projectFiles[project.id] || loadingProjId === project.id) return;
+    
+    setLoadingProjId(project.id);
+    if (project.project_type === "studio") {
+      listResources(project.id)
+        .then(res => {
+          const paths = res.files.map(f => f.path);
+          setProjectFiles(prev => ({ ...prev, [project.id]: paths }));
+        })
+        .catch(() => {})
+        .finally(() => setLoadingProjId(null));
+    } else {
+      getProject(project.id)
+        .then(projDetail => {
+          const localTask = projDetail.local_task;
+          if (localTask) {
+            getTaskFiles(project.id, localTask.id)
+              .then(res => {
+                setProjectFiles(prev => ({ ...prev, [project.id]: res.files || [] }));
+              })
+              .catch(() => {});
+          }
+        })
+        .catch(() => {})
+        .finally(() => setLoadingProjId(null));
+    }
+  }, [allProjects, projectFiles, loadingProjId]);
+
+  /** Detect /slash or @file at cursor position in contentEditable */
+  const handleInput = useCallback(() => {
+    // Trailing 500ms debounce: usual case where the user pauses typing
+    // and we save once they're idle. Plus a 5s max-debounce anchored
+    // on the first keystroke after the last save — without it, a user
+    // typing continuously for minutes would never persist a draft, and
+    // a tab close mid-burst (especially on mobile, where beforeunload
+    // is unreliable) would lose everything.
+    const flush = () => {
+      draftLastFlushRef.current = Date.now();
+      const chatId = getActiveChatId();
+      if (chatId) saveChatDraft(chatId, editableRef.current?.innerHTML ?? "");
+    };
+    if (draftSaveTimerRef.current) clearTimeout(draftSaveTimerRef.current);
+    if (draftLastFlushRef.current === 0) {
+      draftLastFlushRef.current = Date.now();
+    }
+    const sinceLast = Date.now() - draftLastFlushRef.current;
+    const delay = sinceLast >= 5000 ? 0 : Math.min(500, 5000 - sinceLast);
+    draftSaveTimerRef.current = setTimeout(flush, delay);
+    // Detect "!" typed into empty input → enter shell mode and clear the "!"
+    const el = editableRef.current;
+    if (el && !isTerminalMode && !isBusy && el.textContent === "!") {
+      el.innerHTML = "";
+      setHasContent(false);
+      setIsTerminalMode(true);
+      return;
+    }
+    // Shell mode: highlight first word (command) differently from args
+    if (el && isTerminalMode && !composingRef.current) {
+      const raw = el.textContent || "";
+      checkContent();
+      const match = raw.match(/^(\S+)([\s\S]*)$/);
+      if (match) {
+        const sel = window.getSelection();
+        // Calculate cursor offset within the raw text
+        let cursorOffset = raw.length;
+        if (sel && sel.rangeCount > 0) {
+          const r = sel.getRangeAt(0);
+          // Walk text nodes to find absolute offset
+          const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+          let offset = 0;
+          let node: Node | null = walker.nextNode();
+          while (node) {
+            if (node === r.startContainer) {
+              cursorOffset = offset + r.startOffset;
+              break;
+            }
+            offset += (node.textContent || "").length;
+            node = walker.nextNode();
+          }
+        }
+        const escCmd = match[1]
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
+        const escArgs = match[2]
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/\n/g, "<br>");
+        const highlighted = `<span style="color:var(--color-accent);font-weight:600">${escCmd}</span>${escArgs}`;
+        el.innerHTML = highlighted;
+        // Restore cursor
+        if (sel) {
+          const newRange = document.createRange();
+          const tw = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+          let remaining = cursorOffset;
+          let placed = false;
+          let tn: Node | null = tw.nextNode();
+          while (tn) {
+            const len = (tn.textContent || "").length;
+            if (remaining <= len) {
+              newRange.setStart(tn, remaining);
+              newRange.collapse(true);
+              sel.removeAllRanges();
+              sel.addRange(newRange);
+              placed = true;
+              break;
+            }
+            remaining -= len;
+            tn = tw.nextNode();
+          }
+          if (!placed) {
+            newRange.selectNodeContents(el);
+            newRange.collapse(false);
+            sel.removeAllRanges();
+            sel.addRange(newRange);
+          }
+        }
+      }
+      return;
+    }
+    checkContent();
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) {
+      setShowSlashMenu(false);
+      setShowFileMenu(false);
+      return;
+    }
+    const range = sel.getRangeAt(0);
+    const node = range.startContainer;
+    if (node.nodeType !== Node.TEXT_NODE) {
+      setShowSlashMenu(false);
+      setShowFileMenu(false);
+      return;
+    }
+    const text = node.textContent || "";
+    const offset = range.startOffset;
+    // Scan backwards from cursor to find "@" or "/" (@ takes priority over /)
+    let slashIdx = -1;
+    let atIdx = -1;
+
+    // Find last @ before cursor
+    const lastAt = text.lastIndexOf("@", offset - 1);
+    if (lastAt >= 0 && (lastAt === 0 || /\s/.test(text[lastAt - 1]))) {
+      const segment = text.slice(lastAt, offset);
+      const hasCategory = segment.startsWith("@project:") ||
+                          segment.startsWith("@file:") ||
+                          segment.startsWith("@agent:") ||
+                          segment.startsWith("@conversation:") ||
+                          segment.startsWith("@browsertabs:") ||
+                          (isStudioProject && segment.startsWith("@sketch:"));
+      const hasNoSpaces = !/\s/.test(segment);
+      if (hasCategory || hasNoSpaces) {
+        atIdx = lastAt;
+      }
+    }
+
+    // Find last / before cursor
+    const lastSlash = text.lastIndexOf("/", offset - 1);
+    if (lastSlash >= 0 && (lastSlash === 0 || /\s/.test(text[lastSlash - 1]))) {
+      const segment = text.slice(lastSlash, offset);
+      if (!/\s/.test(segment)) {
+        slashIdx = lastSlash;
+      }
+    }
+    if (atIdx >= 0 && (taskFiles.length > 0 || agentMentionItems.length > 0)) {
+      refreshTaskFilesIfNeeded();
+      refreshAgentMentionCandidates();
+      refreshProjectsIfNeeded();
+      
+      const mentionText = text.slice(atIdx + 1, offset);
+      let cat: string | null = null;
+      let filter = mentionText;
+      
+      const colonIdx = mentionText.indexOf(":");
+      if (colonIdx >= 0) {
+        const possibleCat = mentionText.slice(0, colonIdx).toLowerCase();
+        const allowedCats = isStudioProject
+          ? ["conversation", "file", "agent", "project", "browsertabs", "sketch"]
+          : ["conversation", "file", "agent", "project", "browsertabs"];
+        if (allowedCats.includes(possibleCat)) {
+          cat = possibleCat;
+          filter = mentionText.slice(colonIdx + 1);
+        }
+      }
+
+      if (cat === "project") {
+        const slashIdx = filter.indexOf("/");
+        if (slashIdx >= 0) {
+          const projectName = filter.slice(0, slashIdx);
+          triggerProjectFilesLoad(projectName);
+        }
+      }
+      
+      setActiveCategory(cat);
+      setFileFilter(filter);
+      setShowFileMenu(true);
+      setFileSelectedIdx(0);
+      setShowSlashMenu(false);
+    } else if (slashIdx >= 0 && slashCommands.length > 0) {
+      setSlashFilter(text.slice(slashIdx + 1, offset));
+      setShowSlashMenu(true);
+      setSlashSelectedIdx(0);
+      setShowFileMenu(false);
+      setActiveCategory(null);
+    } else {
+      setShowSlashMenu(false);
+      setShowFileMenu(false);
+      setActiveCategory(null);
+    }
+  }, [
+    checkContent,
+    isTerminalMode,
+    isBusy,
+    slashCommands.length,
+    taskFiles.length,
+    agentMentionItems.length,
+    refreshTaskFilesIfNeeded,
+    refreshAgentMentionCandidates,
+    refreshProjectsIfNeeded,
+    triggerProjectFilesLoad,
+    getActiveChatId,
+    isStudioProject,
+  ]);
+
+  /** Insert a command chip at the current cursor position, replacing the /partial text */
+  const insertCommandAtCursor = useCallback(
+    (name: string) => {
+      const el = editableRef.current;
+      if (!el) return;
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) return;
+      const range = sel.getRangeAt(0);
+      const node = range.startContainer;
+      if (node.nodeType !== Node.TEXT_NODE) return;
+      const text = node.textContent || "";
+      const offset = range.startOffset;
+      // Find the "/" start
+      let slashIdx = -1;
+      for (let i = offset - 1; i >= 0; i--) {
+        if (text[i] === "/") {
+          if (i === 0 || /\s/.test(text[i - 1])) slashIdx = i;
+          break;
+        }
+        if (/\s/.test(text[i])) break;
+      }
+      if (slashIdx < 0) return;
+      const before = text.slice(0, slashIdx);
+      const after = text.slice(offset);
+      const parent = node.parentNode;
+      if (!parent) return;
+      // Build replacement: textBefore + chip + textAfter
+      const chip = createCommandChip(name);
+      const frag = document.createDocumentFragment();
+      if (before) frag.appendChild(document.createTextNode(before));
+      frag.appendChild(chip);
+      const afterNode = document.createTextNode(after || " ");
+      frag.appendChild(afterNode);
+      parent.replaceChild(frag, node);
+      // Move cursor after chip
+      const newRange = document.createRange();
+      newRange.setStart(afterNode, after ? 0 : 1);
+      newRange.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(newRange);
+      setShowSlashMenu(false);
+      checkContent();
+    },
+    [checkContent],
+  );
+
+  /**
+   * Insert a chip at the cursor position, replacing the `@partial` text.
+   * Routes to the appropriate chip kind:
+   *   - file mentions → file chip (existing path/displayName/category)
+   *   - agent_spawn / agent_send / agent_reply → agent-graph mention chip
+   * Lookups by `(path, category)` are unique within `filteredFiles` because
+   * agent-graph items use synthetic path keys.
+   */
+  const insertFileAtCursor = useCallback(
+    (filePath: string, isDir?: boolean, displayLabel?: string, category?: string) => {
+      const el = editableRef.current;
+      if (!el) return;
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) return;
+      const range = sel.getRangeAt(0);
+      const node = range.startContainer;
+      if (node.nodeType !== Node.TEXT_NODE) return;
+      const text = node.textContent || "";
+      const offset = range.startOffset;
+      // Find the "@" start
+      let atIdx = -1;
+      const lastAt = text.lastIndexOf("@", offset - 1);
+      if (lastAt >= 0 && (lastAt === 0 || /\s/.test(text[lastAt - 1]))) {
+        const segment = text.slice(lastAt, offset);
+        const hasCategory = segment.startsWith("@project:") ||
+                            segment.startsWith("@file:") ||
+                            segment.startsWith("@agent:") ||
+                            segment.startsWith("@conversation:") ||
+                            segment.startsWith("@browsertabs:") ||
+                            (isStudioProject && segment.startsWith("@sketch:"));
+        const hasNoSpaces = !/\s/.test(segment);
+        if (hasCategory || hasNoSpaces) {
+          atIdx = lastAt;
+        }
+      }
+      if (atIdx < 0) return;
+      const before = text.slice(0, atIdx);
+      const after = text.slice(offset);
+      const parent = node.parentNode;
+      if (!parent) return;
+
+      if (category === "category_selector") {
+        const categoryText = `@${filePath}:`;
+        const newTextNode = document.createTextNode(before + categoryText + after);
+        parent.replaceChild(newTextNode, node);
+        
+        const newRange = document.createRange();
+        newRange.setStart(newTextNode, before.length + categoryText.length);
+        newRange.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(newRange);
+        
+        setActiveCategory(filePath);
+        setFileFilter("");
+        setShowFileMenu(true);
+        setFileSelectedIdx(0);
+        return;
+      }
+
+      if (category === "Coding Project" || category === "Studio Project") {
+        const projectText = `@project:${filePath}/`;
+        const newTextNode = document.createTextNode(before + projectText + after);
+        parent.replaceChild(newTextNode, node);
+        
+        const newRange = document.createRange();
+        newRange.setStart(newTextNode, before.length + projectText.length);
+        newRange.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(newRange);
+        
+        setActiveCategory("project");
+        setFileFilter(`${filePath}/`);
+        setShowFileMenu(true);
+        setFileSelectedIdx(0);
+        triggerProjectFilesLoad(filePath);
+        return;
+      }
+
+      const matched = filteredFiles.find(
+        (f) => f.path === filePath && (f.category ?? "") === (category ?? ""),
+      );
+      const chip =
+        matched && matched.kind === "browsertabs"
+          ? createBrowserTabChip(
+              filePath,
+              displayLabel || filePath,
+              matched.sessionId ? Number(matched.sessionId) : undefined,
+            )
+          : matched && matched.kind && matched.kind !== "file"
+          ? createAgentMentionChip(matched)
+          : createFileChip(
+              filePath,
+              isDir,
+              displayLabel || (matched?.displayName ?? ""),
+              category,
+              matched?.favIconUrl
+            );
+
+      const frag = document.createDocumentFragment();
+      if (before) frag.appendChild(document.createTextNode(before));
+      frag.appendChild(chip);
+      const afterNode = document.createTextNode(after || " ");
+      frag.appendChild(afterNode);
+      parent.replaceChild(frag, node);
+      const newRange = document.createRange();
+      newRange.setStart(afterNode, after ? 0 : 1);
+      newRange.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(newRange);
+      setShowFileMenu(false);
+      setActiveCategory(null);
+      checkContent();
+    },
+    [checkContent, filteredFiles, triggerProjectFilesLoad, isStudioProject],
+  );
+
+  /** Delegated click handler for chip close buttons */
+  const handleEditableMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.dataset.chipClose || target.closest("[data-chip-close]")) {
+        e.preventDefault();
+        const chip = target.closest("[data-command],[data-file],[data-mention-kind]");
+        if (chip) {
+          chip.remove();
+          checkContent();
+        }
+      }
+    },
+    [checkContent],
+  );
+
+  /** Strip HTML on paste — insert plain text or handle image paste */
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent) => {
+      // Check for image paste
+      const items = Array.from(e.clipboardData.items);
+      const imageItem = items.find((i) => i.type.startsWith("image/"));
+      if (imageItem && promptCaps.image) {
+        e.preventDefault();
+        const file = imageItem.getAsFile();
+        if (file) addFileAsAttachment(file);
+        return;
+      }
+      // Default: plain text paste
+      e.preventDefault();
+      const text = e.clipboardData.getData("text/plain");
+      // Large text: convert to .txt attachment to avoid freezing contentEditable
+      if (text.length > 10 * 1024) {
+        const blob = new Blob([text], { type: "text/plain" });
+        const file = new File([blob], "pasted-text.txt", { type: "text/plain" });
+        void addFileAsAttachment(file);
+        return;
+      }
+      document.execCommand("insertText", false, text);
+      checkContent();
+    },
+    [checkContent, promptCaps.image, addFileAsAttachment],
+  );
+
+  /** Handle file input selection */
+  const handleFileSelect = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(e.target.files ?? []);
+      files.forEach((file) => {
+        if (file.type.startsWith("image/") && promptCaps.image)
+          void addFileAsAttachment(file);
+        else if (file.type.startsWith("audio/") && promptCaps.audio)
+          void addFileAsAttachment(file);
+        else void addFileAsAttachment(file);
+      });
+      // Reset input so same file can be selected again
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    },
+    [promptCaps.image, promptCaps.audio, addFileAsAttachment],
+  );
+
+  /**
+   * Insert a file chip at a screen point (used for drag-and-drop from
+   * the Review sidebar). Falls back to appending at the editor end if
+   * the point isn't inside the editable region.
+   */
+  const insertFileChipAtPoint = useCallback(
+    (filePath: string, clientX: number, clientY: number) => {
+      const el = editableRef.current;
+      if (!el) return;
+      const matched = filteredFiles.find((f) => f.path === filePath);
+      const chip = createFileChip(
+        filePath,
+        false,
+        matched?.displayName,
+        matched?.category,
+        matched?.favIconUrl
+      );
+
+      // Resolve a Range at the drop point. caretRangeFromPoint is WebKit/Blink;
+      // caretPositionFromPoint is the standard. Try both.
+      type CaretPositionLike = { offsetNode: Node; offset: number };
+      const docWithCaret = document as Document & {
+        caretRangeFromPoint?: (x: number, y: number) => Range | null;
+        caretPositionFromPoint?: (x: number, y: number) => CaretPositionLike | null;
+      };
+      let range: Range | null = null;
+      if (typeof docWithCaret.caretRangeFromPoint === 'function') {
+        range = docWithCaret.caretRangeFromPoint(clientX, clientY);
+      } else if (typeof docWithCaret.caretPositionFromPoint === 'function') {
+        const pos = docWithCaret.caretPositionFromPoint(clientX, clientY);
+        if (pos) {
+          range = document.createRange();
+          range.setStart(pos.offsetNode, pos.offset);
+          range.collapse(true);
+        }
+      }
+
+      // If the resolved range is outside the editable, append to its end.
+      const inEditor = range && el.contains(range.startContainer);
+      if (!inEditor) {
+        range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(false);
+      }
+
+      el.focus();
+      range!.insertNode(chip);
+
+      // Place caret after the chip with a trailing space for ergonomics.
+      const space = document.createTextNode(' ');
+      chip.parentNode?.insertBefore(space, chip.nextSibling);
+      const newRange = document.createRange();
+      newRange.setStartAfter(space);
+      newRange.collapse(true);
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(newRange);
+
+      checkContent();
+    },
+    [checkContent, filteredFiles],
+  );
+
+  /** Drag & drop handlers */
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    // If the drag carries a grove file path, advertise copy semantics so
+    // the cursor reflects "drop = insert".
+    const types = e.dataTransfer.types;
+    if (types && Array.from(types).includes('application/x-grove-file-path')) {
+      e.dataTransfer.dropEffect = 'copy';
+    }
+    setIsDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    // Only set false when leaving the container (not entering a child)
+    if (!e.currentTarget.contains(e.relatedTarget as Node))
+      setIsDragging(false);
+  }, []);
+
+  const handleDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      setIsDragging(false);
+
+      // Path drag from Review sidebar — insert a file chip at the drop point.
+      const grovePath = e.dataTransfer.getData('application/x-grove-file-path');
+      if (grovePath) {
+        insertFileChipAtPoint(grovePath, e.clientX, e.clientY);
+        return;
+      }
+
+      const files = Array.from(e.dataTransfer.files);
+      files.forEach((file) => {
+        if (file.type.startsWith("image/") && promptCaps.image)
+          void addFileAsAttachment(file);
+        else if (file.type.startsWith("audio/") && promptCaps.audio)
+          void addFileAsAttachment(file);
+        else void addFileAsAttachment(file);
+      });
+    },
+    [promptCaps.image, promptCaps.audio, addFileAsAttachment, insertFileChipAtPoint],
+  );
+
+  // Re-check hasContent when attachments change
+  useEffect(() => {
+    // checkContent reads contentEditable DOM and may setState; this is the
+    // only place attachment-driven recomputation is observable.
+    checkContent();
+  }, [attachments.length, checkContent]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      // Skip during IME composition (e.g. Chinese/Japanese input)
+      if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+
+      // Backspace: robust chip deletion for contentEditable
+      if (e.key === "Backspace" && !e.metaKey && !e.altKey) {
+        const sel = window.getSelection();
+        if (sel && sel.isCollapsed && sel.anchorNode) {
+          const anchor = sel.anchorNode;
+          const offset = sel.anchorOffset;
+          const isChipEl = (n: Node): n is HTMLElement =>
+            n instanceof HTMLElement &&
+            (n.dataset.command !== undefined ||
+              n.dataset.file !== undefined ||
+              n.dataset.mentionKind !== undefined);
+
+          // Case A: Cursor at start of text node — chip is previous sibling → delete chip
+          if (anchor.nodeType === Node.TEXT_NODE && offset === 0) {
+            const prev = anchor.previousSibling;
+            if (prev && isChipEl(prev)) {
+              e.preventDefault();
+              const before = prev.previousSibling;
+              prev.remove();
+              // Position cursor at end of preceding text, or start of container
+              if (before && before.nodeType === Node.TEXT_NODE) {
+                const r = document.createRange();
+                r.setStart(before, (before.textContent || "").length);
+                r.collapse(true);
+                sel.removeAllRanges();
+                sel.addRange(r);
+              }
+              checkContent();
+              return;
+            }
+          }
+
+          // Case B: Cursor in element node — previous child is chip → delete chip
+          if (anchor.nodeType === Node.ELEMENT_NODE && offset > 0) {
+            const prevChild = anchor.childNodes[offset - 1];
+            if (isChipEl(prevChild)) {
+              e.preventDefault();
+              const before = prevChild.previousSibling;
+              prevChild.remove();
+              if (before && before.nodeType === Node.TEXT_NODE) {
+                const r = document.createRange();
+                r.setStart(before, (before.textContent || "").length);
+                r.collapse(true);
+                sel.removeAllRanges();
+                sel.addRange(r);
+              }
+              checkContent();
+              return;
+            }
+          }
+
+          // Case C: Cursor in a whitespace-only text node right after a chip
+          // (the trailing " " inserted as cursor placeholder after chip creation)
+          // Handle deletion ourselves to prevent browser from mangling the DOM
+          if (anchor.nodeType === Node.TEXT_NODE && offset > 0) {
+            const text = anchor.textContent || "";
+            const prev = anchor.previousSibling;
+            if (prev && isChipEl(prev) && text.trimEnd().length === 0) {
+              e.preventDefault();
+              if (text.length <= 1) {
+                // Last whitespace char — delete both the padding text node and the chip
+                const beforeChip = prev.previousSibling;
+                prev.remove();
+                anchor.parentNode?.removeChild(anchor);
+                if (beforeChip && beforeChip.nodeType === Node.TEXT_NODE) {
+                  const r = document.createRange();
+                  r.setStart(beforeChip, (beforeChip.textContent || "").length);
+                  r.collapse(true);
+                  sel.removeAllRanges();
+                  sel.addRange(r);
+                } else {
+                  // No text before chip — position at end of remaining content
+                  const el = editableRef.current;
+                  if (el) {
+                    const r = document.createRange();
+                    r.selectNodeContents(el);
+                    r.collapse(false);
+                    sel.removeAllRanges();
+                    sel.addRange(r);
+                  }
+                }
+              } else {
+                // Multiple whitespace chars — delete one manually
+                anchor.textContent =
+                  text.slice(0, offset - 1) + text.slice(offset);
+                const r = document.createRange();
+                r.setStart(anchor, offset - 1);
+                r.collapse(true);
+                sel.removeAllRanges();
+                sel.addRange(r);
+              }
+              checkContent();
+              return;
+            }
+          }
+        }
+      }
+
+      // Shell mode: Backspace on empty input → exit shell mode
+      if (isTerminalMode && e.key === "Backspace") {
+        const el = editableRef.current;
+        if (el && !el.textContent?.trim()) {
+          e.preventDefault();
+          el.innerHTML = "";
+          setIsTerminalMode(false);
+          return;
+        }
+      }
+      // Shell mode: Escape → exit shell mode
+      if (isTerminalMode && e.key === "Escape") {
+        e.preventDefault();
+        const el = editableRef.current;
+        if (el) {
+          // Strip highlight spans, keep plain text
+          const raw = el.textContent || "";
+          el.textContent = raw;
+          el.blur();
+        }
+        setIsTerminalMode(false);
+        return;
+      }
+      // Expanded input: Escape → collapse
+      if (isInputExpanded && e.key === "Escape") {
+        e.preventDefault();
+        setIsInputExpanded(false);
+        editableRef.current?.blur();
+        return;
+      }
+      // Slash menu navigation
+      if (showSlashMenu && filteredSlashCommands.length > 0) {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          setSlashSelectedIdx(
+            (prev) => (prev + 1) % filteredSlashCommands.length,
+          );
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          setSlashSelectedIdx(
+            (prev) =>
+              (prev - 1 + filteredSlashCommands.length) %
+              filteredSlashCommands.length,
+          );
+          return;
+        }
+        if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+          e.preventDefault();
+          insertCommandAtCursor(filteredSlashCommands[slashSelectedIdx].name);
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          setShowSlashMenu(false);
+          return;
+        }
+      }
+      // File menu navigation
+      if (showFileMenu && filteredFiles.length > 0) {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          setFileSelectedIdx((prev) => (prev + 1) % filteredFiles.length);
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          setFileSelectedIdx(
+            (prev) => (prev - 1 + filteredFiles.length) % filteredFiles.length,
+          );
+          return;
+        }
+        if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+          e.preventDefault();
+          const sel_item = filteredFiles[fileSelectedIdx];
+          insertFileAtCursor(
+            sel_item.path,
+            sel_item.isDir,
+            sel_item.displayName,
+            sel_item.category,
+          );
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          setShowFileMenu(false);
+          setActiveCategory(null);
+          return;
+        }
+      }
+      // Shift+Tab → cycle permission mode
+      if (e.key === "Tab" && e.shiftKey && modeOptions.length > 0) {
+        e.preventDefault();
+        const currentIdx = modeOptions.findIndex(
+          (m) => m.value === permissionLevel,
+        );
+        const nextIdx = (currentIdx + 1) % modeOptions.length;
+        const next = modeOptions[nextIdx];
+        // Local-only: mode now travels with the next prompt's config bundle.
+        setPermissionLevel(next.value);
+        return;
+      }
+      // Cmd+Option+Backspace → clear pending queue
+      if (
+        e.key === "Backspace" &&
+        e.metaKey &&
+        e.altKey &&
+        pendingMessages.length > 0
+      ) {
+        e.preventDefault();
+        handleClearPending();
+        return;
+      }
+      // Plain input: Escape → blur editor
+      if (e.key === "Escape") {
+        e.preventDefault();
+        editableRef.current?.blur();
+        if (typeof window !== "undefined") {
+          window.getSelection()?.removeAllRanges();
+        }
+        return;
+      }
+      // Expanded mode: Cmd/Ctrl+Enter → send, plain Enter → newline
+      // Inline mode: Enter → send, Shift+Enter → newline
+      if (isInputExpanded) {
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+          e.preventDefault();
+          handleSend();
+        }
+      } else {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          handleSend();
+        }
+      }
+    },
+    [
+      handleSend,
+      isTerminalMode,
+      isInputExpanded,
+      showSlashMenu,
+      filteredSlashCommands,
+      slashSelectedIdx,
+      insertCommandAtCursor,
+      showFileMenu,
+      filteredFiles,
+      fileSelectedIdx,
+      insertFileAtCursor,
+      pendingMessages,
+      handleClearPending,
+      modeOptions,
+      permissionLevel,
+      checkContent,
+    ],
+  );
+
+  const toggleThinkingCollapse = useCallback((index: number) => {
+    setMessages((prev) =>
+      prev.map((m, i) =>
+        i === index && m.type === "thinking"
+          ? { ...m, collapsed: !m.collapsed }
+          : m,
+      ),
+    );
+  }, []);
+
+  const renderItems = useMemo(() => buildRenderItems(messages), [messages]);
+  const lastMessageType = messages[messages.length - 1]?.type;
+
+  // Data-layer chat search — works across the full conversation, not just
+  // what's currently rendered by Virtuoso. Navigation calls
+  // virtuosoRef.scrollToIndex; highlights are re-applied each time
+  // Virtuoso renders a different range (renderToken bumps).
+  const chatSearch = useChatSearch({
+    items: renderItems,
+    query: chatSearchOpen ? chatSearchQuery : "",
+    enabled: chatSearchOpen,
+    extractText: extractRenderItemText,
+    virtuosoRef,
+    scrollerRef: messagesViewportRef,
+    renderToken,
+  });
+
+  // ─── Memoized Virtuoso plumbing ──────────────────────────────────────
+  // Virtuoso treats the `components` prop as render config — when its
+  // identity changes, Header/Footer subtrees are unmounted and remounted.
+  // During streaming the parent re-renders many times per second, so we
+  // memoize Header/Footer/components on the only inputs that actually
+  // affect their rendered output.
+
+  const VirtuosoHeader = useMemo(() => {
+    const Header = () =>
+      hiddenMessageCount > 0 ? (
+        <div className="px-4 pt-4">
+          <div className="mx-auto max-w-[720px] rounded-md border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 py-2 text-center text-xs text-[var(--color-text-muted)]">
+            {hiddenMessageCount.toLocaleString()} earlier messages are hidden
+            from this view. Full history is still saved.
+          </div>
+        </div>
+      ) : (
+        <div className="h-4" />
+      );
+    return Header;
+  }, [hiddenMessageCount]);
+
+  const VirtuosoFooter = useMemo(() => {
+    const showThinking =
+      isBusy &&
+      lastMessageType !== "assistant" &&
+      lastMessageType !== "terminal_output";
+    const spacerHeight = inputAreaHeight + 16;
+    const Footer = () => (
+      <div>
+        {showThinking && (
+          <div className="flex items-center gap-2 px-4 py-2 text-sm text-[var(--color-text-muted)]">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            <span>Thinking...</span>
+          </div>
+        )}
+        {/* Spacer: keeps the last row above the floating composer. Sized
+            from the live ResizeObserver on inputAreaRef. */}
+        <div style={{ height: spacerHeight }} />
+      </div>
+    );
+    return Footer;
+  }, [isBusy, lastMessageType, inputAreaHeight]);
+
+  const virtuosoComponents = useMemo(
+    () => ({ Header: VirtuosoHeader, Footer: VirtuosoFooter }),
+    [VirtuosoHeader, VirtuosoFooter],
+  );
+
+  // Only bump renderToken (which forces useChatSearch to re-apply
+  // highlights to freshly mounted DOM) when search is open. Otherwise
+  // streaming would thrash the parent at every Virtuoso paint.
+  // Trailing-debounce so a streaming turn with search open doesn't trigger a
+  // full DOM re-walk on every paint.
+  const renderTokenBumpTimerRef = useRef<number | null>(null);
+  // Cancel any in-flight bump when search closes (or unmounts), so we don't
+  // wake the parent for nothing after the user dismisses the search bar.
+  useEffect(() => {
+    return () => {
+      if (renderTokenBumpTimerRef.current !== null) {
+        window.clearTimeout(renderTokenBumpTimerRef.current);
+        renderTokenBumpTimerRef.current = null;
+      }
+    };
+  }, [chatSearchOpen]);
+  const handleItemsRendered = useMemo(
+    () =>
+      chatSearchOpen
+        ? () => {
+            if (renderTokenBumpTimerRef.current !== null) {
+              window.clearTimeout(renderTokenBumpTimerRef.current);
+            }
+            renderTokenBumpTimerRef.current = window.setTimeout(() => {
+              renderTokenBumpTimerRef.current = null;
+              setRenderToken((t) => t + 1);
+            }, 100);
+          }
+        : undefined,
+    [chatSearchOpen],
+  );
+
+  // followOutput callback. Always use "smooth" — Virtuoso coalesces
+  // successive smooth scrolls into one continuous animation, which makes
+  // streaming tokens feel like flowing text rather than chunk-by-chunk
+  // jumps. (The old DOM-based scroll used "auto" during streaming because
+  // smooth scrollTo() couldn't keep up with rapid setState; that
+  // limitation doesn't apply to Virtuoso's internal scroll scheduler.)
+  const handleFollowOutput = useCallback((isAtBottom: boolean) => {
+    return isAtBottom ? ("smooth" as const) : (false as const);
+  }, []);
+
+  // Typewriter reveals text via setState INSIDE MessageItem — the
+  // `messages` array reference doesn't change, so Virtuoso's
+  // followOutput never fires. We watch totalListHeightChanged
+  // (which DOES fire when the streaming row grows) and re-anchor to
+  // bottom while auto-stick is on.
+  const handleTotalListHeightChanged = useCallback(() => {
+    if (!autoStickToBottomRef.current) return;
+    virtuosoRef.current?.scrollToIndex({
+      index: "LAST",
+      align: "end",
+      behavior: "smooth",
+    });
+  }, []);
+
+  // Track the message index where the current busy turn started
+  const turnStartIndexRef = useRef(0);
+  const wasBusyRef = useRef(false);
+  useEffect(() => {
+    if (isBusy && !wasBusyRef.current) {
+      turnStartIndexRef.current = messages.length;
+    }
+    wasBusyRef.current = isBusy;
+  }, [isBusy, messages.length]);
+
+  const toggleSection = useCallback((sectionId: string) => {
+    setExpandedSections((prev) => {
+      const next = new Set(prev);
+      if (next.has(sectionId)) {
+        next.delete(sectionId);
+      } else {
+        next.add(sectionId);
+      }
+      return next;
+    });
+  }, []);
+
+  // ─── Collapsed mode ──────────────────────────────────────────────────────
+
+  if (collapsed) {
+    return (
+      <motion.div
+        layout
+        initial={{ width: 48 }}
+        animate={{ width: 48 }}
+        transition={{ type: "spring", damping: 25, stiffness: 200 }}
+        className="h-full flex flex-col rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-tertiary)] overflow-hidden cursor-pointer hover:bg-[var(--color-bg)] transition-colors"
+        onClick={onExpand}
+        title="Expand Chat (t)"
+      >
+        <div className="flex-1 flex flex-col items-center py-2">
+          <div className="p-3 text-[var(--color-text-muted)]">
+            {AgentIcon ? (
+              <AgentIcon size={20} />
+            ) : (
+              <MessageSquare className="w-5 h-5" />
+            )}
+          </div>
+          {isConnected && (
+            <div className="p-3">
+              <div className="w-2.5 h-2.5 rounded-full bg-[var(--color-success)] animate-pulse" />
+            </div>
+          )}
+          <div className="flex-1" />
+          <div className="p-3 text-[var(--color-text-muted)]">
+            <ChevronRight className="w-5 h-5" />
+          </div>
+        </div>
+      </motion.div>
+    );
+  }
+
+  // ─── Full chat view ──────────────────────────────────────────────────────
+
+  return (
+    <motion.div
+      ref={taskChatRootRef}
+      tabIndex={-1}
+      initial={{ opacity: 0, y: -10 }}
+      animate={{ opacity: 1, y: 0 }}
+      className={`flex-1 flex flex-col overflow-hidden relative outline-none ${fullscreen ? "" : "rounded-lg border border-[var(--color-border)]"}`}
+      onPointerDown={(e) => {
+        // Anchor keyboard focus to the chat panel on any click, so that
+        // global Cmd/Ctrl+F handlers (which gate on activeElement) recognize
+        // the chat as the focused panel even when the user clicks a plain
+        // text region. Form controls still receive focus afterwards because
+        // the browser focuses click targets after pointerdown completes.
+        const root = taskChatRootRef.current;
+        if (!root) return;
+        if (root === e.target || !(e.target as Element).closest?.("input,textarea,select,button,a,iframe,[contenteditable=true]")) {
+          if (!root.contains(document.activeElement)) {
+            root.focus({ preventScroll: true });
+          }
+        }
+      }}
+    >
+      {chatSearchOpen && (
+        <PreviewSearchBar
+          query={chatSearchQuery}
+          onQueryChange={setChatSearchQuery}
+          total={chatSearch.total}
+          current={chatSearch.current}
+          onNext={chatSearch.next}
+          onPrev={chatSearch.prev}
+          onClose={() => { setChatSearchOpen(false); setChatSearchQuery(""); }}
+          className="absolute right-3 top-12 z-[60]"
+        />
+      )}
+      {/* Header */}
+      {!hideHeader && sessionRailCollapsed && (
+        <div className="relative z-30 border-b border-[color-mix(in_srgb,var(--color-border)_78%,transparent)] bg-[color-mix(in_srgb,var(--color-bg)_88%,transparent)] backdrop-blur-sm select-none">
+          <div className="flex w-full items-center justify-between px-3 py-1.5">
+            <div className="flex flex-1 min-w-0 items-center gap-2 text-sm select-none">
+              {activeChat ? (
+                // NB: do NOT add flex-1 here. The title is a sibling of the
+                // New/Fork buttons inside a flex container — flex-1 on the
+                // title makes it consume all remaining width and pushes New/
+                // Fork to the right edge against the Connected indicator,
+                // with a big empty gap after the title. min-w-0 alone is
+                // enough; OverflowTitle inside truncates as needed.
+                <div className="relative min-w-0" ref={chatMenuRef}>
+                  {editingTitle?.chatId === activeChat.id &&
+                  editingTitle.surface === "header" ? (
+                    <div className="flex items-center gap-2">
+                      {AgentIcon ? (
+                        <AgentIcon
+                          size={14}
+                          className="shrink-0 text-[var(--color-text-muted)]"
+                        />
+                      ) : (
+                        <MessageSquare className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-muted)]" />
+                      )}
+                      <InlineEditTitle
+                        value={editTitleValue}
+                        onChange={setEditTitleValue}
+                        onSave={handleTitleSave}
+                        onCancel={() => setEditingTitle(null)}
+                        className="min-w-0 w-48 border-b border-[var(--color-highlight)] bg-transparent px-0 py-0 text-sm text-[var(--color-text)] outline-none"
+                      />
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setShowChatMenu((prev) => !prev)}
+                      onDoubleClick={() => {
+                        setEditTitleValue(activeChat.title);
+                        setEditingTitle({
+                          chatId: activeChat.id,
+                          surface: "header",
+                        });
+                        setShowChatMenu(false);
+                      }}
+                      className="flex max-w-full min-w-0 items-center gap-2 text-left"
+                      title="Double-click to rename"
+                    >
+                      {AgentIcon ? (
+                        <AgentIcon
+                          size={14}
+                          className="shrink-0 text-[var(--color-text-muted)]"
+                        />
+                      ) : (
+                        <MessageSquare className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-muted)]" />
+                      )}
+                      <OverflowTitle
+                        text={activeChat.title}
+                        className="text-[13px] font-medium text-[var(--color-text)]"
+                      />
+                      <ChevronDown className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
+                    </button>
+                  )}
+
+                  {showChatMenu && (
+                    <div className="absolute top-full left-0 z-[80] mt-1 min-w-56 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg">
+                      <div className="border-b border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[var(--color-bg)] px-2 py-1">
+                        <button
+                          onClick={() => {
+                            setShowChatMenu(false);
+                            setSessionRailCollapsed(false);
+                          }}
+                          className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-[12px] text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-secondary)] hover:text-[var(--color-text)]"
+                        >
+                          <span>Open Sessions</span>
+                          <ChevronRight className="h-3 w-3" />
+                        </button>
+                      </div>
+                      <div className="max-h-64 overflow-y-auto py-1">
+                        {orderedChats.map((chat) => {
+                          const ChatIcon = getChatIcon(chat.agent);
+                          return (
+                            <div
+                              key={chat.id}
+                              className={`group flex cursor-pointer items-center gap-2 px-3 py-2 text-sm transition-colors ${
+                                chat.id === activeChatId
+                                  ? "bg-[var(--color-bg-tertiary)] text-[var(--color-text)]"
+                                  : "text-[var(--color-text-muted)] hover:bg-[var(--color-bg-secondary)] hover:text-[var(--color-text)]"
+                              }`}
+                              onClick={() => switchChat(chat.id)}
+                            >
+                              <ChatIcon className="h-3.5 w-3.5 shrink-0" />
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate">{chat.title}</div>
+                              </div>
+                              {chats.length > 1 && (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleDeleteChat(chat.id);
+                                  }}
+                                  className="shrink-0 p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-error)] group-hover:opacity-100"
+                                  title="Delete chat"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <span className="text-[var(--color-text-muted)] truncate">
+                  {agentLabel}
+                </span>
+              )}
+
+              <div className="relative shrink-0" ref={headerAgentPickerRef}>
+                <button
+                  onClick={(e) => toggleAgentPicker(e.currentTarget)}
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-highlight)]"
+                  title="New Session"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>New</span>
+                </button>
+              </div>
+              {/* Fork 只在 source agent live 且当前空闲、不在登录中时允许。
+                  disabled 而不是隐藏:让用户知道按钮存在,只是当下不能用。 */}
+              {forkCapable && activeChat && (
+                <button
+                  onClick={() => handleForkChat(activeChat.id)}
+                  disabled={!isConnected || isBusy || !!activeAuthMessage}
+                  className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-highlight)] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-[var(--color-text-muted)]"
+                  title={
+                    !isConnected
+                      ? "Fork unavailable: source session not connected"
+                      : isBusy
+                        ? "Fork unavailable while agent is responding"
+                        : activeAuthMessage
+                          ? "Fork unavailable: finish login first"
+                          : "Fork Session — derive a new session from the current chat, copy the conversation history"
+                  }
+                >
+                  <GitFork className="w-3.5 h-3.5" />
+                  <span>Fork</span>
+                </button>
+              )}
+            </div>
+
+            <div className="flex shrink-0 items-center gap-1.5 select-none">
+              <div
+                className={`w-2.5 h-2.5 rounded-full ${isConnected ? "bg-[var(--color-success)] animate-pulse" : "bg-[var(--color-warning)]"}`}
+              />
+              <span className="text-xs text-[var(--color-text-muted)]">
+                {isConnected
+                  ? "Connected"
+                  : connectPhase === "downloading" && connectPhaseStartedAt
+                    ? <DownloadingLabel startedAt={connectPhaseStartedAt} />
+                    : "Connecting..."}
+              </span>
+              {onToggleFullscreen && (
+                <button
+                  onClick={onToggleFullscreen}
+                  className="ml-1 rounded p-1 text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+                  title={fullscreen ? "Exit Fullscreen" : "Fullscreen"}
+                >
+                  {fullscreen ? (
+                    <Minimize2 className="w-3.5 h-3.5" />
+                  ) : (
+                    <Maximize2 className="w-3.5 h-3.5" />
+                  )}
+                </button>
+              )}
+              {onCollapse && (
+                <button
+                  onClick={onCollapse}
+                  className="ml-1 rounded p-1 text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+                  title="Minimize Chat"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="flex min-h-0 flex-1">
+        <div
+          className={`shrink-0 border-r border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_20%,transparent)] transition-all duration-200 ${sessionRailCollapsed ? "w-0 overflow-hidden border-r-transparent" : "w-[228px] overflow-hidden"}`}
+        >
+          <div className="flex h-full flex-col">
+            <div className="border-b border-[color-mix(in_srgb,var(--color-border)_68%,transparent)] p-2 space-y-1.5">
+              <div className="flex items-center gap-2 px-1">
+                <button
+                  onClick={() => setSessionRailCollapsed(true)}
+                  className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--color-text-muted)] transition-colors hover:text-[var(--color-text)] hover:bg-[var(--color-bg-secondary)]"
+                  title="Back to compact mode"
+                >
+                  <ChevronLeft className="h-3.5 w-3.5" />
+                </button>
+                <div
+                  className="min-w-0 flex items-center gap-2"
+                  onDoubleClick={() => {
+                    if (!activeChat) return;
+                    setEditTitleValue(activeChat.title);
+                    setEditingTitle({
+                      chatId: activeChat.id,
+                      surface: "sidebar-header",
+                    });
+                  }}
+                  title="Double-click to rename"
+                >
+                  {AgentIcon ? (
+                    <AgentIcon
+                      size={14}
+                      className="shrink-0 text-[var(--color-text-muted)]"
+                    />
+                  ) : (
+                    <MessageSquare className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-muted)]" />
+                  )}
+                  {activeChat &&
+                  editingTitle?.chatId === activeChat.id &&
+                  editingTitle.surface === "sidebar-header" ? (
+                    <InlineEditTitle
+                      value={editTitleValue}
+                      onChange={setEditTitleValue}
+                      onSave={handleTitleSave}
+                      onCancel={() => setEditingTitle(null)}
+                      className="min-w-0 flex-1 bg-transparent text-[13px] font-medium text-[var(--color-text)] outline-none"
+                    />
+                  ) : (
+                    <OverflowTitle
+                      text={activeChat?.title ?? "Chats"}
+                      className="text-[13px] font-medium text-[var(--color-text)]"
+                    />
+                  )}
+                </div>
+              </div>
+              <div className="flex items-center justify-between gap-2 px-1">
+                <div className="text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
+                  Sessions
+                </div>
+                <div className="flex items-center gap-1.5 text-[11px] text-[var(--color-text-muted)]">
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${isConnected ? "bg-[var(--color-success)]" : "bg-[var(--color-warning)]"}`}
+                  />
+                  <span>
+                    {isConnected
+                      ? "Connected"
+                      : connectPhase === "downloading" && connectPhaseStartedAt
+                        ? <DownloadingLabel startedAt={connectPhaseStartedAt} compact />
+                        : "Connecting..."}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-none p-1.5">
+              <div className="space-y-1">
+                <div className="flex items-stretch gap-1">
+                  <div className="relative flex-1" ref={sidebarAgentPickerRef}>
+                    <button
+                      onClick={(e) => toggleAgentPicker(e.currentTarget)}
+                      className="flex w-full items-center gap-2 rounded-md border border-dashed border-[color-mix(in_srgb,var(--color-highlight)_34%,transparent)] bg-transparent px-1.5 py-1 text-[12px] text-[var(--color-highlight)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)]"
+                      title="New Session"
+                    >
+                      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-sm border border-dashed border-[color-mix(in_srgb,var(--color-highlight)_34%,transparent)] text-[var(--color-highlight)]">
+                        <Plus className="h-3 w-3" />
+                      </div>
+                      <span className="font-medium">New Session</span>
+                    </button>
+                  </div>
+                  {forkCapable && activeChat && (
+                    <button
+                      onClick={() => handleForkChat(activeChat.id)}
+                      disabled={!isConnected || isBusy || !!activeAuthMessage}
+                      className="flex shrink-0 items-center gap-1.5 rounded-md border border-dashed border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-transparent px-2 text-[12px] text-[var(--color-text-muted)] transition-colors hover:border-[color-mix(in_srgb,var(--color-highlight)_34%,transparent)] hover:text-[var(--color-highlight)] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] disabled:hover:text-[var(--color-text-muted)]"
+                      title={
+                        !isConnected
+                          ? "Fork unavailable: source session not connected"
+                          : isBusy
+                            ? "Fork unavailable while agent is responding"
+                            : activeAuthMessage
+                              ? "Fork unavailable: finish login first"
+                              : "Fork Session — derive a new session from the current chat, copy the conversation history"
+                      }
+                    >
+                      <GitFork className="h-3 w-3" />
+                      <span>Fork</span>
+                    </button>
+                  )}
+                </div>
+                {orderedChats.map((chat) => {
+                  const ChatIcon = getChatIcon(chat.agent);
+                  const isActive = chat.id === activeChatId;
+                  return (
+                    <div
+                      key={chat.id}
+                      className={`group flex items-center gap-1.5 rounded-md border border-transparent px-1.5 py-1 transition-colors ${
+                        isActive
+                          ? "bg-[color-mix(in_srgb,var(--color-highlight)_9%,transparent)]"
+                          : "text-[var(--color-text-muted)] hover:bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)] hover:text-[var(--color-text)]"
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => switchChat(chat.id)}
+                        onDoubleClick={() => {
+                          setEditTitleValue(chat.title);
+                          setEditingTitle({
+                            chatId: chat.id,
+                            surface: "sidebar-list",
+                          });
+                        }}
+                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                        title={chat.title}
+                      >
+                        <div
+                          className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-sm border ${
+                            isActive
+                              ? "border-[color-mix(in_srgb,var(--color-highlight)_26%,transparent)] bg-[color-mix(in_srgb,var(--color-highlight)_10%,transparent)] text-[var(--color-highlight)]"
+                              : "border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-transparent text-[var(--color-text-muted)]"
+                          }`}
+                        >
+                          <ChatIcon className="h-3 w-3" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          {editingTitle?.chatId === chat.id &&
+                          editingTitle.surface === "sidebar-list" ? (
+                            <InlineEditTitle
+                              value={editTitleValue}
+                              onChange={setEditTitleValue}
+                              onSave={handleTitleSave}
+                              onCancel={() => setEditingTitle(null)}
+                              className="w-full bg-transparent text-[12px] leading-5 text-[var(--color-text)] outline-none"
+                            />
+                          ) : (
+                            <OverflowTitle
+                              text={chat.title}
+                              className={`text-[12px] leading-5 ${isActive ? "font-medium text-[var(--color-text)]" : ""}`}
+                            />
+                          )}
+                        </div>
+                      </button>
+                      {chats.length > 1 &&
+                        !(
+                          editingTitle?.chatId === chat.id &&
+                          editingTitle.surface === "sidebar-list"
+                        ) && (
+                          <button
+                            onClick={() => handleDeleteChat(chat.id)}
+                            className="shrink-0 rounded p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-error)] group-hover:opacity-100"
+                            title="Delete chat"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="relative min-h-0 min-w-0 flex-1">
+          {/* Terminal launch mode: agent CLI runs in xterm.js (PTY).
+              Chatbox input still writes lines to PTY stdin via handleSend. */}
+          {isTerminalLaunchMode && agentPtyWsUrl ? (
+            // Constrain xterm's height so the floating chatbox doesn't cover
+            // the agent's bottom prompt. inputAreaHeight is the live-measured
+            // chatbox height (ResizeObserver on inputAreaRef); +16 matches
+            // the Virtuoso Footer spacer used in ACP mode.
+            <div
+              className="absolute inset-x-0 top-0"
+              style={{ bottom: inputAreaHeight + 16 }}
+            >
+              <XTerminal
+                wsUrl={agentPtyWsUrl}
+                instanceId={`agent-pty:${activeChatId ?? ""}`}
+                // Drive the chat header's connection pill from the PTY WS
+                // status — there's no ACP WS in this mode so the original
+                // ACP-driven `isConnected` would be stuck on "Connecting…".
+                onConnected={() => setIsConnected(true)}
+                onDisconnected={() => setIsConnected(false)}
+              />
+            </div>
+          ) : (
+          /* Messages — virtualized via react-virtuoso so multi-thousand
+              message conversations stay snappy. Virtuoso owns the scroll
+              container; we hand it the renderItems array and let it
+              mount/unmount rows as the viewport moves. */
+          <Virtuoso
+            // Force-remount per chat so each chat starts with a clean
+            // scroll position (no carry-over from the previous chat).
+            // Initial bottom-pinning is handled imperatively below in
+            // the activeChatId/renderItems.length effect — Virtuoso's
+            // initialTopMostItemIndex is unreliable when data loads
+            // async after mount.
+            key={activeChatId}
+            ref={virtuosoRef}
+            data={renderItems}
+            scrollerRef={(ref) => {
+              messagesViewportRef.current = ref as HTMLDivElement | null;
+            }}
+            className="relative z-0 h-full min-h-0 flex-1 overscroll-none"
+            // Hide the list while we're scrolling it to the bottom on
+            // chat switch — otherwise the user sees "first row visible,
+            // then snap to last row" which is jarring.
+            style={{
+              opacity: chatPositioning ? 0 : 1,
+              transition: chatPositioning ? "none" : "opacity 120ms ease-out",
+            }}
+            increaseViewportBy={{ top: 600, bottom: 1200 }}
+            followOutput={handleFollowOutput}
+            atBottomStateChange={handleAtBottomStateChange}
+            atBottomThreshold={48}
+            isScrolling={handleIsScrolling}
+            totalListHeightChanged={handleTotalListHeightChanged}
+            itemContent={(idx, item) =>
+              item.kind === "single" ? (
+                <div className="px-4 pt-3">
+                  <MessageItem
+                    message={item.message}
+                    index={item.index}
+                    isBusy={isBusy}
+                    agentLabel={agentLabel}
+                    projectId={projectId}
+                    taskId={task.id}
+                    isStudio={isStudioProject}
+                    resolveSender={resolveSender}
+                    onToggleThinkingCollapse={toggleThinkingCollapse}
+                    onPermissionResponse={handlePermissionResponse}
+                    onFileClick={onNavigateToFile}
+                    onImageClick={setLightboxUrl}
+                    onMermaidClick={setLightboxSvg}
+                    onD2Click={setLightboxSvg}
+                    onInsertReference={insertAttachmentReference}
+                  />
+                </div>
+              ) : (
+                <div className="px-4 pt-3">
+                  <ToolSectionView
+                    sectionId={item.sectionId}
+                    tools={item.tools}
+                    expanded={expandedSections.has(item.sectionId)}
+                    forceExpanded={false}
+                    sectionFinished={idx < renderItems.length - 1 || !isBusy}
+                    onToggleSection={toggleSection}
+                    onFileClick={onNavigateToFile}
+                  />
+                </div>
+              )
+            }
+            computeItemKey={(_idx, item) =>
+              item.kind === "single"
+                ? `m-${item.index}`
+                : `ts-${item.sectionId}`
+            }
+            itemsRendered={handleItemsRendered}
+            components={virtuosoComponents}
+          />
+          )}
+
+          {/* Input */}
+          <div ref={inputAreaRef} className="pointer-events-none absolute inset-x-0 z-10 px-3 pb-4 pt-2" style={{ bottom: "var(--grove-kb-inset, 0px)" }}>
+            <div className="pointer-events-none absolute inset-x-0 bottom-0 h-24 bg-[linear-gradient(to_top,color-mix(in_srgb,var(--color-bg)_96%,transparent),transparent)]" />
+            <div className="chatbox-cq-root pointer-events-auto relative mx-auto w-full max-w-[920px]">
+              {isRemoteSession && (
+                <div className="absolute inset-x-0 bottom-full z-20 mb-3">
+                  <div className="flex items-center justify-between gap-3 rounded-[22px] border border-[color-mix(in_srgb,var(--color-warning)_28%,transparent)] bg-[color-mix(in_srgb,var(--color-warning)_8%,transparent)] px-4 py-2.5 shadow-[0_10px_28px_rgba(0,0,0,0.12)] backdrop-blur-md">
+                    <div className="flex min-w-0 items-center gap-2 text-xs text-[var(--color-warning)]">
+                      <Eye className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">
+                        Read-only — controlled by{" "}
+                        <strong>{remoteOwnerName}</strong>
+                      </span>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={handleTakeControl}
+                      disabled={isTakingControl}
+                      className="h-7 shrink-0 rounded-full px-3 text-xs text-[var(--color-warning)] hover:bg-[color-mix(in_srgb,var(--color-warning)_10%,transparent)] hover:text-[var(--color-text)]"
+                    >
+                      {isTakingControl ? (
+                        <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                      ) : null}
+                      Take Control
+                    </Button>
+                  </div>
+                </div>
+              )}
+              <AnimatePresence initial={false}>
+                {composerPanelOpen && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10, height: 0 }}
+                    animate={{ opacity: 1, y: 0, height: "auto" }}
+                    exit={{ opacity: 0, y: 8, height: 0 }}
+                    transition={{ duration: 0.2, ease: "easeOut" }}
+                    className="mb-3 overflow-hidden rounded-[26px] border border-[color-mix(in_srgb,var(--color-border)_62%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_82%,transparent)] shadow-[0_16px_40px_rgba(0,0,0,0.14)] backdrop-blur-md"
+                  >
+                    <div className="max-h-72 overflow-y-auto px-3 py-3">
+                      {activeComposerPanel === "todo" && (
+                        <div className="space-y-1">
+                          {planEntries.map((entry, i) => (
+                            <div
+                              key={i}
+                              className="flex items-center gap-2 py-0.5 text-sm"
+                            >
+                              {entry.status === "completed" ? (
+                                <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-[var(--color-success)]" />
+                              ) : entry.status === "in_progress" ? (
+                                <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[var(--color-highlight)]" />
+                              ) : (
+                                <Circle className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-muted)]" />
+                              )}
+                              <span
+                                className={
+                                  entry.status === "completed"
+                                    ? "text-[var(--color-text-muted)] line-through"
+                                    : "text-[var(--color-text)]"
+                                }
+                              >
+                                {entry.content}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {activeComposerPanel === "plan" && (
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between">
+                            <div className="text-[11px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
+                              {planFilePath.split("/").pop()}
+                            </div>
+                            <button
+                              onClick={handleSavePlanToNote}
+                              disabled={isSavingToNote}
+                              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-[var(--color-highlight)] transition-colors hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50"
+                              title="Save plan to task note"
+                            >
+                              {isSavingToNote ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                              ) : saveToNoteDone ? (
+                                <CheckCircle2 className="h-3 w-3" />
+                              ) : (
+                                <Bookmark className="h-3 w-3" />
+                              )}
+                              <span>{saveToNoteDone ? "Saved" : "Save To Note"}</span>
+                            </button>
+                          </div>
+                          <MarkdownRenderer
+                            content={planFileContent}
+                            onFileClick={onNavigateToFile}
+                            onMermaidClick={setLightboxSvg}
+                            onD2Click={setLightboxSvg}
+                            onImageClick={setLightboxUrl}
+                            sketchContext={isStudioProject ? { projectId, taskId: task.id } : undefined}
+                          />
+                        </div>
+                      )}
+
+                      {activeComposerPanel === "pending" && (
+                        <div className="space-y-1">
+                          {pendingMessages.map((msg, i) => (
+                            <div
+                              key={pendingMessageKeys[i] ?? `idx-${i}`}
+                              className="flex items-center gap-2 py-1 text-sm"
+                            >
+                              <span className="w-4 shrink-0 text-right text-xs text-[var(--color-text-muted)]">
+                                {i + 1}
+                              </span>
+                              {editingPendingId === msg.id && msg.id !== "" ? (
+                                <input
+                                  autoFocus
+                                  value={editingPendingValue}
+                                  onChange={(e) =>
+                                    setEditingPendingValue(e.target.value)
+                                  }
+                                  onKeyDown={(e) => {
+                                    if (
+                                      e.nativeEvent.isComposing ||
+                                      e.keyCode === 229
+                                    )
+                                      return;
+                                    if (e.key === "Enter") {
+                                      e.preventDefault();
+                                      handleSavePendingEdit();
+                                    }
+                                    if (e.key === "Escape")
+                                      handleCancelPendingEdit();
+                                  }}
+                                  onBlur={handleSavePendingEdit}
+                                  className="flex-1 min-w-0 rounded border border-[var(--color-highlight)] bg-[var(--color-bg-secondary)] px-2 py-0.5 text-sm text-[var(--color-text)] outline-none"
+                                />
+                              ) : (
+                                <>
+                                  <span className="flex-1 min-w-0 truncate text-[var(--color-text)]">
+                                    {msg.text}
+                                  </span>
+                                  <div className="flex items-center gap-1 shrink-0">
+                                    {i === 0 && (
+                                      <button
+                                        onClick={() => handleSendNow()}
+                                        disabled={isCancelling}
+                                        className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-[var(--color-highlight)] transition-colors hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50 disabled:cursor-not-allowed"
+                                        title={isCancelling ? "Cancelling…" : "Send Now"}
+                                      >
+                                        {isCancelling ? (
+                                          <Loader2 className="h-3 w-3 animate-spin" />
+                                        ) : (
+                                          <Send className="h-3 w-3" />
+                                        )}
+                                        <span>Now</span>
+                                      </button>
+                                    )}
+                                    <button
+                                      onClick={() => handleEditPending(msg)}
+                                      className="rounded p-1 text-[var(--color-text-muted)] transition-colors hover:text-[var(--color-text)]"
+                                      title="Edit"
+                                    >
+                                      <Pencil className="h-3 w-3" />
+                                    </button>
+                                    <button
+                                      onClick={() => handleDeletePending(msg.id)}
+                                      className="rounded p-1 text-[var(--color-text-muted)] transition-colors hover:text-[var(--color-error)]"
+                                      title="Delete"
+                                    >
+                                      <Trash2 className="h-3 w-3" />
+                                    </button>
+                                  </div>
+                                </>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {activeComposerPanel === "previewComments" && (
+                        <div className="space-y-2.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-1.5">
+                              <MessageSquarePlus className="h-3.5 w-3.5 text-[var(--color-highlight)]" />
+                              <span className="text-[11px] font-medium uppercase tracking-[0.1em] text-[var(--color-text-muted)]">
+                                Preview comments
+                              </span>
+                              <span className="rounded-full bg-[color-mix(in_srgb,var(--color-highlight)_14%,transparent)] px-1.5 py-px text-[10px] font-medium leading-none text-[var(--color-highlight)]">
+                                {taskPreviewCommentDrafts.length}
+                              </span>
+                            </div>
+                            <button
+                              onClick={() => sendPreviewComments(taskPreviewCommentDrafts)}
+                              className="inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[10px] font-semibold text-white shadow-sm transition-transform hover:scale-[1.02]"
+                              style={{ background: "var(--color-highlight)" }}
+                            >
+                              <Send className="h-3 w-3" />
+                              Send all
+                            </button>
+                          </div>
+                          <div className="space-y-1.5">
+                            {taskPreviewCommentDrafts.map((draft, idx) => {
+                              const fileLabel = draft.fileName || draft.filePath.split("/").pop() || draft.filePath;
+                              const dir = draft.filePath.slice(0, Math.max(0, draft.filePath.length - fileLabel.length - 1));
+                              const crumb = draft.locator.selector || draft.locator.tagName;
+                              return (
+                                <div
+                                  key={draft.id}
+                                  className="group relative flex gap-2.5 rounded-xl border border-[var(--color-border)] bg-[color-mix(in_srgb,var(--color-bg)_75%,transparent)] p-2 pl-2.5 transition-colors hover:border-[color-mix(in_srgb,var(--color-highlight)_40%,var(--color-border))]"
+                                >
+                                  <div
+                                    className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-bold text-white shadow-sm"
+                                    style={{ background: "var(--color-highlight)" }}
+                                    title="Marker shown in preview"
+                                  >
+                                    {idx + 1}
+                                  </div>
+                                  <div className="min-w-0 flex-1">
+                                    <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12px] leading-snug text-[var(--color-text)]">
+                                      {draft.comment}
+                                    </div>
+                                    <div className="mt-1 flex items-center gap-1 text-[10px] text-[var(--color-text-muted)]">
+                                      <span className="truncate font-medium text-[var(--color-text)]" title={draft.filePath}>
+                                        {fileLabel}
+                                      </span>
+                                      {dir && (
+                                        <span className="truncate opacity-60" title={draft.filePath}>
+                                          · {dir}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="mt-0.5 truncate font-mono text-[10px] text-[var(--color-text-muted)] opacity-80" title={crumb}>
+                                      {crumb}
+                                    </div>
+                                  </div>
+                                  <div className="flex shrink-0 items-start gap-1 opacity-70 transition-opacity group-hover:opacity-100">
+                                    <button
+                                      onClick={() => sendPreviewComments([draft])}
+                                      className="rounded-md p-1 text-[var(--color-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-highlight)_12%,transparent)] hover:text-[var(--color-highlight)]"
+                                      title="Send this comment"
+                                    >
+                                      <Send className="h-3 w-3" />
+                                    </button>
+                                    <button
+                                      onClick={() => removePreviewCommentDraft(draft.id)}
+                                      className="rounded-md p-1 text-[var(--color-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-error)_12%,transparent)] hover:text-[var(--color-error)]"
+                                      title="Remove"
+                                    >
+                                      <X className="h-3 w-3" />
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      {activeComposerPanel === "auth" && activeAuthMessage && (
+                        <AuthRequiredPanel
+                          message={activeAuthMessage}
+                          index={activeAuthMessageIndex}
+                          agentLabel={agentLabel}
+                          onAuthLogin={handleAuthLogin}
+                          onDismiss={(idx) => {
+                            setMessages((prev) =>
+                              prev.map((m, i) =>
+                                i === idx && m.type === "auth_required"
+                                  ? { ...m, status: "succeeded" }
+                                  : m
+                              )
+                            );
+                            setShowAuthPanel(false);
+                          }}
+                        />
+                      )}
+
+                      {activeComposerPanel === "permission" &&
+                        activePermissionMessage && (
+                          <div className="space-y-3">
+                            <div className="flex items-center gap-2">
+                              <ShieldCheck className="h-4 w-4 shrink-0 text-[var(--color-warning)]" />
+                              <span className="text-sm font-medium text-[var(--color-text)]">
+                                {activePermissionMessage.description}
+                              </span>
+                            </div>
+                            <div className="space-y-2">
+                              {activePermissionMessage.options.map((opt) => (
+                                <button
+                                  key={opt.option_id}
+                                  onClick={() =>
+                                    handlePermissionResponse(
+                                      opt.option_id,
+                                      activePermissionMessage.id,
+                                    )
+                                  }
+                                  className="flex w-full items-center justify-between rounded-xl border border-[color-mix(in_srgb,var(--color-warning)_18%,transparent)] bg-[color-mix(in_srgb,var(--color-warning)_7%,transparent)] px-3 py-2.5 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--color-warning)_12%,transparent)]"
+                                >
+                                  <span className="text-sm font-medium text-[var(--color-text)]">
+                                    {opt.name}
+                                  </span>
+                                  <ChevronRight className="h-4 w-4 text-[var(--color-warning)]" />
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      {activeComposerPanel === "ask_form" &&
+                        activeFormMessage && (
+                          <FormPill
+                            key={activeFormMessage.id}
+                            definition={activeFormMessage.definition}
+                            onSubmit={(text) => {
+                              sendFormResponse(text);
+                              resolveAskForm(activeFormMessage.id);
+                            }}
+                            onDismiss={() => {
+                              resolveAskForm(activeFormMessage.id);
+                            }}
+                          />
+                        )}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              <AnimatePresence>
+                {showScrollToBottom && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 8 }}
+                    transition={{ duration: 0.18, ease: "easeOut" }}
+                    className="absolute inset-x-0 top-0 z-20 -translate-y-[118%]"
+                  >
+                    <button
+                      onClick={() => {
+                        enableAutoStickToBottom("smooth");
+                        setShowScrollToBottom(false);
+                      }}
+                      className="group relative mx-auto flex items-center gap-2 rounded-full px-3 py-2 text-[15px] font-medium tracking-[0.01em] text-[color-mix(in_srgb,var(--color-highlight)_80%,white_4%)] transition-all duration-200 hover:text-[color-mix(in_srgb,var(--color-highlight)_96%,white_8%)] select-none"
+                    >
+                      <span className="pointer-events-none absolute inset-0 rounded-full bg-[color-mix(in_srgb,var(--color-highlight)_8%,transparent)] opacity-0 blur-md transition-all duration-200 group-hover:opacity-100" />
+                      <span className="relative flex items-center gap-2">
+                        <ArrowDown className="h-4 w-4" />
+                        <span>Scroll to bottom</span>
+                      </span>
+                    </button>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* Slash command autocomplete popover */}
+              <AnimatePresence>
+                {showSlashMenu && filteredSlashCommands.length > 0 && (
+                  <motion.div
+                    ref={slashMenuRef}
+                    initial={{ opacity: 0, y: 4 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 4 }}
+                    transition={{ duration: 0.12 }}
+                    className="absolute bottom-full left-3 right-3 mb-1 max-h-56 overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg z-50"
+                  >
+                    {filteredSlashCommands.map((cmd, i) => (
+                      <button
+                        // Include index because multiple skills may share the
+                        // same name (user + plugin /review etc). Duplicate
+                        // React keys break reconciliation and leave orphan
+                        // DOM nodes that filter can no longer remove.
+                        key={`${cmd.name}-${i}`}
+                        ref={(el) => {
+                          slashItemRefs.current[i] = el;
+                        }}
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => insertCommandAtCursor(cmd.name)}
+                        onMouseEnter={() => setSlashSelectedIdx(i)}
+                        className={`flex w-full items-start gap-2.5 px-3 py-2 text-left transition-colors ${
+                          i === slashSelectedIdx
+                            ? "bg-[var(--color-bg-tertiary)]"
+                            : "hover:bg-[var(--color-bg-secondary)]"
+                        }`}
+                      >
+                        <Slash className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--color-highlight)]" />
+                        <div className="min-w-0">
+                          <div className="text-sm font-medium text-[var(--color-text)]">
+                            /{cmd.name}
+                          </div>
+                          <div className="truncate text-xs text-[var(--color-text-muted)]">
+                            {cmd.description}
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* File @ mention autocomplete popover */}
+              <FileMentionDropdown
+                items={filteredFiles}
+                selectedIdx={fileSelectedIdx}
+                onSelect={insertFileAtCursor}
+                onMouseEnter={setFileSelectedIdx}
+                visible={showFileMenu}
+                menuRef={fileMenuRef}
+              />
+
+              {/* Hidden file input */}
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={handleFileSelect}
+              />
+
+              <div
+                ref={chatboxContainerRef}
+                className={`chatbox-bubble relative min-w-0 rounded-[30px] border bg-[color-mix(in_srgb,var(--color-bg-secondary)_78%,transparent)] px-3 pt-2 pb-3 shadow-[0_22px_60px_rgba(0,0,0,0.18)] backdrop-blur-md transition-all ${
+                  isBusy
+                    ? "chatbox-busy-border border-transparent focus-within:border-transparent"
+                    : isTerminalMode
+                      ? "focus-within:border-[var(--color-warning)] border-[color-mix(in_srgb,var(--color-border)_62%,transparent)]"
+                      : "focus-within:border-[color-mix(in_srgb,var(--color-highlight)_82%,white_8%)] border-[color-mix(in_srgb,var(--color-border)_62%,transparent)]"
+                } ${isDragging ? "chatbox-drop-active" : ""} select-none`}
+                style={{ transform: "translateY(-6px)" }}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+              >
+                {/* Localized drop overlay — only fires inside the composer */}
+                {isDragging && (
+                  <div className="chatbox-drop-overlay" aria-hidden>
+                    <div className="chatbox-drop-overlay-inner">
+                      <Paperclip className="w-4 h-4" />
+                      <span>Drop to mention this file</span>
+                    </div>
+                  </div>
+                )}
+                <div className="mb-2 flex items-center justify-between gap-2 pr-10 select-none">
+                  <div className="flex min-w-0 items-center gap-2 select-none">
+                    <div className="inline-flex items-center gap-1.5 rounded-full bg-[var(--color-bg)] px-2.5 py-1 text-[11px] text-[var(--color-text)] min-w-0 max-w-full">
+                      {AgentIcon ? (
+                        <AgentIcon
+                          size={12}
+                          className="shrink-0 text-[var(--color-highlight)]"
+                        />
+                      ) : (
+                        <Bot className="w-3 h-3 shrink-0 text-[var(--color-highlight)]" />
+                      )}
+                      <span className="text-[var(--color-text-muted)] shrink-0">
+                        Agent
+                      </span>
+                      <span className="truncate font-medium">{agentLabel}</span>
+                      {agentQuota && (
+                        <AgentQuotaPopover
+                          usage={agentQuota}
+                          refreshing={quotaRefreshing}
+                          onRefresh={refreshAgentQuota}
+                          anchorRef={chatboxContainerRef}
+                        >
+                          <button
+                            type="button"
+                            onClick={refreshAgentQuota}
+                            disabled={quotaRefreshing}
+                            aria-label={`Agent quota: ${Math.round(
+                              quotaBadgePercentRemaining ?? 0,
+                            )}% remaining${
+                              agentQuota.plan ? ` on ${agentQuota.plan}` : ""
+                            }${agentQuota.outdated ? ". Data may be outdated." : ""}. Click to refresh.`}
+                            title={`${Math.round(
+                              quotaBadgePercentRemaining ?? 0,
+                            )}% remaining${agentQuota.outdated ? " — outdated" : ""} — click to refresh`}
+                            className="inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 text-[10px] font-semibold leading-[16px] transition-opacity hover:opacity-80 disabled:opacity-50"
+                            style={{
+                              color: quotaHealthColor(quotaBadgePercentRemaining ?? 0),
+                              // Subtle health-tinted pill so the status is
+                              // legible even at a glance: healthy green,
+                              // warning amber, critical red.
+                              backgroundColor: `color-mix(in srgb, ${quotaHealthColor(
+                                quotaBadgePercentRemaining ?? 0,
+                              )} 12%, transparent)`,
+                              borderColor: `color-mix(in srgb, ${quotaHealthColor(
+                                quotaBadgePercentRemaining ?? 0,
+                              )} 40%, transparent)`,
+                            }}
+                          >
+                            {(() => {
+                              const Icon = quotaBatteryIcon(
+                                quotaBadgePercentRemaining ?? 0,
+                              );
+                              return <Icon size={10} />;
+                            })()}
+                            {Math.round(quotaBadgePercentRemaining ?? 0)}%
+                          </button>
+                        </AgentQuotaPopover>
+                      )}
+                      {contextUsage && (
+                        <ContextUsagePill
+                          usage={contextUsage}
+                          anchorRef={chatboxContainerRef}
+                          hasCompactCommand={hasCompactCommand}
+                          onCompact={handleCompact}
+                        />
+                      )}
+                    </div>
+                    {isTerminalMode && (
+                      <div className="inline-flex items-center gap-1 rounded-full bg-[color-mix(in_srgb,var(--color-warning)_10%,transparent)] px-2 py-1 text-[10px] font-medium text-[var(--color-warning)]">
+                        <Terminal className="w-3 h-3" />
+                        Shell
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0 select-none">
+                    {hasTodoPanel && (
+                      <button
+                        onClick={() => {
+                          const next = !showPlan;
+                          setShowPlan(next);
+                          if (next) {
+                            setShowPermissionPanel(false);
+                            setShowFormPanel(false);
+                            setShowPlanFile(false);
+                            setShowPendingQueue(false);
+                            setShowPreviewComments(false);
+                          }
+                        }}
+                        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
+                          activeComposerPanel === "todo"
+                            ? "bg-[color-mix(in_srgb,var(--color-highlight)_14%,transparent)] text-[var(--color-highlight)]"
+                            : "bg-[var(--color-bg)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                        }`}
+                      >
+                        <ListTodo className="h-3 w-3" />
+                        <span>Todo</span>
+                        <span className="opacity-70">
+                          {
+                            planEntries.filter((e) => e.status === "completed")
+                              .length
+                          }
+                          /{planEntries.length}
+                        </span>
+                      </button>
+                    )}
+                    {hasPlanPanel && (
+                      <button
+                        onClick={() => {
+                          const next = !showPlanFile;
+                          setShowPlanFile(next);
+                          if (next) {
+                            setShowPermissionPanel(false);
+                            setShowFormPanel(false);
+                            setShowPlan(false);
+                            setShowPendingQueue(false);
+                            setShowPreviewComments(false);
+                          }
+                        }}
+                        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
+                          activeComposerPanel === "plan"
+                            ? "bg-[color-mix(in_srgb,var(--color-highlight)_14%,transparent)] text-[var(--color-highlight)]"
+                            : "bg-[var(--color-bg)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                        }`}
+                      >
+                        <BookOpen className="h-3 w-3" />
+                        <span>Plan</span>
+                      </button>
+                    )}
+                    {hasPendingPanel && (
+                      <button
+                        onClick={() => {
+                          const next = !showPendingQueue;
+                          setShowPendingQueue(next);
+                          if (next) {
+                            setShowPermissionPanel(false);
+                            setShowFormPanel(false);
+                            setShowPlan(false);
+                            setShowPlanFile(false);
+                            setShowPreviewComments(false);
+                          }
+                        }}
+                        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
+                          activeComposerPanel === "pending"
+                            ? "bg-[color-mix(in_srgb,var(--color-highlight)_14%,transparent)] text-[var(--color-highlight)]"
+                            : "bg-[var(--color-bg)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                        }`}
+                      >
+                        <ListPlus className="h-3 w-3" />
+                        <span>Pending</span>
+                      </button>
+                    )}
+                    {activePermissionMessage && (
+                      <button
+                        onClick={() => {
+                          const next = !showPermissionPanel;
+                          setShowPermissionPanel(next);
+                          if (next) {
+                            setShowPlan(false);
+                            setShowPlanFile(false);
+                            setShowPendingQueue(false);
+                            setShowPreviewComments(false);
+                          }
+                        }}
+                        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
+                          activeComposerPanel === "permission"
+                            ? "bg-[color-mix(in_srgb,var(--color-warning)_18%,transparent)] text-[var(--color-warning)]"
+                            : "border border-[color-mix(in_srgb,var(--color-warning)_24%,transparent)] bg-[color-mix(in_srgb,var(--color-warning)_6%,transparent)] text-[color-mix(in_srgb,var(--color-warning)_96%,white_8%)] hover:bg-[color-mix(in_srgb,var(--color-warning)_12%,transparent)]"
+                        }`}
+                      >
+                        <ShieldCheck className="h-3 w-3" />
+                        <span>Permission Request</span>
+                      </button>
+                    )}
+                    {activeFormMessage && (
+                      <button
+                        onClick={() => {
+                          const next = !showFormPanel;
+                          setShowFormPanel(next);
+                          if (next) {
+                            // auth + permission outrank ask_form in
+                            // activeComposerPanel — clear them too, otherwise
+                            // the form pane silently queues open and pops
+                            // unexpectedly once the higher-priority panel
+                            // closes.
+                            setShowAuthPanel(false);
+                            setShowPermissionPanel(false);
+                            setShowPlan(false);
+                            setShowPlanFile(false);
+                            setShowPendingQueue(false);
+                            setShowPreviewComments(false);
+                          }
+                        }}
+                        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
+                          activeComposerPanel === "ask_form"
+                            ? "bg-[color-mix(in_srgb,var(--color-highlight)_18%,transparent)] text-[var(--color-highlight)]"
+                            : "border border-[color-mix(in_srgb,var(--color-highlight)_24%,transparent)] bg-[color-mix(in_srgb,var(--color-highlight)_6%,transparent)] text-[color-mix(in_srgb,var(--color-highlight)_96%,white_8%)] hover:bg-[color-mix(in_srgb,var(--color-highlight)_12%,transparent)]"
+                        }`}
+                      >
+                        <ListChecks className="h-3 w-3" />
+                        <span>Survey</span>
+                      </button>
+                    )}
+                    {hasPreviewCommentsPanel && (
+                      <button
+                        onClick={() => {
+                          const next = !showPreviewComments;
+                          setShowPreviewComments(next);
+                          if (next) {
+                            setShowPermissionPanel(false);
+                            setShowFormPanel(false);
+                            setShowPlan(false);
+                            setShowPlanFile(false);
+                            setShowPendingQueue(false);
+                          }
+                        }}
+                        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
+                          activeComposerPanel === "previewComments"
+                            ? "bg-[color-mix(in_srgb,var(--color-highlight)_14%,transparent)] text-[var(--color-highlight)]"
+                            : "bg-[var(--color-bg)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                        }`}
+                      >
+                        <MessageSquarePlus className="h-3 w-3" />
+                        <span>Preview</span>
+                        <span className="opacity-70">{taskPreviewCommentDrafts.length}</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {attachments.length > 0 && (
+                  <div className="mb-2 flex gap-2 flex-wrap select-none">
+                    {attachments.map((att, i) => (
+                      <div
+                        key={i}
+                        className="group relative flex items-center gap-2 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 pr-7 max-w-full"
+                      >
+                        {att.type === "image" && att.previewUrl ? (
+                          <img
+                            src={att.previewUrl}
+                            className="w-8 h-8 object-cover rounded-md border border-[var(--color-border)] shrink-0 cursor-pointer hover:opacity-80 transition-opacity"
+                            alt={att.label}
+                            title={att.label}
+                            onClick={() => setLightboxUrl(att.previewUrl!)}
+                          />
+                        ) : att.type === "audio" ? (
+                          <div className="w-8 h-8 rounded-md border border-[var(--color-border)] flex items-center justify-center bg-[var(--color-bg-tertiary)] shrink-0">
+                            <Mic className="w-4 h-4 text-[var(--color-text-muted)]" />
+                          </div>
+                        ) : att.type === "resource" ? (
+                          <div className="w-8 h-8 rounded-md border border-[var(--color-border)] flex items-center justify-center bg-[var(--color-bg-tertiary)] shrink-0">
+                            <Paperclip className="w-4 h-4 text-[var(--color-text-muted)]" />
+                          </div>
+                        ) : null}
+                        <div className="min-w-0">
+                          <div className="text-xs font-medium text-[var(--color-text)] truncate max-w-40">
+                            {att.label}
+                          </div>
+                          <div className="text-[10px] text-[var(--color-text-muted)] truncate max-w-40">
+                            {att.name}
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => removeAttachment(i)}
+                          className="absolute top-1.5 right-1.5 w-4 h-4 rounded-full bg-[var(--color-error)] text-white flex items-center justify-center text-[10px] opacity-0 group-hover:opacity-100 transition-opacity"
+                        >
+                          &times;
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <button
+                  onClick={() => {
+                    setIsInputExpanded((v) => {
+                      if (!v) {
+                        setShowPlan(false);
+                        setShowPlanFile(false);
+                      }
+                      return !v;
+                    });
+                    setTimeout(() => editableRef.current?.focus(), 0);
+                  }}
+                  className="absolute right-3 top-2.5 p-1.5 text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] rounded-lg transition-colors z-10"
+                  title={
+                    isInputExpanded ? "Collapse input (Esc)" : "Expand input"
+                  }
+                >
+                  {isInputExpanded ? (
+                    <Minimize2 className="w-3.5 h-3.5" />
+                  ) : (
+                    <Maximize2 className="w-3.5 h-3.5" />
+                  )}
+                </button>
+
+                <div
+                  className={`relative flex ${isTerminalMode ? "items-start" : ""}`}
+                >
+                  {isTerminalMode && (
+                    <span className="shrink-0 pl-4 pt-2 text-sm leading-7 font-mono text-[var(--color-text-muted)] select-none">
+                      $&nbsp;
+                    </span>
+                  )}
+                  <div className="relative flex-1">
+                    {!hasContent && !isInputFocused && (
+                      <div
+                        className={`pointer-events-none absolute top-2 text-sm leading-7 text-[var(--color-text-muted)] select-none ${
+                          isTerminalMode ? "left-0 right-4" : "left-4 right-4"
+                        }`}
+                      >
+                        {activePermissionMessage
+                          ? "Handle permission above to continue"
+                          : !isConnected
+                            ? "Waiting for connection..."
+                            : isTerminalMode
+                              ? "Enter shell command\u2026"
+                              : isBusy
+                                ? "Queue a message\u2026"
+                                : "Ask anything… use @ for mentions, / for commands"}
+                      </div>
+                    )}
+                    <div
+                      ref={editableRef}
+                      contentEditable={
+                        isConnected &&
+                        !isRemoteSession &&
+                        !activePermissionMessage
+                      }
+                      suppressContentEditableWarning
+                      onInput={handleInput}
+                      onKeyDown={handleKeyDown}
+                      onMouseDown={handleEditableMouseDown}
+                      onFocus={() => setIsInputFocused(true)}
+                      onBlur={() => setIsInputFocused(false)}
+                      onPaste={handlePaste}
+                      onCompositionStart={() => {
+                        composingRef.current = true;
+                      }}
+                      onCompositionEnd={() => {
+                        composingRef.current = false;
+                        handleInput();
+                      }}
+                      className={`overflow-y-auto py-2 text-sm leading-6 text-[var(--color-text)] focus:outline-none flex-1 ${
+                        isTerminalMode ? "pr-4" : "px-4"
+                      } ${
+                        isInputExpanded
+                          ? "min-h-[32vh] max-h-[56vh]"
+                          : "min-h-[56px] max-h-32"
+                      } ${!isConnected || isRemoteSession || activePermissionMessage ? "opacity-50 cursor-not-allowed" : ""} ${
+                        isTerminalMode ? "font-mono" : ""
+                      }`}
+                      style={{
+                        overflowWrap: "anywhere",
+                        whiteSpace: "pre-wrap",
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div className="chatbox-footer mt-2 flex items-center justify-between gap-2 select-none">
+                  <div className="chatbox-footer-left flex items-center gap-2 min-w-0 select-none">
+                    {!activePermissionMessage &&
+                      (promptCaps.image || promptCaps.audio) && (
+                        <button
+                          onClick={() => fileInputRef.current?.click()}
+                          className="h-9 w-9 flex items-center justify-center rounded-xl bg-[var(--color-bg)] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors shrink-0"
+                          title="Attach file"
+                        >
+                          <Paperclip className="w-4 h-4" />
+                        </button>
+                      )}
+                    <span className="truncate text-[10px] text-[var(--color-text-muted)]">
+                      {activePermissionMessage
+                        ? "Permission required"
+                        : !isConnected
+                          ? "Offline"
+                          : isBusy
+                            ? hasContent
+                              ? "Ready to queue"
+                              : pendingMessages.length > 0
+                                ? `${pendingMessages.length} queued`
+                                : "Agent running"
+                            : isInputExpanded
+                              ? "\u2318\u21A9 send \u00b7 \u21A9 newline"
+                              : "Enter send"}
+                    </span>
+                  </div>
+                  <div className="chatbox-footer-right flex items-center gap-2 shrink-0 select-none">
+                    {!isTerminalLaunchMode && !composerNarrow && modelOptions.length > 0 && (
+                      <DropdownSelect
+                        ref={modelMenuRef}
+                        label="Model"
+                        options={modelOptions}
+                        value={selectedModel}
+                        open={showModelMenu}
+                        onToggle={() => {
+                          setShowModelMenu(!showModelMenu);
+                          setShowPermMenu(false);
+                          setShowThoughtLevelMenu(false);
+                        }}
+                        onSelect={(v) => {
+                          // Local-only: model now travels with the next prompt's config bundle.
+                          setSelectedModel(v);
+                          setShowModelMenu(false);
+                        }}
+                      />
+                    )}
+                    {!isTerminalLaunchMode && !composerNarrow && modeOptions.length > 0 && (
+                      <DropdownSelect
+                        ref={permMenuRef}
+                        label="Mode"
+                        options={modeOptions}
+                        value={permissionLevel}
+                        open={showPermMenu}
+                        onToggle={() => {
+                          setShowPermMenu(!showPermMenu);
+                          setShowModelMenu(false);
+                          setShowThoughtLevelMenu(false);
+                        }}
+                        onSelect={(v) => {
+                          // Local-only: mode now travels with the next prompt's config bundle.
+                          setPermissionLevel(v);
+                          setShowPermMenu(false);
+                        }}
+                      />
+                    )}
+                    {!isTerminalLaunchMode && !composerHideThinking && thoughtLevelOptions.length > 0 && thoughtLevelConfigId && (
+                      <DropdownSelect
+                        ref={thoughtLevelMenuRef}
+                        label="Thinking"
+                        options={thoughtLevelOptions}
+                        value={thoughtLevel}
+                        open={showThoughtLevelMenu}
+                        onToggle={() => {
+                          setShowThoughtLevelMenu(!showThoughtLevelMenu);
+                          setShowModelMenu(false);
+                          setShowPermMenu(false);
+                        }}
+                        onSelect={(v) => {
+                          // Local-only: thought_level now travels with the next prompt's config bundle.
+                          setThoughtLevel(v);
+                          setShowThoughtLevelMenu(false);
+                        }}
+                      />
+                    )}
+                    {activePermissionMessage && isBusy ? (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        className="h-9 w-9 !p-0 rounded-xl"
+                        onClick={handleStopAgent}
+                        disabled={isCancelling}
+                      >
+                        {isCancelling ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />}
+                      </Button>
+                    ) : !activePermissionMessage && !isBusy && hasContent ? (
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        className="h-9 w-9 !p-0 rounded-xl shadow-sm"
+                        onClick={handleSend}
+                        disabled={!isConnected}
+                      >
+                        <Send className="w-3.5 h-3.5" />
+                      </Button>
+                    ) : !activePermissionMessage && isBusy && hasContent ? (
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        className="h-9 w-9 !p-0 rounded-xl shadow-sm"
+                        onClick={handleSend}
+                      >
+                        <ListPlus className="w-3.5 h-3.5" />
+                      </Button>
+                    ) : !activePermissionMessage && isBusy && !hasContent ? (
+                      pendingMessages.length > 0 ? (
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          className="h-9 w-9 !p-0 rounded-xl"
+                          onClick={handleSendNow}
+                          disabled={isCancelling}
+                        >
+                          {isCancelling ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                        </Button>
+                      ) : (
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          className="h-9 w-9 !p-0 rounded-xl"
+                          onClick={handleStopAgent}
+                          disabled={isCancelling}
+                        >
+                          {isCancelling ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />}
+                        </Button>
+                      )
+                    ) : (
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        className="h-9 w-9 !p-0 rounded-xl shadow-sm"
+                        disabled
+                      >
+                        <Send className="w-3.5 h-3.5" />
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      {/* Image / SVG Lightbox */}
+      <ImageLightbox
+        imageUrl={lightboxUrl}
+        svgContent={lightboxSvg}
+        onClose={() => { setLightboxUrl(null); setLightboxSvg(null); }}
+      />
+      {showAgentPicker &&
+        agentPickerAnchor &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            ref={agentPickerMenuRef}
+            style={{
+              position: "fixed",
+              top: agentPickerAnchor.top,
+              left: agentPickerAnchor.left,
+              zIndex: 1000,
+            }}
+            className="min-w-48 max-h-64 overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg py-1"
+          >
+            {!acpAvailabilityLoaded ? (
+              <div className="flex items-center gap-2 px-3 py-2 text-sm text-[var(--color-text-muted)]">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" /> Checking...
+              </div>
+            ) : (
+              <AgentPickerMenuItems
+                displayOptions={acpAgentOptions.filter((opt) => !opt.disabled)}
+                customAgents={customAgents}
+                customAgentPersonas={customAgentPersonas}
+                triggerSize="compact"
+                onSelectBuiltin={(opt) => handleNewChatWithAgent(opt.value)}
+                onSelectId={(id) => handleNewChatWithAgent(id)}
+              />
+            )}
+          </div>,
+          document.body,
+        )}
+    </motion.div>
+  );
+}
+
+// ─── Sub-components ──────────────────────────────────────────────────────────
+
+/** Reusable dropdown selector for bottom toolbar */
+const DropdownSelect = ({
+  ref,
+  label,
+  options,
+  value,
+  open,
+  onToggle,
+  onSelect,
+}: {
+  ref: React.RefObject<HTMLDivElement | null>;
+  label: string;
+  options: { label: string; value: string }[];
+  value: string;
+  open: boolean;
+  onToggle: () => void;
+  onSelect: (value: string) => void;
+}) => {
+  const [searchQuery, setSearchQuery] = useState("");
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const enableSearch = options.length > 5;
+
+  useEffect(() => {
+    if (open && enableSearch) {
+      requestAnimationFrame(() => {
+        searchInputRef.current?.focus();
+      });
+    }
+  }, [open, enableSearch]);
+
+  useEffect(() => {
+    if (open) return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setSearchQuery("");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  const filteredOptions = useMemo(() => {
+    if (!searchQuery || !enableSearch) return options;
+    const q = searchQuery.toLowerCase();
+    return options.filter((o) => o.label.toLowerCase().includes(q));
+  }, [options, searchQuery, enableSearch]);
+
+  const handleSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Escape") {
+      if (searchQuery) {
+        setSearchQuery("");
+      } else {
+        onToggle();
+      }
+      e.stopPropagation();
+    }
+  };
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        onClick={onToggle}
+        className="inline-flex h-7 items-center gap-1 rounded-full bg-[var(--color-bg)] px-2.5 text-[11px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+      >
+        <span className="chatbox-dropdown-label opacity-70">{label}</span>
+        <span className="max-w-40 truncate text-[var(--color-text)]">
+          {options.find((o) => o.value === value)?.label ?? "Default"}
+        </span>
+        <ChevronDown className="w-3 h-3 opacity-70" />
+      </button>
+      {open && (
+        <div className="absolute bottom-full right-0 mb-1 min-w-44 max-h-64 flex flex-col rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg py-1 z-50">
+          {enableSearch && (
+            <div className="px-2 pt-1.5 pb-1 border-b border-[var(--color-border)] flex-shrink-0">
+              <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-[var(--color-bg-secondary)]">
+                <Search className="w-3 h-3 text-[var(--color-text-muted)] flex-shrink-0" />
+                <input
+                  ref={searchInputRef}
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyDown={handleSearchKeyDown}
+                  placeholder="Search..."
+                  className="flex-1 bg-transparent text-xs text-[var(--color-text)] placeholder-[var(--color-text-muted)] outline-none min-w-0"
+                />
+              </div>
+            </div>
+          )}
+          <div className="overflow-y-auto flex-1">
+          {filteredOptions.map((opt) => (
+            <button
+              key={opt.value}
+              onClick={() => onSelect(opt.value)}
+              className={`w-full text-left px-3 py-1.5 text-sm flex items-center justify-between hover:bg-[var(--color-bg-tertiary)] transition-colors ${
+                value === opt.value
+                  ? "text-[var(--color-text)]"
+                  : "text-[var(--color-text-muted)]"
+              }`}
+            >
+              <span>{opt.label}</span>
+              {value === opt.value && (
+                <span className="text-[var(--color-highlight)]">✓</span>
+              )}
+            </button>
+          ))}
+          {enableSearch && filteredOptions.length === 0 && (
+            <div className="px-3 py-2 text-xs text-[var(--color-text-muted)] text-center">
+              No matches
+            </div>
+          )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+/**
+ * Render a user-message body, replacing every `<grove-meta>` envelope with the
+ * type's pretty React renderer (mention pill / inject badge / future kinds).
+ * Plain text segments keep `whitespace-pre-wrap` so user formatting survives.
+ *
+ * Inline vs block layout is decided per envelope type — pills stay inline;
+ * block meta renders in sequence, with pure whitespace separators suppressed.
+ */
+function UserMessageBody({ content }: { content: string }) {
+  const segments = parseGroveMetaSegments(content);
+  if (segments.length === 0) {
+    return <div className="whitespace-pre-wrap break-words">{content}</div>;
+  }
+  const nodes: React.ReactNode[] = [];
+  let inlineBody: React.ReactNode[] = [];
+
+  const flushInline = (key: string) => {
+    if (inlineBody.length === 0) return;
+    nodes.push(
+      <div key={key} className="whitespace-pre-wrap break-words">
+        {inlineBody}
+      </div>,
+    );
+    inlineBody = [];
+  };
+
+  segments.forEach((seg, i) => {
+    if (seg.kind === "text") {
+      if (!seg.content) return;
+      if (seg.content.trim() === "") return;
+      // Strip leading newlines when this text segment immediately follows a
+      // meta envelope. Source from agent_graph CLI/MCP often has `\n\n` after
+      // `</grove-meta>` for raw-string readability, but pre-wrap renders
+      // those as visible blank lines above the body text.
+      const prev = segments[i - 1];
+      const text =
+        prev && prev.kind === "meta" ? seg.content.replace(/^\n+/, "") : seg.content;
+      if (!text) return;
+      inlineBody.push(<span key={`t-${i}`}>{text}</span>);
+      return;
+    }
+    const isBlockMeta =
+      seg.envelope.type.startsWith("agent_inject_") ||
+      seg.envelope.type === "preview_comment";
+    const node = renderGroveMetaEnvelope(seg.envelope, {
+      layout: isBlockMeta ? "block" : "inline",
+    });
+    if (isBlockMeta) {
+      flushInline(`inline-before-${i}`);
+      nodes.push(<div key={`b-${i}`}>{node}</div>);
+    } else {
+      inlineBody.push(<span key={`m-${i}`}>{node}</span>);
+    }
+  });
+  flushInline("inline-tail");
+
+  return <>{nodes}</>;
+}
+
+/** Individual message rendering */
+const MessageItem = memo(function MessageItem({
+  message,
+  index,
+  isBusy,
+  agentLabel,
+  projectId,
+  taskId,
+  isStudio,
+  onToggleThinkingCollapse,
+  onPermissionResponse,
+  onFileClick,
+  onImageClick,
+  onMermaidClick,
+  onD2Click,
+  onInsertReference,
+  resolveSender,
+}: {
+  message: ChatMessage;
+  index: number;
+  isBusy: boolean;
+  agentLabel?: string;
+  projectId: string;
+  taskId: string;
+  isStudio: boolean;
+  onToggleThinkingCollapse: (index: number) => void;
+  onPermissionResponse?: (optionId: string, requestId: string) => void;
+  onFileClick?: (filePath: string, line?: number) => Promise<boolean>;
+  onImageClick?: (url: string) => void;
+  onMermaidClick?: (svg: string) => void;
+  onD2Click?: (svg: string) => void;
+  onInsertReference?: (label: string) => void;
+  resolveSender?: (sender?: string) => {
+    label: string;
+    Icon: React.ComponentType<{ size?: number; className?: string }>;
+  };
+}) {
+  const sketchContext = isStudio ? { projectId, taskId } : undefined;
+  // Typewriter reveal for streaming assistant/thinking text. Hook must
+  // be called unconditionally; for other message types (or any
+  // non-busy chat — i.e. history loads) we feed instant=true so it's
+  // effectively a no-op and the full content shows immediately.
+  const isTextStream =
+    message.type === "assistant" || message.type === "thinking";
+  const streamRaw = isTextStream ? message.content : "";
+  const streamInstant =
+    !isTextStream || message.complete || !isBusy;
+  const streamDisplay = useTypewriter(streamRaw, streamInstant);
+  const resolveImageUrl = useCallback((src: string) => {
+    if (/^https?:\/\//.test(src) || src.startsWith("data:")) return src;
+    // Strip `file://` so the backend gets a plain absolute path.
+    const stripped = src.startsWith("file://") ? src.slice("file://".length) : src;
+    // Markdown sources arrive already percent-encoded (e.g. `%20` for
+    // spaces). Decode first so we don't double-encode when re-encoding
+    // for the query string. decodeURIComponent throws on malformed
+    // sequences — fall back to the raw src in that case.
+    let decoded = stripped;
+    try {
+      decoded = decodeURIComponent(stripped);
+    } catch {
+      // keep stripped as-is
+    }
+    return `/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(decoded)}`;
+  }, [projectId, taskId]);
+
+  switch (message.type) {
+    case "user":
+      if (message.terminal) {
+        // Simple highlight: first token = command (accent), rest = args (normal)
+        const parts = message.content.match(/^(\S+)([\s\S]*)$/);
+        const cmd = parts ? parts[1] : message.content;
+        const args = parts ? parts[2] : "";
+        return (
+          <div className="flex justify-end">
+            <div className="max-w-[85%] min-w-0">
+              <div className="rounded-xl px-3.5 py-2 bg-[var(--color-bg-tertiary)] border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] shadow-[0_10px_30px_rgba(0,0,0,0.08)]">
+                <code className="text-[13px] font-mono whitespace-pre-wrap">
+                  <span className="text-[var(--color-text-muted)] select-none">
+                    ${" "}
+                  </span>
+                  <span className="text-[var(--color-accent)] font-semibold">
+                    {cmd}
+                  </span>
+                  <span className="text-[var(--color-text)]">{args}</span>
+                </code>
+              </div>
+            </div>
+          </div>
+        );
+      }
+      return (
+        <div className="flex justify-end">
+          <div className="max-w-[80%] min-w-0">
+            {message.sender && (() => {
+              const resolved = resolveSender?.(message.sender) ?? {
+                label: message.sender,
+                Icon: Bot,
+              };
+              const SenderIcon = resolved.Icon;
+              return (
+                <div
+                  className="text-[10px] text-[var(--color-text-muted)] text-right mb-0.5 px-1 flex items-center justify-end gap-1"
+                  title={message.sender}
+                >
+                  <SenderIcon size={10} className="shrink-0" />
+                  <span className="truncate max-w-[200px]">{resolved.label}</span>
+                </div>
+              );
+            })()}
+            <div className="rounded-2xl px-3.5 py-2.5 bg-[color-mix(in_srgb,var(--color-bg-tertiary)_78%,transparent)] border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] text-sm text-[var(--color-text)] shadow-[0_10px_30px_rgba(0,0,0,0.08)]">
+              {message.attachments?.map((att, i) =>
+                att.type === "image" && att.previewUrl ? (
+                  <div key={i} className="group/img relative mb-2 inline-block max-w-full">
+                    <img
+                      src={att.previewUrl}
+                      className="max-w-full max-h-48 rounded cursor-pointer hover:opacity-90 transition-opacity"
+                      onClick={() => onImageClick?.(att.previewUrl!)}
+                      alt={att.label}
+                    />
+                    {att.label && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onInsertReference?.(att.label);
+                        }}
+                        className="absolute left-1.5 top-1.5 flex items-center gap-1 rounded-md bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white opacity-0 backdrop-blur-sm transition-opacity group-hover/img:opacity-100 hover:!bg-[var(--color-highlight)] hover:!text-white cursor-pointer select-none"
+                        title={`Insert reference to ${att.label}`}
+                      >
+                        {att.label}
+                      </button>
+                    )}
+                  </div>
+                ) : att.type === "audio" ? (
+                  <div key={i} className="group/aud relative mb-2 max-w-full">
+                    <audio
+                      controls
+                      src={`data:${att.mimeType};base64,${att.data}`}
+                      className="max-w-full"
+                    />
+                    {att.label && (
+                      <button
+                        type="button"
+                        onClick={() => onInsertReference?.(att.label)}
+                        className="absolute left-1.5 top-1.5 flex items-center gap-1 rounded-md bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white opacity-0 backdrop-blur-sm transition-opacity group-hover/aud:opacity-100 hover:!bg-[var(--color-highlight)] hover:!text-white cursor-pointer select-none"
+                        title={`Insert reference to ${att.label}`}
+                      >
+                        {att.label}
+                      </button>
+                    )}
+                  </div>
+                ) : att.type === "resource" ? (
+                  <div key={i} className="group/res relative mb-2">
+                    <button
+                      type="button"
+                      onClick={() => att.uri && openExternalUrl(att.uri)}
+                      className="flex w-full max-w-[320px] items-center gap-2 rounded-xl border border-[color-mix(in_srgb,var(--color-border)_70%,transparent)] bg-[color-mix(in_srgb,var(--color-bg)_72%,transparent)] px-3 py-2 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--color-bg)_88%,transparent)]"
+                      title={att.uri ?? att.name}
+                    >
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[var(--color-bg-secondary)]">
+                        <Paperclip className="h-4 w-4 text-[var(--color-text-muted)]" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="truncate text-xs font-medium text-[var(--color-text)]">
+                          {att.label || att.name}
+                        </div>
+                        {att.name !== att.label && (
+                          <div className="text-[10px] text-[var(--color-text-muted)]">
+                            {att.name}{typeof att.size === "number"
+                              ? ` • ${Math.max(1, Math.round(att.size / 1024))} KB`
+                              : ""}
+                          </div>
+                        )}
+                      </div>
+                    </button>
+                    {att.label && (
+                      <button
+                        type="button"
+                        onClick={() => onInsertReference?.(att.label)}
+                        className="absolute left-1.5 top-1.5 flex items-center gap-1 rounded-md bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white opacity-0 backdrop-blur-sm transition-opacity group-hover/res:opacity-100 hover:!bg-[var(--color-highlight)] hover:!text-white cursor-pointer select-none"
+                        title={`Insert reference to ${att.label}`}
+                      >
+                        {att.label}
+                      </button>
+                    )}
+                  </div>
+                ) : null,
+              )}
+              {message.content && (
+                <UserMessageBody content={message.content} />
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    case "assistant": {
+      // Use the typewriter-revealed text while streaming; once complete
+      // the hook returns the full content immediately.
+      const shown = message.complete ? message.content : streamDisplay;
+      // Skip empty/whitespace-only assistant messages
+      if (!shown.trim()) return null;
+      return (
+        <div className="flex justify-start">
+          <div className="max-w-[82%] min-w-0 text-sm text-[var(--color-text)]">
+            <MarkdownRenderer
+              content={shown}
+              onFileClick={onFileClick}
+              resolveImageUrl={resolveImageUrl}
+              onMermaidClick={onMermaidClick}
+              onD2Click={onD2Click}
+              onImageClick={onImageClick}
+              enableRunCommand
+              sketchContext={sketchContext}
+            />
+            {!message.complete && isBusy && (
+              <span className="inline-block w-1.5 h-4 ml-0.5 bg-[var(--color-text-muted)] animate-pulse rounded-sm" />
+            )}
+            {message.complete && message.usage && (
+              <TurnUsageMeta
+                inputTokens={message.usage.inputTokens}
+                outputTokens={message.usage.outputTokens}
+                cachedReadTokens={message.usage.cachedReadTokens}
+                startTs={message.startTs}
+                endTs={message.endTs}
+              />
+            )}
+          </div>
+        </div>
+      );
+    }
+    case "thinking":
+      return (
+        <div className="flex justify-start" data-grove-search-skip="true">
+          <div className="max-w-[82%] w-full">
+            <button
+              onClick={() => onToggleThinkingCollapse(index)}
+              className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors mb-1"
+            >
+              <Brain className="w-3 h-3" />
+              {message.collapsed ? (
+                <ChevronRight className="w-3 h-3" />
+              ) : (
+                <ChevronDown className="w-3 h-3" />
+              )}
+              <span className="italic">
+                {message.complete ? "Thought" : "Thinking"}
+              </span>
+            </button>
+            {!message.collapsed && (
+              <div className="ml-5 rounded-lg px-3 py-2 bg-[var(--color-bg-tertiary)] text-xs text-[var(--color-text-muted)] italic whitespace-pre-wrap max-h-40 overflow-y-auto">
+                {message.complete ? message.content : streamDisplay}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    case "permission":
+      return message.resolved ? (
+        <PermissionCard message={message} onRespond={onPermissionResponse} />
+      ) : null;
+    case "tool":
+      // Tools are rendered via ToolSectionView; skip here
+      return null;
+    case "ask_form":
+      // Rendered in the composer panel (chip + expandable panel above the
+      // input), not inline in the message stream.
+      return null;
+    case "system": {
+      const displayContent =
+        message.content === "$$CONNECTED$$"
+          ? `Connected to ${agentLabel || "Agent"}`
+          : message.content;
+      return (
+        <div className="text-center text-xs text-[var(--color-text-muted)] py-1">
+          {displayContent}
+        </div>
+      );
+    }
+    case "auth_required":
+      // buildRenderItems 已过滤,不会走到这里。万一漏过返回 null 而非占位。
+      return null;
+    case "terminal_output": {
+      const hasExited = message.exitCode !== undefined;
+      const isError = hasExited && message.exitCode !== 0;
+      const output = message.chunks.join("");
+      return (
+        <div className="flex justify-start">
+          <div className="max-w-[90%] w-full">
+            <div
+              className={`rounded-xl border overflow-hidden ${
+                isError
+                  ? "border-[color-mix(in_srgb,var(--color-error)_40%,transparent)]"
+                  : "border-[color-mix(in_srgb,var(--color-border)_72%,transparent)]"
+              } bg-[var(--color-bg-secondary)]`}
+            >
+              {output && (
+                <pre className="px-3 py-2 text-[12px] font-mono text-[var(--color-text-secondary)] whitespace-pre-wrap overflow-x-auto max-h-[300px] overflow-y-auto">
+                  {output}
+                </pre>
+              )}
+              {hasExited && (
+                <div
+                  className={`flex items-center gap-1.5 px-3 py-1 text-[10px] font-medium border-t ${
+                    isError
+                      ? "border-[color-mix(in_srgb,var(--color-error)_30%,transparent)] text-[var(--color-error)] bg-[color-mix(in_srgb,var(--color-error)_8%,transparent)]"
+                      : "border-[color-mix(in_srgb,var(--color-border)_50%,transparent)] text-[var(--color-text-muted)] bg-[var(--color-bg-tertiary)]"
+                  }`}
+                >
+                  <Terminal className="w-3 h-3" />
+                  exit {message.exitCode}
+                </div>
+              )}
+              {!hasExited && (
+                <div className="flex items-center gap-1.5 px-3 py-1 text-[10px] text-[var(--color-text-muted)] border-t border-[color-mix(in_srgb,var(--color-border)_50%,transparent)] bg-[var(--color-bg-tertiary)]">
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--color-warning)] animate-pulse" />
+                  running...
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+  }
+});
+
+/** Permission request card with action buttons */
+/** AuthRequired panel — 渲染在 composerPanel 区域(对齐 PermissionRequest)。
+ * 暗色 tertiary 背景、warning 左强调条、标题 + 描述 + ghost 风格选项按钮。
+ * in_progress / succeeded 期间整组按钮 disable;每个 method 单独一行,
+ * 含可选 description 二行注释。 */
+function AuthRequiredPanel({
+  message,
+  index,
+  agentLabel,
+  onAuthLogin,
+  onDismiss,
+}: {
+  message: Extract<ChatMessage, { type: "auth_required" }>;
+  index: number;
+  agentLabel?: string;
+  onAuthLogin?: (index: number, methodId: string) => void;
+  onDismiss?: (index: number) => void;
+}) {
+  const agentDisplay = message.agentName || agentLabel || "Agent";
+  const hasMethods = message.methods.length > 0;
+  const activeMethod = message.activeMethodId
+    ? message.methods.find((m) => m.id === message.activeMethodId)
+    : undefined;
+  let title: string;
+  let description: string;
+  if (message.status === "succeeded") {
+    title = "Login successful";
+    description = "Retrying your request...";
+  } else if (message.status === "in_progress") {
+    title = "Authenticating";
+    description = activeMethod
+      ? `Complete the ${activeMethod.name} flow in the browser. The session will resume automatically once finished.`
+      : "Waiting for the agent to confirm authentication...";
+  } else if (message.status === "failed") {
+    title = "Login failed";
+    description =
+      message.errorMessage ?? "Please choose an option below to try again.";
+  } else if (!hasMethods) {
+    title = "Authentication required";
+    description = `${agentDisplay} did not advertise any login method. Run the agent's CLI login in a terminal, then send your message again.`;
+  } else {
+    title = "Authentication required";
+    description = `${agentDisplay} needs you to sign in before continuing. Pick a login method below.`;
+  }
+  const buttonsDisabled =
+    message.status === "in_progress" || message.status === "succeeded";
+
+  return (
+    <div className="space-y-3 relative pr-6">
+      <button
+        type="button"
+        onClick={() => onDismiss?.(index)}
+        className="absolute top-0 right-0 rounded-md p-1 text-[var(--color-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-text)_10%,transparent)] hover:text-[var(--color-text)]"
+        title="Dismiss"
+      >
+        <X className="h-3.5 w-3.5" />
+      </button>
+      <div className="flex items-start gap-2">
+        <AlertTriangle className="h-4 w-4 shrink-0 text-[var(--color-warning)] mt-0.5" />
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium text-[var(--color-text)]">
+            {title}
+          </div>
+          <p className="mt-0.5 text-xs text-[var(--color-text-muted)] break-words leading-relaxed">
+            {description}
+          </p>
+        </div>
+      </div>
+      {hasMethods && (
+        <div className="space-y-2">
+          {message.methods.map((method) => {
+            const isActive = method.id === message.activeMethodId;
+            const showSpinner = isActive && message.status === "in_progress";
+            const showCheck = isActive && message.status === "succeeded";
+            return (
+              <button
+                key={method.id}
+                type="button"
+                disabled={buttonsDisabled}
+                onClick={() => onAuthLogin?.(index, method.id)}
+                className="flex w-full items-center justify-between rounded-xl border border-[color-mix(in_srgb,var(--color-warning)_18%,transparent)] bg-[color-mix(in_srgb,var(--color-warning)_7%,transparent)] px-3 py-2.5 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--color-warning)_12%,transparent)] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-[color-mix(in_srgb,var(--color-warning)_7%,transparent)]"
+              >
+                <span className="flex-1 min-w-0 pr-2">
+                  <span className="block text-sm font-medium text-[var(--color-text)]">
+                    {method.name}
+                  </span>
+                  {method.description && (
+                    <span className="mt-0.5 block text-[11px] text-[var(--color-text-muted)] leading-snug">
+                      {method.description}
+                    </span>
+                  )}
+                </span>
+                {showCheck ? (
+                  <ShieldCheck className="h-4 w-4 shrink-0 text-[var(--color-success)]" />
+                ) : showSpinner ? (
+                  <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[var(--color-warning)]" />
+                ) : (
+                  <ChevronRight className="h-4 w-4 shrink-0 text-[var(--color-warning)]" />
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PermissionCard({
+  message,
+  onRespond,
+}: {
+  message: PermissionMessage;
+  onRespond?: (optionId: string, requestId: string) => void;
+}) {
+  const isResolved = !!message.resolved;
+  const isCancelled =
+    isResolved && message.resolved!.toLowerCase() === "cancelled";
+  const isAllowed =
+    isResolved &&
+    (message.resolved!.toLowerCase().includes("allow") ||
+      message.resolved!.toLowerCase().includes("yes"));
+
+  if (isResolved) {
+    return (
+      <div
+        className={`flex items-start gap-2 py-1.5 px-3 rounded-lg text-xs border min-w-0 ${
+          isCancelled
+            ? "bg-[color-mix(in_srgb,var(--color-warning)_8%,transparent)] border-[color-mix(in_srgb,var(--color-warning)_24%,transparent)]"
+            : "bg-[var(--color-bg-tertiary)] border-[var(--color-border)]"
+        }`}
+      >
+        {isCancelled ? (
+          <AlertTriangle className="w-3.5 h-3.5 text-[var(--color-warning)] shrink-0 mt-0.5" />
+        ) : isAllowed ? (
+          <ShieldCheck className="w-3.5 h-3.5 text-[var(--color-success)] shrink-0 mt-0.5" />
+        ) : (
+          <ShieldX className="w-3.5 h-3.5 text-[var(--color-error)] shrink-0 mt-0.5" />
+        )}
+        <span
+          className={`flex-1 min-w-0 break-all ${
+            isCancelled
+              ? "text-[color-mix(in_srgb,var(--color-warning)_92%,white_6%)]"
+              : "text-[var(--color-text-muted)]"
+          }`}
+        >
+          {message.description}
+        </span>
+        <span
+          className={`text-[10px] text-right break-all max-w-[40%] ${isCancelled ? "text-[var(--color-warning)]" : "text-[var(--color-text-muted)] opacity-70"}`}
+        >
+          {message.resolved}
+        </span>
+      </div>
+    );
+  }
+
+  const allowOptions = message.options.filter((o) =>
+    o.kind.startsWith("allow"),
+  );
+  const rejectOptions = message.options.filter((o) =>
+    o.kind.startsWith("reject"),
+  );
+
+  return (
+    <div
+      className="rounded-lg border-l-3 border border-[var(--color-border)] bg-[var(--color-bg-tertiary)] overflow-hidden"
+      style={{ borderLeftColor: "var(--color-warning)", borderLeftWidth: 3 }}
+    >
+      <div className="px-3 py-2.5">
+        <div className="flex items-center gap-2 mb-2">
+          <ShieldCheck className="w-4 h-4 text-[var(--color-warning)] shrink-0" />
+          <span className="text-sm text-[var(--color-text)]">
+            Permission Required
+          </span>
+        </div>
+        <p className="text-xs text-[var(--color-text-muted)] mb-3 ml-6 break-words">
+          {message.description}
+        </p>
+        <div className="flex items-center gap-2 ml-6 flex-wrap">
+          {allowOptions.map((opt) => (
+            <button
+              key={opt.option_id}
+              onClick={() => onRespond?.(opt.option_id, message.id)}
+              className="px-3 py-1 rounded-md text-xs font-medium transition-colors bg-[var(--color-success)] text-white hover:opacity-80"
+              style={{
+                backgroundColor:
+                  "color-mix(in srgb, var(--color-success) 85%, white)",
+              }}
+            >
+              {opt.name}
+            </button>
+          ))}
+          {rejectOptions.map((opt) => (
+            <button
+              key={opt.option_id}
+              onClick={() => onRespond?.(opt.option_id, message.id)}
+              className="px-3 py-1 rounded-md text-xs font-medium transition-colors border border-[var(--color-border)] text-[var(--color-text-muted)] hover:bg-[var(--color-bg)] hover:text-[var(--color-error)]"
+            >
+              {opt.name}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function normalizeToolVerb(title: string): string {
+  const lower = title.toLowerCase();
+  if (lower.startsWith("read")) return "read";
+  if (lower.startsWith("edit") || lower.startsWith("write")) return "edit";
+  if (
+    lower.startsWith("run") ||
+    lower === "terminal" ||
+    lower === "exec_command" ||
+    lower === "write_stdin"
+  )
+    return "run";
+  if (
+    lower.startsWith("search") ||
+    lower === "grep" ||
+    lower.startsWith("find") ||
+    lower === "glob" ||
+    lower === "toolsearch"
+  )
+    return "search";
+  if (lower.startsWith("list") || lower.startsWith("ls")) return "list";
+  if (lower.startsWith("task") || lower.startsWith("update_plan"))
+    return "plan";
+  if (lower.includes("permission")) return "permission";
+  return "other";
+}
+
+function isEditTool(message: ToolMessage): boolean {
+  return normalizeToolVerb(message.title) === "edit";
+}
+
+/**
+ * Finer-grained kind specifically for Action chip rendering.
+ * Determines the icon + label-extraction strategy per tool.
+ */
+type ActionKind =
+  | "bash"
+  | "bash_output"
+  | "skill"
+  | "todo"
+  | "mcp"
+  | "permission"
+  | "generic";
+
+function classifyActionKind(title: string): ActionKind {
+  const lower = title.toLowerCase().trim();
+  // 注：不匹配 "terminal"（会被 isBackgroundAction 先剔掉，走不到这里）。
+  if (lower === "bash" || lower.startsWith("run ")) return "bash";
+  if (lower === "bash_output") return "bash_output";
+  if (lower === "skill" || lower === "skill_use") return "skill";
+  if (
+    lower === "todo_write" ||
+    lower === "todowrite" ||
+    lower === "update_plan"
+  )
+    return "todo";
+  if (lower.startsWith("mcp__") || lower.startsWith("mcp_")) return "mcp";
+  if (lower.includes("permission")) return "permission";
+  return "generic";
+}
+
+/**
+ * Extract a short, informative label for a non-Edit action chip.
+ * Falls back to tool title when nothing better is derivable.
+ */
+function extractActionChipLabel(
+  message: ToolMessage,
+  kind: ActionKind,
+): string {
+  const content = message.content ?? "";
+  const locations = message.locations ?? [];
+  const firstLoc = locations[0];
+
+  const firstNonEmptyLine = (text: string): string => {
+    for (const raw of text.split("\n")) {
+      const line = raw.trim();
+      if (line) return line;
+    }
+    return "";
+  };
+
+  switch (kind) {
+    case "bash":
+    case "bash_output": {
+      // Content typically starts with the command or its output.
+      // If it looks like a shell command (starts with a letter and no obvious
+      // error/usage prefix), surface its first line. Otherwise fall back to
+      // the tool title so we at least say "bash".
+      const first = firstNonEmptyLine(content);
+      if (!first) return extractRawActionLabel(message);
+      // Heuristic: if first line starts with a known error/usage marker, it's
+      // output not the command — fall back to title so we don't mislabel.
+      if (/^(error|usage|traceback|panic|command not found)/i.test(first)) {
+        return extractRawActionLabel(message);
+      }
+      return first;
+    }
+    case "skill": {
+      // Skill content usually opens with either YAML frontmatter
+      // (--- name: xxx ---) or a JSON-ish `"name": "..."` snippet.
+      const fm = /^---\s*[\s\S]*?\bname:\s*([^\n]+)/.exec(content);
+      if (fm) return `skill · ${fm[1].trim().replace(/["']/g, "")}`;
+      const json = /"name"\s*:\s*"([^"]+)"/.exec(content);
+      if (json) return `skill · ${json[1]}`;
+      const firstHeading = /^#\s+(.+)$/m.exec(content);
+      if (firstHeading) return `skill · ${firstHeading[1]}`;
+      return "skill";
+    }
+    case "todo": {
+      // Content is usually JSON with a todos array; extract counts.
+      try {
+        const parsed = JSON.parse(content);
+        const todos = Array.isArray(parsed)
+          ? parsed
+          : Array.isArray(parsed?.todos)
+            ? parsed.todos
+            : Array.isArray(parsed?.entries)
+              ? parsed.entries
+              : null;
+        if (todos && todos.length > 0) {
+          const inProgress = todos.find(
+            (t: { status?: string }) => t?.status === "in_progress",
+          );
+          const active = inProgress?.content ?? inProgress?.title ?? null;
+          return active
+            ? `${todos.length} todos · ${String(active).slice(0, 40)}`
+            : `${todos.length} todos`;
+        }
+      } catch {
+        /* fall through */
+      }
+      return extractRawActionLabel(message);
+    }
+    case "mcp": {
+      // Title like "mcp__grove__grove_list_projects" → "grove · list_projects"
+      const t = message.title;
+      const parts = t.split("__").filter(Boolean);
+      if (parts.length >= 3 && parts[0].toLowerCase() === "mcp") {
+        const server = parts[1];
+        const fn = parts.slice(2).join("_");
+        // Strip redundant `<server>_` prefix if backend double-namespaces it.
+        const fnPretty = fn.startsWith(`${server}_`)
+          ? fn.slice(server.length + 1)
+          : fn;
+        return `${server} · ${fnPretty}`;
+      }
+      return t;
+    }
+    case "permission":
+      return "Permission request";
+    case "generic":
+    default: {
+      if (firstLoc?.path) {
+        const base = firstLoc.path.split("/").pop() || firstLoc.path;
+        return base;
+      }
+      return extractRawActionLabel(message);
+    }
+  }
+}
+
+function renderActionKindIcon(
+  kind: ActionKind,
+  className = "h-3 w-3 shrink-0",
+) {
+  switch (kind) {
+    case "bash":
+    case "bash_output":
+      return <Terminal className={className} />;
+    case "skill":
+      return <Sparkles className={className} />;
+    case "todo":
+      return <ListTodo className={className} />;
+    case "mcp":
+      return <Plug className={className} />;
+    case "permission":
+      return <ShieldCheck className={className} />;
+    default:
+      return <Wrench className={className} />;
+  }
+}
+
+function isBackgroundAction(message: ToolMessage): boolean {
+  const verb = normalizeToolVerb(message.title);
+  // Generic "Terminal" events often lack the actual command text and only provide
+  // broad shell output. Treat them as background exploration instead of a primary
+  // action so the UI does not surface a low-signal "Terminal" action chip.
+  return (
+    verb === "read" ||
+    verb === "search" ||
+    verb === "list" ||
+    message.title.toLowerCase() === "terminal"
+  );
+}
+
+function getToolNavMode(message: ToolMessage): "diff" | "full" {
+  return isEditTool(message) ? "diff" : "full";
+}
+
+type ToolLocationChip = {
+  key: string;
+  label: string;
+  path: string;
+  line?: number;
+  isDirectory: boolean;
+  status?: string;
+  mode: "diff" | "full";
+};
+
+const KNOWN_FILE_BASENAMES = new Set([
+  "makefile",
+  "dockerfile",
+  "license",
+  "readme",
+  "procfile",
+  "gemfile",
+  "rakefile",
+  "justfile",
+  "brewfile",
+  ".gitignore",
+  ".gitattributes",
+  ".gitmodules",
+  ".env",
+  ".editorconfig",
+  ".npmrc",
+  ".nvmrc",
+  ".prettierrc",
+  ".eslintrc",
+  ".clang-format",
+  ".dockerignore",
+]);
+
+function getLocationLabel(path: string): string {
+  const normalized = path.replace(/\/+$/, "");
+  const parts = normalized.split("/");
+  return parts[parts.length - 1] || normalized;
+}
+
+function isIgnorableLocationLabel(label: string): boolean {
+  return label === "" || label === "." || label === "..";
+}
+
+function looksLikeFileLabel(label: string): boolean {
+  const lower = label.toLowerCase();
+  if (KNOWN_FILE_BASENAMES.has(lower)) return true;
+  if (label.startsWith(".") && label.length > 1) return true;
+  if (label.includes(".")) return true;
+  if (/[A-Z]/.test(label)) return true;
+  return false;
+}
+
+function isDirectoryLocation(
+  message: ToolMessage,
+  location: NonNullable<ToolMessage["locations"]>[number],
+): boolean {
+  const label = getLocationLabel(location.path);
+  if (isIgnorableLocationLabel(label)) return true;
+  if (location.line != null) return false;
+  if (location.path.endsWith("/")) return true;
+  if (isEditTool(message)) return false;
+  const verb = normalizeToolVerb(message.title);
+  if (verb === "read") return false;
+  if (looksLikeFileLabel(label)) return false;
+  return verb === "search" || verb === "list" || verb === "run";
+}
+
+function collectLocationChips(
+  tools: ToolSectionItem[],
+  predicate: (message: ToolMessage) => boolean,
+): ToolLocationChip[] {
+  const seen = new Set<string>();
+  const chips: ToolLocationChip[] = [];
+
+  for (const tool of tools) {
+    if (!predicate(tool.message)) continue;
+    for (const loc of tool.message.locations ?? []) {
+      const label = getLocationLabel(loc.path);
+      if (isIgnorableLocationLabel(label)) continue;
+      const isDirectory = isDirectoryLocation(tool.message, loc);
+      const key = `${isDirectory ? "dir" : "file"}:${label}:${loc.path}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      chips.push({
+        key,
+        label,
+        path: loc.path,
+        line: loc.line,
+        isDirectory,
+        status: tool.message.status,
+        mode: getToolNavMode(tool.message),
+      });
+    }
+  }
+
+  return chips;
+}
+
+function parseDiffStat(
+  content?: string,
+): { additions: number; deletions: number } | null {
+  if (!content) return null;
+  const lines = content.split("\n");
+  const looksLikeDiff = lines.some(
+    (line) =>
+      line.startsWith("@@ ") ||
+      line.startsWith("@@") ||
+      line.startsWith("diff --git ") ||
+      line.startsWith("+++ ") ||
+      line.startsWith("--- "),
+  );
+  if (!looksLikeDiff) return null;
+  let additions = 0;
+  let deletions = 0;
+  for (const line of lines) {
+    if (
+      line.startsWith("+++ ") ||
+      line.startsWith("--- ") ||
+      line.startsWith("@@") ||
+      line.startsWith("diff --git ") ||
+      line.startsWith("index ")
+    )
+      continue;
+    if (line.startsWith("+")) additions += 1;
+    else if (line.startsWith("-")) deletions += 1;
+  }
+  if (additions === 0 && deletions === 0) return null;
+  return { additions, deletions };
+}
+
+function formatActionCount(count: number): string | null {
+  if (count <= 0) return null;
+  return `${count} action${count !== 1 ? "s" : ""}`;
+}
+
+function formatInspectionCount(count: number): string | null {
+  if (count <= 0) return null;
+  return `${count} inspection step${count !== 1 ? "s" : ""}`;
+}
+
+function truncateChipLabel(label: string, maxLength = 64): string {
+  const singleLine = label.replace(/\s+/g, " ").trim();
+  if (singleLine.length <= maxLength) return singleLine;
+  return `${singleLine.slice(0, maxLength - 1)}…`;
+}
+
+function extractRawActionLabel(message: ToolMessage): string {
+  const title = message.title.replace(/^Run\s+/i, "");
+  const verb = normalizeToolVerb(message.title);
+  if (verb === "run") return title;
+  if (verb === "permission") return "Permission request";
+  if (verb === "plan") return "Plan update";
+  return title;
+}
+
+/** Strip outermost code fence wrapper (```lang\n...\n```) if present */
+function stripWrappingFence(raw: string): string {
+  const lines = raw.split("\n");
+  if (
+    lines.length >= 3 &&
+    /^```\w*$/.test(lines[0].trim()) &&
+    lines[lines.length - 1].trim() === "```"
+  ) {
+    return lines.slice(1, -1).join("\n");
+  }
+  return raw;
+}
+
+function extractFailureReason(tools: ToolSectionItem[]): string | null {
+  for (const tool of tools) {
+    const m = tool.message;
+    if (m.status !== "error" && m.status !== "failed") continue;
+    const content = m.content?.trim();
+    if (!content) return `Failed during ${extractRawActionLabel(m)}`;
+    const stripped = stripWrappingFence(content)
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!stripped) return `Failed during ${extractRawActionLabel(m)}`;
+    return stripped.slice(0, 180);
+  }
+  return null;
+}
+
+function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean) {
+  const running = tools.filter((t) => t.message.status === "running").length;
+  const failed = tools.filter(
+    (t) => t.message.status === "error" || t.message.status === "failed",
+  ).length;
+  const cancelled = tools.filter(
+    (t) => t.message.status === "cancelled",
+  ).length;
+  const total = tools.length;
+  const succeeded = total - running - failed - cancelled;
+  // Only compute terminal statuses when the section is truly finished
+  // (i.e. a new message/thinking/turn-end appeared after this tool section, or chat is idle)
+  const settled = sectionFinished && running === 0;
+  const allFailed = settled && failed > 0 && succeeded === 0;
+  const partialFailed = settled && failed > 0 && !allFailed;
+
+  // statusLabel: only show when it adds info beyond the title
+  const statusLabel =
+    !settled
+      ? ""
+      : partialFailed
+        ? `${failed} failed`
+        : cancelled > 0 && succeeded > 0
+          ? `${cancelled} cancelled`
+          : "";
+  const edits = tools.filter((t) => isEditTool(t.message));
+  const foregroundActions = tools.filter(
+    (t) => !isEditTool(t.message) && !isBackgroundAction(t.message),
+  );
+  const backgroundActions = tools.filter((t) => isBackgroundAction(t.message));
+
+  let title = "Working";
+  if (allFailed) title = "Action failed";
+  else if (partialFailed) title = "Completed with errors";
+  else if (
+    tools.some((t) => normalizeToolVerb(t.message.title) === "permission")
+  )
+    title = "Waiting for permission";
+  else if (edits.length > 0)
+    title = running > 0 || !settled ? "Editing files" : "Edits applied";
+  else if (foregroundActions.length > 0)
+    title = running > 0 || !settled ? "Running actions" : "Actions complete";
+  else if (backgroundActions.length > 0)
+    title = running > 0 || !settled ? "Inspecting code" : "Inspection complete";
+
+  // Merge edits on the same file: accumulate +/- and keep the latest tool id/status
+  const editItems = (() => {
+    const merged = new Map<string, { key: string; toolId: string; label: string; fullPath: string; additions: number; deletions: number; status: string }>();
+    for (const tool of edits) {
+      const loc = tool.message.locations?.[0];
+      const fullPath = loc?.path ?? "";
+      const label =
+        fullPath.split("/").pop() ||
+        tool.message.title.replace(/^(Edit|Write)\s+/i, "");
+      const stat = parseDiffStat(tool.message.content);
+      const existing = merged.get(label);
+      if (existing) {
+        existing.additions += stat?.additions ?? 0;
+        existing.deletions += stat?.deletions ?? 0;
+        existing.toolId = tool.message.id;
+        existing.status = tool.message.status;
+        // Use the longest (most specific) full path
+        if (fullPath.length > existing.fullPath.length) existing.fullPath = fullPath;
+      } else {
+        merged.set(label, {
+          key: `${tool.message.id}:${label}`,
+          toolId: tool.message.id,
+          label,
+          fullPath,
+          additions: stat?.additions ?? 0,
+          deletions: stat?.deletions ?? 0,
+          status: tool.message.status,
+        });
+      }
+    }
+    return Array.from(merged.values());
+  })();
+
+  const buildChipItem = (tool: ToolSectionItem): ActionChipItem => {
+    const kind = classifyActionKind(tool.message.title);
+    const derived = extractActionChipLabel(tool.message, kind);
+    return {
+      key: tool.message.id,
+      kind,
+      label: truncateChipLabel(derived),
+      rawTitle: tool.message.title,
+      content: tool.message.content ?? "",
+      locations: tool.message.locations ?? [],
+      status: tool.message.status,
+      rawInput: tool.message.rawInput,
+    };
+  };
+  const actionItems = foregroundActions.map(buildChipItem);
+  // Background tools without file locations (Bash, Grep with output_mode=content,
+  // MCP calls, ...) won't appear in the file-chip group above — surface them as
+  // action chips so the user can still see what was inspected and expand to read
+  // the output.
+  const inspectionActionItems = backgroundActions
+    .filter((t) => (t.message.locations?.length ?? 0) === 0)
+    .map(buildChipItem);
+
+  const inspectionEntries = collectLocationChips(tools, isBackgroundAction);
+  const inspectionFiles = inspectionEntries.filter(
+    (entry) => !entry.isDirectory,
+  );
+  const actionEntries = collectLocationChips(
+    tools,
+    (message) => !isBackgroundAction(message) && !isEditTool(message),
+  );
+  const actionFiles = actionEntries.map((entry) => entry.label);
+
+  const totalActionCount = edits.length + actionItems.length;
+  const inspectionSectionSummary =
+    inspectionFiles.length > 0
+      ? `Reviewed ${inspectionFiles.length} file${inspectionFiles.length > 1 ? "s" : ""}`
+      : null;
+  const totalAffectedFiles = new Set([...actionFiles, ...editItems.map((e) => e.label)]).size;
+  const actionSectionSummary =
+    totalAffectedFiles > 0
+      ? `Action on ${totalAffectedFiles} file${totalAffectedFiles > 1 ? "s" : ""}`
+      : formatActionCount(totalActionCount);
+  const headerSummary =
+    backgroundActions.length > 0 &&
+    edits.length === 0 &&
+    foregroundActions.length === 0
+      ? (inspectionSectionSummary ??
+        formatInspectionCount(backgroundActions.length))
+      : (actionSectionSummary ?? formatActionCount(totalActionCount));
+
+  // Determine dominant section type for icon selection
+  const sectionType: "inspection" | "edit" | "action" =
+    edits.length > 0
+      ? "edit"
+      : backgroundActions.length > 0 &&
+          foregroundActions.length === 0
+        ? "inspection"
+        : "action";
+
+  return {
+    title,
+    statusLabel,
+    sectionType,
+    headerSummary,
+    actionSectionSummary,
+    editItems,
+    actionItems,
+    visibleActionItems: actionItems.slice(0, 4),
+    actionItemOverflow: Math.max(0, actionItems.length - 4),
+    inspectionSectionSummary,
+    inspectionEntries,
+    inspectionVisibleEntries: inspectionEntries.slice(0, 3),
+    inspectionOverflow: Math.max(0, inspectionEntries.length - 3),
+    inspectionActionItems,
+    visibleInspectionItems: inspectionActionItems.slice(0, 4),
+    inspectionItemOverflow: Math.max(0, inspectionActionItems.length - 4),
+    actionEntries,
+    actionVisibleEntries: actionEntries.slice(0, 3),
+    actionOverflow: Math.max(0, actionEntries.length - 3),
+    failureReason: extractFailureReason(tools),
+    running,
+    failed,
+    cancelled,
+  };
+}
+
+function getStatusChipClasses(status: string, muted = false): string {
+  if (status === "error" || status === "failed") {
+    return "bg-[color-mix(in_srgb,var(--color-warning)_16%,var(--color-bg))] text-[color-mix(in_srgb,var(--color-warning)_92%,white_8%)] border border-[color-mix(in_srgb,var(--color-warning)_28%,transparent)]";
+  }
+  if (status === "running") {
+    return muted
+      ? "bg-[color-mix(in_srgb,var(--color-highlight)_10%,var(--color-bg))] text-[color-mix(in_srgb,var(--color-highlight)_80%,white_8%)] border border-[color-mix(in_srgb,var(--color-highlight)_18%,transparent)]"
+      : "bg-[color-mix(in_srgb,var(--color-highlight)_12%,var(--color-bg))] text-[var(--color-text)] border border-[color-mix(in_srgb,var(--color-highlight)_18%,transparent)]";
+  }
+  if (status === "cancelled") {
+    return "bg-[color-mix(in_srgb,var(--color-text-muted)_10%,var(--color-bg))] text-[var(--color-text-muted)] border border-[color-mix(in_srgb,var(--color-text-muted)_18%,transparent)]";
+  }
+  return muted
+    ? "bg-[color-mix(in_srgb,var(--color-bg-secondary)_78%,var(--color-bg))] text-[var(--color-text-muted)] border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)]"
+    : "bg-[color-mix(in_srgb,var(--color-bg-secondary)_88%,var(--color-bg))] text-[var(--color-text)] border border-[color-mix(in_srgb,var(--color-border)_70%,transparent)]";
+}
+
+type ActionChipItem = {
+  key: string;
+  kind: ActionKind;
+  label: string;
+  rawTitle: string;
+  content: string;
+  locations: { path: string; line?: number }[];
+  status: string;
+  rawInput?: unknown;
+};
+
+/** Render a diff string with +/-/@@ line coloring. Inline `<pre>` block. */
+function DiffPreview({ diff }: { diff: string }) {
+  const lines = diff.split("\n");
+  return (
+    <pre className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all m-0">
+      {lines.map((line, i) => {
+        // file headers — render muted, no +/- coloring
+        const isHeader =
+          line.startsWith("+++") ||
+          line.startsWith("---") ||
+          line.startsWith("diff --git") ||
+          line.startsWith("index ");
+        const isHunk = line.startsWith("@@");
+        const isAdd = !isHeader && line.startsWith("+");
+        const isDel = !isHeader && line.startsWith("-");
+        const cls = isHunk
+          ? "text-[var(--color-text-muted)]"
+          : isHeader
+            ? "text-[var(--color-text-muted)] opacity-70"
+            : isAdd
+              ? "text-[var(--color-success)] bg-[color-mix(in_srgb,var(--color-success)_8%,transparent)]"
+              : isDel
+                ? "text-[var(--color-error)] bg-[color-mix(in_srgb,var(--color-error)_8%,transparent)]"
+                : "text-[var(--color-text)]";
+        return (
+          <span key={i} className={`block ${cls}`}>
+            {line || " "}
+          </span>
+        );
+      })}
+    </pre>
+  );
+}
+
+/**
+ * Pretty-format `tool_call.raw_input` for the expanded panel REQUEST block.
+ * Bash 类工具直接渲 `command`(更短更直观);其他工具 JSON.stringify。
+ * 返回 null 表示没有可显示的 raw_input,调用方应隐藏整个 REQUEST 块。
+ */
+function formatRawInput(raw: unknown, kind: ActionKind): string | null {
+  if (raw == null) return null;
+  if (typeof raw === "string") return raw.trim() || null;
+  if (typeof raw !== "object") return String(raw);
+  const obj = raw as Record<string, unknown>;
+  if ((kind === "bash" || kind === "bash_output") && typeof obj.command === "string") {
+    return obj.command;
+  }
+  try {
+    return JSON.stringify(obj, null, 2);
+  } catch {
+    return null;
+  }
+}
+
+/** Single clickable / expandable action chip. */
+function ActionChip({
+  item,
+  expanded,
+  onToggleExpand,
+  onFileClick,
+}: {
+  item: ActionChipItem;
+  expanded: boolean;
+  onToggleExpand: () => void;
+  onFileClick?: (
+    filePath: string,
+    line?: number,
+    mode?: "diff" | "full",
+  ) => Promise<boolean>;
+}) {
+  const hasContent = item.content.trim().length > 0;
+  const hasLocation = item.locations.length > 0;
+  // Click priority: navigate to first location if one exists; otherwise
+  // toggle inline expand. If neither exists, the chip is still a button
+  // (keeps UI consistent) but click is a no-op.
+  const handleClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (hasLocation) {
+      const loc = item.locations[0];
+      onFileClick?.(loc.path, loc.line, "full");
+      return;
+    }
+    if (hasContent) onToggleExpand();
+  };
+  const isInteractive = hasLocation || hasContent;
+  // chip 尾部提示：有 location → 箭头出链（可跳文件）；有 content → Chevron
+  // 指示可展开/已展开；无交互 → 不显示，避免骗点击。
+  const trailingHint = hasLocation ? (
+    <ExternalLink className="h-3 w-3 shrink-0 text-[var(--color-text-muted)] opacity-70" />
+  ) : hasContent ? (
+    expanded ? (
+      <ChevronUp className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
+    ) : (
+      <ChevronDown className="h-3 w-3 shrink-0 text-[var(--color-text-muted)] opacity-70" />
+    )
+  ) : null;
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      disabled={!isInteractive}
+      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] transition-colors max-w-[320px] ${
+        isInteractive
+          ? "cursor-pointer hover:brightness-110"
+          : "cursor-default"
+      } ${getStatusChipClasses(item.status)} ${
+        expanded
+          ? "ring-1 ring-[color-mix(in_srgb,var(--color-highlight)_55%,transparent)] bg-[color-mix(in_srgb,var(--color-highlight)_14%,var(--color-bg-secondary))] text-[var(--color-text)]"
+          : ""
+      }`}
+    >
+      {item.status === "running" ? (
+        <Loader2 className="h-3 w-3 animate-spin text-[var(--color-highlight)] shrink-0" />
+      ) : (
+        renderActionKindIcon(item.kind)
+      )}
+      <span className="truncate">{item.label}</span>
+      {trailingHint}
+    </button>
+  );
+}
+
+/**
+ * List of action chips plus per-chip expanded detail panels.
+ * Keeps chips in a flex-wrap row; expanded content panels render below in
+ * insertion order (so visual grouping stays tight).
+ */
+function ActionChipList({
+  items,
+  overflowCount,
+  onShowMore,
+  expandedKeys,
+  onToggleExpand,
+  onFileClick,
+}: {
+  items: ActionChipItem[];
+  overflowCount: number;
+  onShowMore: () => void;
+  expandedKeys: Set<string>;
+  onToggleExpand: (key: string) => void;
+  onFileClick?: (
+    filePath: string,
+    line?: number,
+    mode?: "diff" | "full",
+  ) => Promise<boolean>;
+}) {
+  const expandedItems = items.filter((it) => expandedKeys.has(it.key));
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap gap-1.5">
+        {items.map((item) => (
+          <ActionChip
+            key={item.key}
+            item={item}
+            expanded={expandedKeys.has(item.key)}
+            onToggleExpand={() => onToggleExpand(item.key)}
+            onFileClick={onFileClick}
+          />
+        ))}
+        {overflowCount > 0 && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onShowMore();
+            }}
+            className="inline-flex items-center rounded-full border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_80%,var(--color-bg))] px-2.5 py-1 text-[11px] text-[var(--color-text-muted)] hover:bg-[color-mix(in_srgb,var(--color-bg-secondary)_95%,var(--color-bg))] hover:text-[var(--color-text)] cursor-pointer transition-colors"
+          >
+            +{overflowCount} more actions
+          </button>
+        )}
+      </div>
+      {expandedItems.length > 0 && (
+        <div className="space-y-2">
+          {expandedItems.map((item) => {
+            const renderMarkdown =
+              item.kind === "skill" ||
+              item.kind === "todo" ||
+              item.kind === "mcp";
+            return (
+              <div
+                key={`${item.key}:expanded`}
+                className="rounded-lg border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_58%,transparent)] px-3 py-2"
+              >
+                <div className="flex items-center gap-2 mb-1.5">
+                  <span className="text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
+                    {item.rawTitle || "action"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onToggleExpand(item.key);
+                    }}
+                    className="ml-auto text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] cursor-pointer transition-colors"
+                  >
+                    collapse
+                  </button>
+                </div>
+                {(() => {
+                  const reqText = formatRawInput(item.rawInput, item.kind);
+                  const resBody = renderMarkdown ? (
+                    <div className="text-[12px] leading-[1.45]">
+                      <MarkdownRenderer content={item.content} />
+                    </div>
+                  ) : (
+                    <pre className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all text-[var(--color-text)] m-0">
+                      {item.content || "(no output)"}
+                    </pre>
+                  );
+                  return (
+                    <div className="space-y-2">
+                      {reqText && (
+                        <div>
+                          <div className="mb-1 text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
+                            Request
+                          </div>
+                          <pre className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all text-[var(--color-text)] m-0">
+                            {reqText}
+                          </pre>
+                        </div>
+                      )}
+                      <div>
+                        {reqText && (
+                          <div className="mb-1 text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
+                            Response
+                          </div>
+                        )}
+                        {resBody}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ExpandableFileChipGroup({
+  title,
+  summary,
+  visibleEntries,
+  allEntries,
+  expanded,
+  onToggleExpanded,
+  onFileClick,
+  muted = true,
+}: {
+  title: string;
+  summary?: string | null;
+  visibleEntries: ToolLocationChip[];
+  allEntries: ToolLocationChip[];
+  expanded: boolean;
+  onToggleExpanded: () => void;
+  onFileClick?: (
+    filePath: string,
+    line?: number,
+    mode?: "diff" | "full",
+  ) => Promise<boolean>;
+  muted?: boolean;
+}) {
+  const overflow = Math.max(0, allEntries.length - visibleEntries.length);
+  const renderEntry = (entry: ToolLocationChip) => (
+    <button
+      key={entry.key}
+      type="button"
+      disabled={entry.isDirectory}
+      onClick={() => {
+        if (!entry.isDirectory)
+          onFileClick?.(entry.path, entry.line, entry.mode);
+      }}
+      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] max-w-[320px] ${
+        entry.isDirectory
+          ? "bg-[color-mix(in_srgb,var(--color-bg-secondary)_80%,var(--color-bg))] text-[var(--color-text-muted)] border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] disabled:cursor-default disabled:opacity-85"
+          : getStatusChipClasses(entry.status ?? "completed", muted)
+      }`}
+      title={entry.path}
+    >
+      <VSCodeIcon
+        filename={entry.path.split("/").pop() || entry.label}
+        size={13}
+        isFolder={entry.isDirectory}
+      />
+      <span className="truncate">{entry.label}</span>
+    </button>
+  );
+
+  return (
+    <div className="space-y-2">
+      <div className="text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
+        {title}
+        {summary ? (
+          <span className="ml-2 normal-case tracking-normal text-[11px] opacity-80">
+            {summary}
+          </span>
+        ) : null}
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {visibleEntries.map(renderEntry)}
+        {overflow > 0 && (
+          <button
+            type="button"
+            onClick={onToggleExpanded}
+            className="inline-flex items-center rounded-full border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_80%,var(--color-bg))] px-2.5 py-1 text-[11px] text-[var(--color-text-muted)]"
+          >
+            {expanded ? "Show less" : `+${overflow} more`}
+          </button>
+        )}
+      </div>
+      {expanded && overflow > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {allEntries.slice(visibleEntries.length).map(renderEntry)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Collapsible section that groups consecutive tool calls */
+const ToolSectionView = memo(function ToolSectionView({
+  sectionId,
+  tools,
+  expanded,
+  forceExpanded,
+  sectionFinished,
+  onToggleSection,
+  onFileClick,
+}: {
+  sectionId: string;
+  tools: ToolSectionItem[];
+  expanded: boolean;
+  forceExpanded: boolean;
+  sectionFinished: boolean;
+  onToggleSection: (sectionId: string) => void;
+  onFileClick?: (
+    filePath: string,
+    line?: number,
+    mode?: "diff" | "full",
+  ) => Promise<boolean>;
+}) {
+  const sectionExpanded = forceExpanded || expanded;
+  const summary = useMemo(() => summarizeToolSection(tools, sectionFinished), [tools, sectionFinished]);
+  const [inspectionExpanded, setInspectionExpanded] = useState(false);
+  const [actionExpanded, setActionExpanded] = useState(false);
+  const [actionItemsExpanded, setActionItemsExpanded] = useState(false);
+  const [inspectionItemsExpanded, setInspectionItemsExpanded] = useState(false);
+  const [expandedActionKeys, setExpandedActionKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [expandedInspectionKeys, setExpandedInspectionKeys] = useState<
+    Set<string>
+  >(() => new Set());
+  const [expandedEditKeys, setExpandedEditKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const hasDetails =
+    summary.inspectionEntries.length > 0 ||
+    summary.inspectionActionItems.length > 0 ||
+    summary.editItems.length > 0 ||
+    summary.actionItems.length > 0 ||
+    summary.actionEntries.length > 0;
+  const DoneIcon =
+    summary.sectionType === "edit"
+      ? Pencil
+      : summary.sectionType === "inspection"
+        ? Eye
+        : Terminal;
+  const summaryIcon =
+    summary.running > 0 ? (
+      <Loader2 className="w-3.5 h-3.5 text-[var(--color-highlight)] animate-spin shrink-0" />
+    ) : summary.failed > 0 || summary.cancelled > 0 ? (
+      <DoneIcon className="w-3.5 h-3.5 text-[var(--color-warning)] shrink-0" />
+    ) : (
+      <DoneIcon className="w-3.5 h-3.5 text-[var(--color-success)] shrink-0" />
+    );
+  const collapsedSecondaryText = summary.failureReason ?? summary.headerSummary;
+  return (
+    <motion.div
+      layout
+      transition={{ duration: 0.2, ease: "easeOut" }}
+      className={`rounded-xl border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] transition-colors ${
+        sectionExpanded
+          ? "bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)] px-3 py-3"
+          : `bg-[color-mix(in_srgb,var(--color-bg-secondary)_62%,transparent)] px-3 py-2.5${hasDetails ? " hover:bg-[color-mix(in_srgb,var(--color-bg-secondary)_82%,transparent)]" : ""}`
+      }`}
+    >
+      <div
+        role={hasDetails ? "button" : undefined}
+        onClick={hasDetails ? () => onToggleSection(sectionId) : undefined}
+        className={`flex gap-2.5${sectionExpanded ? " items-start" : " items-center"}${hasDetails ? " cursor-pointer" : ""}`}
+      >
+        <div className={sectionExpanded ? "pt-0.5" : ""}>{summaryIcon}</div>
+        <div className="min-w-0 flex-1">
+          {!sectionExpanded ? (
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="shrink-0 text-sm font-medium text-[var(--color-text)]">
+                {summary.title}
+              </span>
+              {summary.statusLabel ? (
+                <span className="shrink-0 text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
+                  {summary.statusLabel}
+                </span>
+              ) : null}
+              {collapsedSecondaryText ? (
+                <span
+                  className={`min-w-0 truncate text-xs ${summary.failureReason ? "text-[color-mix(in_srgb,var(--color-warning)_95%,white_4%)]" : "text-[var(--color-text-muted)]"}`}
+                  title={collapsedSecondaryText}
+                >
+                  <span className="mr-1 text-[var(--color-text-muted)]">·</span>
+                  {collapsedSecondaryText}
+                </span>
+              ) : null}
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium text-[var(--color-text)]">
+                  {summary.title}
+                </span>
+                {summary.statusLabel ? (
+                  <span className="text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
+                    {summary.statusLabel}
+                  </span>
+                ) : null}
+              </div>
+              {summary.failureReason && (
+                <div className="mt-1 rounded-lg border border-[color-mix(in_srgb,var(--color-warning)_20%,transparent)] bg-[color-mix(in_srgb,var(--color-warning)_8%,transparent)] px-2.5 py-2 text-xs text-[color-mix(in_srgb,var(--color-warning)_95%,white_4%)] break-all min-w-0">
+                  {summary.failureReason}
+                </div>
+              )}
+              {!summary.failureReason && (
+                <div className="mt-1 text-xs text-[var(--color-text-muted)]">
+                  {summary.headerSummary}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+        {hasDetails ? (
+          <motion.div
+            animate={{ rotate: sectionExpanded ? 90 : 0 }}
+            transition={{ duration: 0.18, ease: "easeOut" }}
+            className={`shrink-0 ${sectionExpanded ? "mt-0.5" : ""}`}
+          >
+            <ChevronRight className="w-3 h-3 text-[var(--color-text-muted)]" />
+          </motion.div>
+        ) : null}
+      </div>
+
+      <AnimatePresence initial={false}>
+        {sectionExpanded && hasDetails && (
+          <motion.div
+            key="tool-section-body"
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.2, ease: "easeOut" }}
+            className="overflow-hidden"
+          >
+            <div className="mt-3 border-t border-[color-mix(in_srgb,var(--color-border)_62%,transparent)] pt-3 space-y-3">
+              {(summary.inspectionEntries.length > 0 ||
+                summary.inspectionActionItems.length > 0) && (
+                <div className="space-y-2">
+                  {summary.inspectionEntries.length > 0 && (
+                    <ExpandableFileChipGroup
+                      title="Inspection"
+                      summary={summary.inspectionSectionSummary}
+                      visibleEntries={summary.inspectionVisibleEntries}
+                      allEntries={summary.inspectionEntries}
+                      expanded={inspectionExpanded}
+                      onToggleExpanded={() => setInspectionExpanded((v) => !v)}
+                      onFileClick={onFileClick}
+                      muted
+                    />
+                  )}
+                  {(summary.visibleInspectionItems.length > 0 ||
+                    summary.inspectionItemOverflow > 0) && (
+                    <ActionChipList
+                      items={
+                        inspectionItemsExpanded
+                          ? summary.inspectionActionItems
+                          : summary.visibleInspectionItems
+                      }
+                      overflowCount={
+                        inspectionItemsExpanded
+                          ? 0
+                          : summary.inspectionItemOverflow
+                      }
+                      onShowMore={() => setInspectionItemsExpanded(true)}
+                      expandedKeys={expandedInspectionKeys}
+                      onToggleExpand={(key) =>
+                        setExpandedInspectionKeys((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(key)) next.delete(key);
+                          else next.add(key);
+                          return next;
+                        })
+                      }
+                      onFileClick={onFileClick}
+                    />
+                  )}
+                </div>
+              )}
+
+              {summary.editItems.length > 0 && (
+                <div className="space-y-2">
+                  <div className="text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
+                    Edit
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {summary.editItems.map((item) => {
+                      const isExpanded = expandedEditKeys.has(item.key);
+                      const tool = tools.find(
+                        (t) => t.message.id === item.toolId,
+                      )?.message;
+                      const path = item.fullPath || tool?.locations?.[0]?.path;
+                      const hasDiff = (tool?.content?.trim()?.length ?? 0) > 0;
+                      return (
+                        <div
+                          key={item.key}
+                          className={`inline-flex items-center gap-1 rounded-full pl-2.5 pr-1 py-1 text-[11px] transition-colors ${getStatusChipClasses(item.status)} ${
+                            isExpanded
+                              ? "ring-1 ring-[color-mix(in_srgb,var(--color-highlight)_55%,transparent)] bg-[color-mix(in_srgb,var(--color-highlight)_14%,var(--color-bg-secondary))]"
+                              : ""
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (!hasDiff) return;
+                              setExpandedEditKeys((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(item.key)) next.delete(item.key);
+                                else next.add(item.key);
+                                return next;
+                              });
+                            }}
+                            disabled={!hasDiff}
+                            className={`inline-flex items-center gap-1.5 ${hasDiff ? "cursor-pointer" : "cursor-default"} max-w-[320px]`}
+                            title={path}
+                          >
+                            <VSCodeIcon filename={item.label} size={13} />
+                            <span className="truncate">{item.label}</span>
+                            {(item.additions > 0 || item.deletions > 0) && (
+                              <span className="text-[10px] shrink-0">
+                                <span className="text-[var(--color-success)]">
+                                  +{item.additions}
+                                </span>
+                                <span className="mx-0.5 text-[var(--color-text-muted)]">
+                                  /
+                                </span>
+                                <span className="text-[var(--color-error)]">
+                                  -{item.deletions}
+                                </span>
+                              </span>
+                            )}
+                            {hasDiff ? (
+                              isExpanded ? (
+                                <ChevronUp className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
+                              ) : (
+                                <ChevronDown className="h-3 w-3 shrink-0 text-[var(--color-text-muted)] opacity-70" />
+                              )
+                            ) : null}
+                          </button>
+                          {path && tool && (
+                            <button
+                              type="button"
+                              title="Open file"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onFileClick?.(
+                                  path,
+                                  undefined,
+                                  getToolNavMode(tool),
+                                );
+                              }}
+                              className="ml-0.5 inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-full text-[var(--color-text-muted)] hover:bg-[color-mix(in_srgb,var(--color-text)_8%,transparent)] hover:text-[var(--color-text)]"
+                            >
+                              <ExternalLink className="h-3 w-3" />
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {summary.editItems
+                    .filter((item) => expandedEditKeys.has(item.key))
+                    .map((item) => {
+                      const tool = tools.find(
+                        (t) => t.message.id === item.toolId,
+                      )?.message;
+                      const diff = tool?.content ?? "";
+                      return (
+                        <div
+                          key={`${item.key}:diff`}
+                          className="rounded-lg border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_58%,transparent)] px-3 py-2"
+                        >
+                          <div className="mb-1.5 flex items-center gap-2">
+                            <VSCodeIcon filename={item.label} size={13} />
+                            <span className="text-[11px] text-[var(--color-text)]">
+                              {item.label}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setExpandedEditKeys((prev) => {
+                                  const next = new Set(prev);
+                                  next.delete(item.key);
+                                  return next;
+                                })
+                              }
+                              className="ml-auto text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] cursor-pointer transition-colors"
+                            >
+                              collapse
+                            </button>
+                          </div>
+                          <DiffPreview diff={diff || "(empty diff)"} />
+                        </div>
+                      );
+                    })}
+                </div>
+              )}
+
+              {(summary.actionItems.length > 0 ||
+                summary.actionEntries.length > 0) && (
+                <div className="space-y-2">
+                  {summary.actionEntries.length > 0 && (
+                    <ExpandableFileChipGroup
+                      title="Action"
+                      summary={summary.actionSectionSummary}
+                      visibleEntries={summary.actionVisibleEntries}
+                      allEntries={summary.actionEntries}
+                      expanded={actionExpanded}
+                      onToggleExpanded={() => setActionExpanded((v) => !v)}
+                      onFileClick={onFileClick}
+                      muted
+                    />
+                  )}
+                  {(summary.visibleActionItems.length > 0 ||
+                    summary.actionItemOverflow > 0) && (
+                    <ActionChipList
+                      items={
+                        actionItemsExpanded
+                          ? summary.actionItems
+                          : summary.visibleActionItems
+                      }
+                      overflowCount={
+                        actionItemsExpanded ? 0 : summary.actionItemOverflow
+                      }
+                      onShowMore={() => setActionItemsExpanded(true)}
+                      expandedKeys={expandedActionKeys}
+                      onToggleExpand={(key) =>
+                        setExpandedActionKeys((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(key)) next.delete(key);
+                          else next.add(key);
+                          return next;
+                        })
+                      }
+                      onFileClick={onFileClick}
+                    />
+                  )}
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.div>
+  );
+});

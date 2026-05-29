@@ -26,6 +26,7 @@ pub fn render(
     diff_scroll: u16,
     stats_scroll: u16,
     stats_history: Option<&TaskEditHistory>,
+    is_git_usable: bool,
     colors: &ThemeColors,
     click_areas: &mut ClickAreas,
 ) {
@@ -90,14 +91,48 @@ pub fn render(
         PreviewSubTab::Stats => {
             render_stats_tab(frame, content_area, stats_history, stats_scroll, colors)
         }
-        PreviewSubTab::Git => render_git_tab(frame, content_area, panel_data, git_scroll, colors),
+        PreviewSubTab::Git => {
+            if is_git_usable {
+                render_git_tab(frame, content_area, panel_data, git_scroll, colors)
+            } else {
+                render_git_unavailable(frame, content_area, colors)
+            }
+        }
         PreviewSubTab::Notes => {
             render_notes_tab(frame, content_area, panel_data, notes_scroll, colors)
         }
         PreviewSubTab::Diff => {
-            render_diff_tab(frame, content_area, panel_data, diff_scroll, colors)
+            if is_git_usable {
+                render_diff_tab(frame, content_area, panel_data, diff_scroll, colors)
+            } else {
+                render_git_unavailable(frame, content_area, colors)
+            }
         }
     }
+}
+
+/// Placeholder when a git-dependent preview tab is opened on a non-git project.
+fn render_git_unavailable(frame: &mut Frame, area: Rect, colors: &ThemeColors) {
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Not available",
+            Style::default()
+                .fg(colors.warning)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "This project is not a Git repository.",
+            Style::default().fg(colors.muted),
+        )),
+        Line::from(Span::styled(
+            "Create a task to initialize Git.",
+            Style::default().fg(colors.muted),
+        )),
+    ];
+    let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
+    frame.render_widget(paragraph, area);
 }
 
 fn render_sub_tab_bar(
@@ -523,7 +558,13 @@ pub fn render_diff_tab(
         // Author line
         lines.push(Line::from(vec![
             Span::styled(" │ ", Style::default().fg(colors.border)),
-            Span::styled(format!("{}: ", comment.author), author_style),
+            Span::styled(
+                format!(
+                    "{}: ",
+                    crate::storage::comments::build_author(&comment.agent, &comment.role)
+                ),
+                author_style,
+            ),
         ]));
 
         // Content lines with manual wrapping
@@ -556,7 +597,11 @@ pub fn render_diff_tab(
                 let reply_style = Style::default().fg(colors.status_merged);
 
                 // First line: connector + author
-                let first_prefix = format!(" {}─ {}: ", connector, reply.author);
+                let first_prefix = format!(
+                    " {}─ {}: ",
+                    connector,
+                    crate::storage::comments::build_author(&reply.agent, &reply.role)
+                );
                 let cont_prefix = format!(" {}  ", continuation);
                 let reply_content_width = wrap_width.saturating_sub(cont_prefix.len());
 
@@ -708,11 +753,10 @@ pub fn render_stats_tab(
         // Show top 10 files with color gradient based on intensity
         for (path, count) in files.iter().take(10) {
             let path_str = path.to_string_lossy();
-            let bar_width = if max_count > 0 {
-                ((count * bar_max_width as u32) / max_count).max(1) as usize
-            } else {
-                1
-            };
+            let bar_width = (count * bar_max_width as u32)
+                .checked_div(max_count)
+                .unwrap_or(0)
+                .max(1) as usize;
             let bar = "█".repeat(bar_width);
 
             // Color gradient: more edits = warmer color

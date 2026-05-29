@@ -6,7 +6,8 @@ import {
   GitBranch,
   FileText,
   MessageSquare,
-  Terminal,
+  Package,
+
   ChevronRight,
   ChevronLeft,
   RotateCcw,
@@ -15,21 +16,23 @@ import {
   RefreshCw,
   GitMerge,
   Archive,
-  Code,
-  FileCode,
+
   GitBranchPlus,
   MoreHorizontal,
 } from "lucide-react";
 import { Button, DropdownMenu } from "../../ui";
 import type { Task } from "../../../data/types";
-import { StatsTab, GitTab, NotesTab, CommentsTab } from "./tabs";
+import { StatsTab, GitTab, NotesTab, CommentsTab, ArtifactsTab } from "./tabs";
+
+import { useIsMobile } from "../../../hooks";
+import { useProject } from "../../../context";
+import type { PanelType } from "../PanelSystem/types";
 
 interface TaskInfoPanelProps {
   projectId: string;
   task: Task;
   projectName?: string;
   onClose: () => void;
-  onEnterTerminal?: () => void;
   onRecover?: () => void;
   onClean?: () => void;
   isTerminalMode?: boolean;
@@ -38,16 +41,18 @@ interface TaskInfoPanelProps {
   onTabChange?: (tab: TabType) => void;
   // Action handlers for non-archived tasks
   onCommit?: () => void;
-  onReview?: () => void;
-  onEditor?: () => void;
   onRebase?: () => void;
   onSync?: () => void;
   onMerge?: () => void;
   onArchive?: () => void;
   onReset?: () => void;
+  // 新增：进入 Workspace (双击任务或点击 Workspace 按钮)
+  onEnterWorkspace?: () => void;
+  // 新增：在 FlexLayout 中打开 panel (Chat/Terminal/Review/Editor/Stats/Git/Notes/Comments)
+  onAddPanel?: (type: PanelType) => void;
 }
 
-export type TabType = "stats" | "git" | "notes" | "comments";
+export type TabType = "stats" | "git" | "notes" | "comments" | "artifacts";
 
 interface TabConfig {
   id: TabType;
@@ -55,11 +60,17 @@ interface TabConfig {
   icon: typeof BarChart3;
 }
 
-const TABS: TabConfig[] = [
-  { id: "stats", label: "Stats", icon: BarChart3 },
+const REPO_TABS: TabConfig[] = [
+  { id: "stats", label: "Info", icon: BarChart3 },
   { id: "git", label: "Git", icon: GitBranch },
   { id: "notes", label: "Notes", icon: FileText },
   { id: "comments", label: "Comments", icon: MessageSquare },
+];
+
+const STUDIO_TABS: TabConfig[] = [
+  { id: "stats", label: "Info", icon: BarChart3 },
+  { id: "artifacts", label: "Artifacts", icon: Package },
+  { id: "notes", label: "Notes", icon: FileText },
 ];
 
 export function TaskInfoPanel({
@@ -67,29 +78,36 @@ export function TaskInfoPanel({
   task,
   projectName,
   onClose,
-  onEnterTerminal,
   onRecover,
   onClean,
   isTerminalMode = false,
   activeTab: controlledTab,
   onTabChange,
   onCommit,
-  onReview,
-  onEditor,
   onRebase,
   onSync,
   onMerge,
   onArchive,
   onReset,
+  onEnterWorkspace,
+  onAddPanel,
 }: TaskInfoPanelProps) {
+
+  const { isMobile } = useIsMobile();
+  const { selectedProject, projects } = useProject();
+  // Resolve project from the task's projectId, not the globally-selected one:
+  // Blitz can open a task from a different project than the sidebar selection.
+  const taskProject = projects.find((p) => p.id === projectId) ?? selectedProject;
+  const isStudio = taskProject?.projectType === "studio";
+  const TABS = isStudio ? STUDIO_TABS : REPO_TABS;
   const isArchived = task.status === "archived";
-  const isBroken = task.status === "broken";
-  const canOperate = !isArchived && !isBroken;
+  const canOperate = !isArchived;
   const [internalTab, setInternalTab] = useState<TabType>("stats");
   const [expanded, setExpanded] = useState(false);
 
   // Support controlled/uncontrolled tab mode
-  const activeTab = controlledTab ?? internalTab;
+  const requestedTab: TabType = controlledTab ?? internalTab;
+  const activeTab: TabType = TABS.some((tab) => tab.id === requestedTab) ? requestedTab : "stats";
   const handleTabChange = (tab: TabType) => {
     setInternalTab(tab);
     onTabChange?.(tab);
@@ -99,12 +117,14 @@ export function TaskInfoPanel({
     switch (activeTab) {
       case "stats":
         return <StatsTab projectId={projectId} task={task} />;
+      case "artifacts":
+        return <ArtifactsTab projectId={projectId} task={task} />;
       case "git":
-        return <GitTab task={task} />;
+        return <GitTab projectId={projectId} task={task} />;
       case "notes":
-        return <NotesTab task={task} />;
+        return <NotesTab projectId={projectId} task={task} />;
       case "comments":
-        return <CommentsTab task={task} />;
+        return <CommentsTab projectId={projectId} task={task} />;
     }
   };
 
@@ -116,7 +136,7 @@ export function TaskInfoPanel({
         initial={{ width: 48 }}
         animate={{ width: expanded ? "60%" : 48 }}
         transition={{ type: "spring", damping: 25, stiffness: 200 }}
-        className="h-full flex rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] overflow-hidden"
+        className="h-full flex rounded-2xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] overflow-hidden"
         style={{ maxWidth: expanded ? "calc(100% - 400px)" : 48, minWidth: expanded ? 400 : 48 }}
       >
         {/* Vertical Tab Bar (always visible) */}
@@ -136,13 +156,20 @@ export function TaskInfoPanel({
           <div className="flex-1 flex flex-col py-2">
             {TABS.map((tab) => {
               const Icon = tab.icon;
-              const isActive = activeTab === tab.id;
+              // 只在侧边栏模式（没有 onAddPanel）时显示 active 状态
+              const isActive = !onAddPanel && activeTab === tab.id;
               return (
                 <button
                   key={tab.id}
                   onClick={() => {
-                    handleTabChange(tab.id);
-                    if (!expanded) setExpanded(true);
+                    // 如果提供了 onAddPanel 回调，在 FlexLayout 中打开 panel
+                    if (onAddPanel) {
+                      onAddPanel(tab.id);
+                    } else {
+                      // 否则使用原有的展开侧边栏逻辑（向后兼容）
+                      handleTabChange(tab.id);
+                      if (!expanded) setExpanded(true);
+                    }
                   }}
                   className={`
                     p-3 transition-colors
@@ -160,19 +187,23 @@ export function TaskInfoPanel({
             })}
           </div>
 
-          {/* Expand/Collapse toggle */}
-          <div className="h-px bg-[var(--color-border)]" />
-          <button
-            onClick={() => setExpanded(!expanded)}
-            className="p-3 text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
-            title={expanded ? "Collapse" : "Expand"}
-          >
-            {expanded ? (
-              <ChevronLeft className="w-5 h-5" />
-            ) : (
-              <ChevronRight className="w-5 h-5" />
-            )}
-          </button>
+          {/* Expand/Collapse toggle - 只在侧边栏模式显示 */}
+          {!onAddPanel && (
+            <>
+              <div className="h-px bg-[var(--color-border)]" />
+              <button
+                onClick={() => setExpanded(!expanded)}
+                className="p-3 text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+                title={expanded ? "Collapse" : "Expand"}
+              >
+                {expanded ? (
+                  <ChevronLeft className="w-5 h-5" />
+                ) : (
+                  <ChevronRight className="w-5 h-5" />
+                )}
+              </button>
+            </>
+          )}
         </div>
 
         {/* Expandable Content Panel */}
@@ -186,7 +217,7 @@ export function TaskInfoPanel({
               className="flex-1 flex flex-col min-w-0 overflow-hidden"
             >
               {/* Task Info Header */}
-              <div className="px-3 py-2 border-b border-[var(--color-border)]">
+              <div className="px-3 py-2 border-b border-[var(--color-border)] select-none">
                 <div className="flex items-center gap-1.5">
                   <h2 className="text-sm font-semibold text-[var(--color-text)] truncate">
                     {task.name}
@@ -196,12 +227,12 @@ export function TaskInfoPanel({
                   )}
                 </div>
                 <p className="text-xs text-[var(--color-text-muted)] font-mono truncate">
-                  {task.branch} → {task.target}
+                  {task.isLocal ? task.branch : <>{task.branch} → {task.target}</>}
                 </p>
               </div>
 
               {/* Active Tab Label */}
-              <div className="px-3 py-1.5 border-b border-[var(--color-border)] bg-[var(--color-bg)]">
+              <div className="px-3 py-1.5 border-b border-[var(--color-border)] bg-[var(--color-bg)] select-none">
                 <span className="text-xs font-medium text-[var(--color-highlight)]">
                   {TABS.find((t) => t.id === activeTab)?.label}
                 </span>
@@ -216,7 +247,7 @@ export function TaskInfoPanel({
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: -10 }}
                     transition={{ duration: 0.15 }}
-                    className="flex-1 min-h-0 overflow-y-auto"
+                    className="flex-1 min-h-0 overflow-y-auto pb-3"
                   >
                     {renderTabContent()}
                   </motion.div>
@@ -236,15 +267,10 @@ export function TaskInfoPanel({
       animate={{ x: 0, opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ type: "spring", damping: 25, stiffness: 200 }}
-      className="h-full flex flex-col rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] overflow-hidden"
+      className="h-full flex flex-col rounded-2xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] overflow-hidden"
     >
       {/* Header */}
-      <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-[var(--color-border)] bg-[var(--color-bg)]">
-        <Button variant="ghost" size="sm" onClick={onClose}>
-          <X className="w-4 h-4 mr-1" />
-          Close
-        </Button>
-
+      <div className="flex items-center justify-end gap-2 px-3 py-2 border-b border-[var(--color-border)] bg-[var(--color-bg)]">
         {/* Action buttons based on task status */}
         <div className="flex items-center gap-1">
           {isArchived ? (
@@ -272,35 +298,80 @@ export function TaskInfoPanel({
                 </Button>
               )}
             </>
+          ) : isMobile ? (
+            /* Mobile: dropdown + standalone Workspace button */
+            <>
+              <DropdownMenu
+                trigger={<MoreHorizontal className="w-4 h-4" />}
+                items={[
+                  ...(onCommit ? [{
+                    id: "commit",
+                    label: "Commit",
+                    icon: GitCommit,
+                    onClick: onCommit,
+                    disabled: isArchived,
+                  }] : []),
+                  ...(onRebase ? [{
+                    id: "rebase",
+                    label: "Rebase",
+                    icon: GitBranchPlus,
+                    onClick: onRebase,
+                    disabled: !canOperate,
+                  }] : []),
+                  ...(onSync ? [{
+                    id: "sync",
+                    label: "Sync",
+                    icon: RefreshCw,
+                    onClick: onSync,
+                    disabled: !canOperate,
+                  }] : []),
+                  ...(onMerge ? [{
+                    id: "merge",
+                    label: "Merge",
+                    icon: GitMerge,
+                    onClick: onMerge,
+                    disabled: !canOperate,
+                  }] : []),
+                  ...(onArchive ? [{
+                    id: "archive",
+                    label: "Archive",
+                    icon: Archive,
+                    onClick: onArchive,
+                    variant: "warning" as const,
+                    disabled: false,
+                  }] : []),
+                  ...(onReset ? [{
+                    id: "reset",
+                    label: "Reset",
+                    icon: RotateCcw,
+                    onClick: onReset,
+                    variant: "warning" as const,
+                    disabled: isArchived,
+                  }] : []),
+                  ...(onClean ? [{
+                    id: "clean",
+                    label: "Clean",
+                    icon: Trash2,
+                    onClick: onClean,
+                    variant: "danger" as const,
+                  }] : []),
+                ]}
+              />
+              {onEnterWorkspace && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={onEnterWorkspace}
+                >
+                  <ChevronRight className="w-4 h-4 mr-1" />
+                  Workspace
+                </Button>
+              )}
+            </>
           ) : (
             <>
-              {/* Panel actions first to avoid accidental commits */}
-              {onReview && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={onReview}
-                  disabled={isArchived}
-                  className="text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)]"
-                >
-                  <Code className="w-4 h-4 mr-1" />
-                  Review
-                </Button>
-              )}
-              {onEditor && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={onEditor}
-                  disabled={isArchived}
-                  className="text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)]"
-                >
-                  <FileCode className="w-4 h-4 mr-1" />
-                  Editor
-                </Button>
-              )}
-              {/* Vertical separator */}
-              <div className="w-px h-6 bg-[var(--color-border)] mx-1" />
+              {/* Desktop: Commit Rebase Sync Merge | ... (dropdown) | Workspace */}
+
               {/* Git actions */}
               {onCommit && (
                 <Button
@@ -350,6 +421,7 @@ export function TaskInfoPanel({
                   Merge
                 </Button>
               )}
+
               {/* Dangerous actions in dropdown */}
               {(onArchive || onReset || onClean) && (
                 <DropdownMenu
@@ -361,7 +433,7 @@ export function TaskInfoPanel({
                       icon: Archive,
                       onClick: onArchive,
                       variant: "warning" as const,
-                      disabled: isBroken,
+                      disabled: false,
                     }] : []),
                     ...(onReset ? [{
                       id: "reset",
@@ -381,10 +453,16 @@ export function TaskInfoPanel({
                   ]}
                 />
               )}
-              {onEnterTerminal && (
-                <Button variant="secondary" size="sm" onClick={onEnterTerminal}>
-                  <Terminal className="w-4 h-4 mr-1" />
-                  Terminal
+
+              {/* Workspace 按钮 */}
+              {onEnterWorkspace && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={onEnterWorkspace}
+                >
+                  <ChevronRight className="w-4 h-4 mr-1" />
+                  Workspace
                 </Button>
               )}
             </>
@@ -392,23 +470,8 @@ export function TaskInfoPanel({
         </div>
       </div>
 
-      {/* Task Name */}
-      <div className="px-3 py-2 border-b border-[var(--color-border)]">
-        <div className="flex items-center gap-1.5">
-          <h2 className="text-sm font-semibold text-[var(--color-text)] truncate">
-            {task.name}
-          </h2>
-          {projectName && (
-            <span className="flex-shrink-0 px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-text-muted)] bg-[var(--color-bg-tertiary)] rounded">{projectName}</span>
-          )}
-        </div>
-        <p className="text-xs text-[var(--color-text-muted)] font-mono truncate">
-          {task.branch} → {task.target}
-        </p>
-      </div>
-
       {/* Tab Navigation */}
-      <div className="relative flex border-b border-[var(--color-border)] bg-[var(--color-bg)]">
+      <div className="relative flex border-b border-[var(--color-border)] bg-[var(--color-bg)] select-none">
         {TABS.map((tab) => {
           const Icon = tab.icon;
           const isActive = activeTab === tab.id;
@@ -450,7 +513,7 @@ export function TaskInfoPanel({
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -10 }}
             transition={{ duration: 0.15 }}
-            className="flex-1 min-h-0 overflow-y-auto"
+            className="flex-1 min-h-0 overflow-y-auto pb-3"
           >
             {renderTabContent()}
           </motion.div>

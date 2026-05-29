@@ -1,35 +1,932 @@
-import ReactMarkdown from "react-markdown";
+import { Children, isValidElement, useState, useEffect, useRef, useId, memo, useMemo } from "react";
+import { Check, Code, Copy, FileText, Hash, Loader2, Play, Terminal, WrapText } from "lucide-react";
+import { renderD2 } from "../../api";
+import type { RenderD2Error } from "../../api";
+import ReactMarkdown, { type Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import mermaid from "mermaid";
+import { VSCodeIcon } from "./VSCodeIcon";
+import { SketchChip } from "./SketchChip";
+import { sketchThumbnailUrl } from "../../api/sketches";
+import { highlightLines, normalizeLanguage } from "../Review/syntaxHighlight";
+import { createSlugger } from "./headingSlug";
+import { useTheme } from "../../context/ThemeContext";
+
+/** Languages whose code blocks may be executed in the terminal. */
+const RUNNABLE_SHELL_LANGS = new Set(["bash", "sh", "shell", "zsh"]);
+
+/** Event name for command injection into an active XTerminal. */
+export const TERMINAL_INJECT_EVENT = "grove:terminal-inject";
+
+export interface TerminalInjectDetail {
+  command: string;
+}
+
+// Match file paths like `path/to/file.ext` or `path/to/file.ext:123`.
+// Accept Unicode and other non-ASCII characters in path segments.
+const FILE_PATH_RE = /^(.+\/[^/]+?\.[A-Za-z0-9]+)(?::(\d+))?[,.]?$/;
+
+// Match local file hrefs after decoding percent-encoded characters.
+// e.g. "service/foo.go", "/abs/path/中文名.md", or ends with "#L505"
+const FILE_HREF_RE = /^(.+\/[^/]+?\.[A-Za-z0-9]+)(?:[:#]L?(\d+))?$/;
+
+// Matches `sketch-<uuid>`. Used to validate `sketch://` hrefs.
+const SKETCH_ID_RE = /^sketch-[0-9a-f-]+$/i;
+
+// Wrap bare `sketch://sketch-<uuid>` occurrences as markdown autolinks so
+// react-markdown surfaces them through the link renderer, which converts
+// them into <SketchChip>. The negative lookbehind avoids re-wrapping when
+// the URL is already inside `[label](...)` or `[...](...)`.
+const SKETCH_AUTOLINK_RE = /(?<![[(])(sketch:\/\/sketch-[0-9a-f-]+)\b/gi;
+
+function preprocessSketchUrls(content: string): string {
+  if (!content.includes("sketch://")) return content;
+  // Split by fenced code blocks and inline code spans so we don't rewrite
+  // URLs inside code. Odd-indexed parts are the code regions.
+  // Note: an author-written `sketch://...` wrapped in inline backticks is
+  // kept as a <code> span by design — authors opt out of chip rendering by
+  // quoting it. Only non-code occurrences become clickable chips.
+  const parts = content.split(/(```[\s\S]*?```|`[^`\n]+`)/g);
+  for (let i = 0; i < parts.length; i += 2) {
+    parts[i] = parts[i].replace(SKETCH_AUTOLINK_RE, (m) => `[${m}](${m})`);
+  }
+  return parts.join("");
+}
+
+// Match inline code spans whose content, after collapsing whitespace, is a
+// bare http(s) URL or a `sketch://sketch-<uuid>` ref. Agents (notably
+// claude-code ACP) often wrap links in backticks without meaning "this is
+// code" — that would render as a non-clickable `<code>` span and, for
+// sketch refs, suppress chip rendering downstream. We unwrap so remark-gfm
+// autolinks http(s), and so preprocessSketchUrls can wrap sketch refs.
+// - Single-backtick inline spans only (skip ``` fences elsewhere).
+// - Allow newlines/whitespace inside the span; we strip them.
+const INLINE_CODE_URL_RE = /`([^`]+?)`/g;
+const SKETCH_BARE_RE = /^sketch:\/\/sketch-[0-9a-f-]+$/i;
+
+function preprocessInlineCodeUrls(content: string): string {
+  if (!content.includes("`")) return content;
+  // Don't touch fenced code blocks; only rewrite inline spans outside them.
+  const parts = content.split(/(```[\s\S]*?```)/g);
+  for (let i = 0; i < parts.length; i += 2) {
+    parts[i] = parts[i].replace(INLINE_CODE_URL_RE, (m, inner: string) => {
+      const collapsed = inner.replace(/\s+/g, "");
+      if (/^https?:\/\/\S+$/.test(collapsed)) return collapsed;
+      if (SKETCH_BARE_RE.test(collapsed)) return collapsed;
+      return m;
+    });
+  }
+  return parts.join("");
+}
+
+function cssVar(name: string, fallback: string): string {
+  if (typeof window === "undefined") return fallback;
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return value || fallback;
+}
+
+function isDarkColor(color: string): boolean {
+  const match = color.trim().match(/^#([0-9a-f]{6})$/i);
+  if (!match) return true;
+  const hex = match[1];
+  const r = parseInt(hex.slice(0, 2), 16);
+  const g = parseInt(hex.slice(2, 4), 16);
+  const b = parseInt(hex.slice(4, 6), 16);
+  const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+  return luminance < 0.5;
+}
+
+function getMermaidConfig() {
+  const bg = cssVar("--color-bg", "#0a0a0b");
+  const bgSecondary = cssVar("--color-bg-secondary", "#141416");
+  const bgTertiary = cssVar("--color-bg-tertiary", "#1c1c1f");
+  const border = cssVar("--color-border", "#27272a");
+  const text = cssVar("--color-text", "#fafafa");
+  const textMuted = cssVar("--color-text-muted", "#71717a");
+  const highlight = cssVar("--color-highlight", "#10b981");
+  const darkMode = isDarkColor(bg);
+
+  return {
+    startOnLoad: false,
+    theme: "base" as const,
+    themeVariables: {
+      darkMode,
+      background: "transparent",
+      fontFamily: "inherit",
+      primaryColor: bgSecondary,
+      primaryTextColor: text,
+      primaryBorderColor: border,
+      secondaryColor: bgTertiary,
+      secondaryTextColor: text,
+      secondaryBorderColor: border,
+      tertiaryColor: bg,
+      tertiaryTextColor: text,
+      tertiaryBorderColor: border,
+      lineColor: textMuted,
+      textColor: text,
+      mainBkg: bgSecondary,
+      nodeBkg: bgSecondary,
+      nodeTextColor: text,
+      clusterBkg: bg,
+      clusterBorder: border,
+      defaultLinkColor: textMuted,
+      titleColor: text,
+      edgeLabelBackground: bg,
+      actorBkg: bgSecondary,
+      actorBorder: border,
+      actorTextColor: text,
+      actorLineColor: textMuted,
+      signalColor: textMuted,
+      signalTextColor: text,
+      labelBoxBkgColor: bg,
+      labelBoxBorderColor: border,
+      labelTextColor: text,
+      loopTextColor: text,
+      noteBkgColor: `color-mix(in srgb, ${highlight} 12%, ${bg})`,
+      noteBorderColor: border,
+      noteTextColor: text,
+      activationBorderColor: border,
+      activationBkgColor: bgTertiary,
+      sequenceNumberColor: text,
+    },
+  };
+}
+
+// Module-level SVG caches: code → rendered SVG string.
+// Survive component re-mounts so cached diagrams are shown instantly.
+const mermaidSvgCache = new Map<string, string>();
+const d2SvgCache = new Map<string, string>();
+
+function SourceToggleButton({ active, onClick }: { active: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={(e) => { e.stopPropagation(); onClick(); }}
+      className="absolute top-2 right-2 z-10 p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity"
+      title={active ? "Show preview" : "Show source"}
+      style={{
+        color: active ? "var(--color-highlight)" : "var(--color-text-muted)",
+        background: active ? "color-mix(in srgb, var(--color-highlight) 12%, transparent)" : "transparent",
+      }}
+    >
+      <Code className="w-3.5 h-3.5" />
+    </button>
+  );
+}
+
+export const MermaidBlock = memo(function MermaidBlock({ code, onPreviewClick }: { code: string; onPreviewClick?: (svg: string) => void }): React.JSX.Element {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const uniqueId = useId();
+  const { theme } = useTheme();
+  const cacheKey = `${theme.id}::${code}`;
+  const [svg, setSvg] = useState<string | null>(() => mermaidSvgCache.get(cacheKey) ?? null);
+  const [error, setError] = useState<string | null>(null);
+  const [showSource, setShowSource] = useState(false);
+
+  /* eslint-disable react-hooks/set-state-in-effect */
+  useEffect(() => {
+    const cached = mermaidSvgCache.get(cacheKey);
+    if (cached) {
+      setSvg(cached);
+      setError(null);
+      return;
+    }
+
+    // Debounce rendering so rapidly-changing streaming code doesn't fire mermaid on every token.
+    // The old svg (if any) stays visible during the debounce window — no loading flash.
+    const timer = window.setTimeout(() => {
+      let cancelled = false;
+      const id = `mermaid-${uniqueId.replace(/:/g, "")}`;
+      // 即使前置 parse + .catch 兜底,异常路径下 mermaid 仍可能在 document.body
+      // 留下 `#d{id}` 或 `#${id}` 临时节点。每次 effect 跑前先扫一遍清掉,
+      // 避免长会话下泄漏堆积。
+      const cleanupStrayNodes = () => {
+        document.getElementById(id)?.remove();
+        document.getElementById(`d${id}`)?.remove();
+      };
+      cleanupStrayNodes();
+      try {
+        mermaid.initialize(getMermaidConfig());
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        return () => { cancelled = true; };
+      }
+      // Pre-validate: mermaid.render leaks a `#d{id}` temp container in document.body
+      // on parse failure. parse({ suppressErrors: true }) lets us bail before render
+      // ever touches the DOM — important during streaming when intermediate code
+      // states are syntactically invalid.
+      mermaid
+        .parse(code, { suppressErrors: true })
+        .then((ok) => {
+          if (cancelled) return;
+          if (ok === false) {
+            // parse passed but returned false — try render for a detailed
+            // error message. If render then throws, surface its message
+            // instead of a generic "Syntax error" so the user sees the
+            // actual mermaid complaint.
+            return mermaid.render(id, code).then(
+              () => {
+                if (!cancelled) setError("Syntax error in text");
+              },
+              (err: unknown) => {
+                if (cancelled) return;
+                const m =
+                  err instanceof Error
+                    ? err.message
+                    : typeof err === "string"
+                      ? err
+                      : null;
+                setError(m && m.length > 0 ? m : "Syntax error in text");
+              },
+            );
+          }
+          return mermaid.render(id, code).then(({ svg: rendered }) => {
+            if (!cancelled) {
+              mermaidSvgCache.set(cacheKey, rendered);
+              setSvg(rendered);
+              setError(null);
+            }
+          });
+        })
+        .catch((err) => {
+          if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+        })
+        .finally(cleanupStrayNodes);
+      return () => {
+        cancelled = true;
+        cleanupStrayNodes();
+      };
+    }, 300);
+
+    return () => window.clearTimeout(timer);
+  }, [cacheKey, code, uniqueId, theme.id, theme.colors.bg, theme.colors.bgSecondary, theme.colors.bgTertiary, theme.colors.border, theme.colors.text, theme.colors.textMuted, theme.colors.highlight]);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  if (error && showSource) {
+    return (
+      <div className="group relative rounded-lg border border-[var(--color-border)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)] my-2 overflow-hidden">
+        <SourceToggleButton active={showSource} onClick={() => setShowSource(false)} />
+        <pre className="p-3 text-xs font-mono whitespace-pre-wrap break-words leading-relaxed overflow-x-auto" style={{ color: "var(--color-text)" }}>{code}</pre>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="group relative rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] my-2 overflow-hidden">
+        <SourceToggleButton active={showSource} onClick={() => setShowSource(true)} />
+        <div className="p-3">
+          <div className="text-xs font-mono text-[var(--color-danger)] whitespace-pre-wrap break-words">{error}</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!svg) {
+    return (
+      <div className="rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] p-4 my-2 flex items-center justify-center text-xs text-[var(--color-text-muted)]">
+        Rendering diagram...
+      </div>
+    );
+  }
+
+  if (showSource) {
+    return (
+      <div className="group relative rounded-lg border border-[var(--color-border)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)] my-2 overflow-hidden">
+        <SourceToggleButton active={showSource} onClick={() => setShowSource(false)} />
+        <pre className="p-3 text-xs font-mono whitespace-pre-wrap break-words leading-relaxed overflow-x-auto" style={{ color: "var(--color-text)" }}>{code}</pre>
+      </div>
+    );
+  }
+
+  return (
+    <div ref={containerRef} className="group relative my-2">
+      <SourceToggleButton active={showSource} onClick={() => setShowSource(true)} />
+      <div
+        className={`rounded-lg border border-[var(--color-border)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)] p-3 overflow-x-auto flex justify-center [&_svg]:max-w-full ${onPreviewClick ? "cursor-pointer hover:border-[var(--color-highlight)] transition-colors" : ""}`}
+        dangerouslySetInnerHTML={{ __html: svg }}
+        onClick={onPreviewClick ? () => {
+          const responsive = svg
+            .replace(/\s*width="[^"]*"/, ' width="100%"')
+            .replace(/\s*height="[^"]*"/, ' height="100%"')
+            .replace(/(<svg[^>]*?)(?=\s*>)/, '$1 style="max-width:90vw;max-height:85vh;width:auto;height:auto;" preserveAspectRatio="xMidYMid meet"');
+          onPreviewClick(responsive);
+        } : undefined}
+      />
+    </div>
+  );
+});
+
+export const D2Block = memo(function D2Block({
+  code,
+  onPreviewClick,
+}: {
+  code: string;
+  onPreviewClick?: (svg: string) => void;
+}): React.JSX.Element {
+  const [state, setState] = useState<'idle' | 'loading' | 'success' | 'not_installed' | 'error'>(
+    () => d2SvgCache.has(code) ? 'success' : 'idle'
+  );
+  const [svg, setSvg] = useState<string>(() => d2SvgCache.get(code) ?? '');
+  const [errorMsg, setErrorMsg] = useState<string>('');
+  const [showSource, setShowSource] = useState(false);
+  useEffect(() => {
+    // If already cached, skip API call entirely
+    if (d2SvgCache.has(code)) {
+      const cached = d2SvgCache.get(code)!;
+      setSvg(cached); // eslint-disable-line react-hooks/set-state-in-effect
+      setState('success');
+      return;
+    }
+    // Debounce: wait 800ms after code stops changing before calling API.
+    // This prevents rapid re-renders while AI is streaming.
+    const timer = setTimeout(() => {
+      setState('loading');
+      renderD2(code)
+        .then((result) => { d2SvgCache.set(code, result); setSvg(result); setState('success'); })
+        .catch((err: RenderD2Error) => {
+          if (err.code === 'd2_not_installed') setState('not_installed');
+          else { setErrorMsg(err.message || 'Render failed'); setState('error'); }
+        });
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [code]);
+
+  if (showSource) {
+    return (
+      <div className="group relative rounded-lg border border-[var(--color-border)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)] my-2 overflow-hidden">
+        <SourceToggleButton active={showSource} onClick={() => setShowSource(false)} />
+        <pre className="p-3 text-xs font-mono whitespace-pre-wrap break-words leading-relaxed overflow-x-auto" style={{ color: "var(--color-text)" }}>{code}</pre>
+      </div>
+    );
+  }
+
+  // While debouncing: show last known SVG if available, otherwise spinner
+  if (state === 'idle' || state === 'loading') {
+    if (svg) {
+      const responsive = svg
+        .replace(/\s*width="[^"]*"/, ' width="100%"')
+        .replace(/\s*height="[^"]*"/, ' height="100%"');
+      return (
+        <div className="group relative my-2 opacity-60">
+          <SourceToggleButton active={false} onClick={() => setShowSource(true)} />
+          <div
+            className={`flex items-center justify-center [&_svg]:max-w-full${onPreviewClick ? ' cursor-pointer hover:opacity-80 transition-opacity' : ''}`}
+            dangerouslySetInnerHTML={{ __html: responsive }}
+            onClick={onPreviewClick ? () => onPreviewClick(responsive) : undefined}
+          />
+        </div>
+      );
+    }
+    return (
+      <div className="flex items-center justify-center py-6">
+        <Loader2 className="w-4 h-4 animate-spin" style={{ color: 'var(--color-text-muted)' }} />
+      </div>
+    );
+  }
+
+  if (state === 'not_installed') {
+    return (
+      <div className="group relative rounded-lg px-4 py-3 my-2 text-xs"
+        style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}>
+        <SourceToggleButton active={false} onClick={() => setShowSource(true)} />
+        <p className="font-medium mb-1" style={{ color: 'var(--color-text)' }}>d2 not installed</p>
+        <code className="font-mono" style={{ color: 'var(--color-text-muted)' }}>brew install d2</code>
+      </div>
+    );
+  }
+
+  if (state === 'error') {
+    return (
+      <div className="group relative rounded-lg px-4 py-3 my-2 text-xs"
+        style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)', color: 'var(--color-error)' }}>
+        <SourceToggleButton active={false} onClick={() => setShowSource(true)} />
+        {errorMsg || 'Render failed'}
+      </div>
+    );
+  }
+
+  const responsive = svg
+    .replace(/\s*width="[^"]*"/, ' width="100%"')
+    .replace(/\s*height="[^"]*"/, ' height="100%"');
+
+  return (
+    <div className="group relative my-2">
+      <SourceToggleButton active={showSource} onClick={() => setShowSource(true)} />
+      <div
+        className={`flex items-center justify-center [&_svg]:max-w-full${onPreviewClick ? ' cursor-pointer hover:opacity-80 transition-opacity' : ''}`}
+        dangerouslySetInnerHTML={{ __html: responsive }}
+        onClick={onPreviewClick ? () => onPreviewClick(svg) : undefined}
+      />
+    </div>
+  );
+});
+
+/** Language display metadata: friendly label + icon. */
+const LANG_META: Record<string, { label: string; Icon: typeof Code }> = {
+  bash: { label: "bash", Icon: Terminal },
+  sh: { label: "shell", Icon: Terminal },
+  shell: { label: "shell", Icon: Terminal },
+  zsh: { label: "zsh", Icon: Terminal },
+  powershell: { label: "powershell", Icon: Terminal },
+  ps1: { label: "powershell", Icon: Terminal },
+  dockerfile: { label: "dockerfile", Icon: Terminal },
+  makefile: { label: "makefile", Icon: Terminal },
+  javascript: { label: "javascript", Icon: Code },
+  js: { label: "javascript", Icon: Code },
+  jsx: { label: "jsx", Icon: Code },
+  typescript: { label: "typescript", Icon: Code },
+  ts: { label: "typescript", Icon: Code },
+  tsx: { label: "tsx", Icon: Code },
+  python: { label: "python", Icon: Code },
+  py: { label: "python", Icon: Code },
+  rust: { label: "rust", Icon: Code },
+  rs: { label: "rust", Icon: Code },
+  go: { label: "go", Icon: Code },
+  java: { label: "java", Icon: Code },
+  kotlin: { label: "kotlin", Icon: Code },
+  swift: { label: "swift", Icon: Code },
+  cpp: { label: "c++", Icon: Code },
+  c: { label: "c", Icon: Code },
+  ruby: { label: "ruby", Icon: Code },
+  rb: { label: "ruby", Icon: Code },
+  php: { label: "php", Icon: Code },
+  sql: { label: "sql", Icon: Code },
+  json: { label: "json", Icon: Code },
+  yaml: { label: "yaml", Icon: Code },
+  yml: { label: "yaml", Icon: Code },
+  toml: { label: "toml", Icon: Code },
+  html: { label: "html", Icon: Code },
+  css: { label: "css", Icon: Code },
+  scss: { label: "scss", Icon: Code },
+  markdown: { label: "markdown", Icon: FileText },
+  md: { label: "markdown", Icon: FileText },
+  diff: { label: "diff", Icon: Code },
+};
+
+function getLangMeta(lang: string | undefined): { label: string; Icon: typeof Code } {
+  if (!lang) return { label: "text", Icon: FileText };
+  const key = lang.toLowerCase();
+  if (LANG_META[key]) return LANG_META[key];
+  return { label: key, Icon: Code };
+}
+
+/** Header icon button — thin, always-visible, subtle hover. */
+function HeaderButton({
+  onClick,
+  title,
+  icon: Icon,
+  active,
+  hoverTone,
+}: {
+  onClick: () => void;
+  title: string;
+  icon: typeof Code;
+  active?: boolean;
+  hoverTone?: "default" | "accent" | "success";
+}) {
+  const toneColor =
+    hoverTone === "accent"
+      ? "var(--color-highlight)"
+      : hoverTone === "success"
+        ? "var(--color-success)"
+        : "var(--color-text)";
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-label={title}
+      className="inline-flex h-6 w-6 items-center justify-center rounded-md transition-colors"
+      style={{
+        color: active ? toneColor : "var(--color-text-muted)",
+        background: active ? "color-mix(in srgb, var(--color-text-muted) 10%, transparent)" : "transparent",
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.color = toneColor;
+        e.currentTarget.style.background = "color-mix(in srgb, var(--color-text-muted) 12%, transparent)";
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.color = active ? toneColor : "var(--color-text-muted)";
+        e.currentTarget.style.background = active ? "color-mix(in srgb, var(--color-text-muted) 10%, transparent)" : "transparent";
+      }}
+    >
+      <Icon className="h-3.5 w-3.5" />
+    </button>
+  );
+}
+
+function CodeBlock({
+  code,
+  language,
+  enableRunCommand,
+}: {
+  code: string;
+  language?: string;
+  enableRunCommand?: boolean;
+}): React.JSX.Element {
+  const [copied, setCopied] = useState(false);
+  const [isWrapped, setIsWrapped] = useState(true); // Default: soft-wrap on
+  const [showLineNumbers, setShowLineNumbers] = useState(true);
+
+  const normalizedLanguage = normalizeLanguage(language);
+  const rawLines = useMemo(() => code.split("\n"), [code]);
+  // Render raw text on first paint, then upgrade to highlighted HTML when the
+  // browser is idle. Large markdown docs with several big code blocks would
+  // otherwise block the first frame for hundreds of ms while highlight.js
+  // tokenizes everything synchronously.
+  const escapedLines = useMemo(
+    () => rawLines.map((l) => l.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")),
+    [rawLines],
+  );
+  // Key the cached highlight to the inputs it was computed from. When the
+  // code or language changes, the stale highlight is discarded immediately
+  // (line count mismatch would otherwise misalign rows in the render loop)
+  // and we fall back to escaped raw text until the idle upgrade lands.
+  const [highlighted, setHighlighted] = useState<{ key: string; lines: string[] } | null>(null);
+  const highlightKey = `${normalizedLanguage ?? ""}\x00${code}`;
+  const highlightedLines = highlighted?.key === highlightKey ? highlighted.lines : escapedLines;
+  useEffect(() => {
+    let cancelled = false;
+    const run = () => {
+      if (cancelled) return;
+      const out = highlightLines(rawLines, normalizedLanguage);
+      if (!cancelled) setHighlighted({ key: highlightKey, lines: out });
+    };
+    type IdleWindow = Window & {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    const w = window as IdleWindow;
+    if (typeof w.requestIdleCallback === "function") {
+      const handle = w.requestIdleCallback(run, { timeout: 200 });
+      return () => {
+        cancelled = true;
+        w.cancelIdleCallback?.(handle);
+      };
+    }
+    const handle = window.setTimeout(run, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+    };
+    // `highlightKey` is derived from `code` + `normalizedLanguage` and used
+    // inside the closure for cache-keying, but it MUST NOT appear in the
+    // deps array on its own — it's a string identity that changes with
+    // every keystroke during streaming and would re-fire the highlight
+    // effect more often than needed. Tracking the underlying inputs gives
+    // the same correctness with less churn.
+  }, [code, normalizedLanguage]); // eslint-disable-line react-hooks/exhaustive-deps -- highlightKey/rawLines are derived
+
+  const isRunnable =
+    !!enableRunCommand &&
+    RUNNABLE_SHELL_LANGS.has((normalizedLanguage || language || "").toLowerCase());
+  const { label: langLabel, Icon: LangIcon } = getLangMeta(normalizedLanguage || language);
+  const lineNumWidth = `${String(rawLines.length).length}ch`;
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1400);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  const handleRun = () => {
+    const event = new CustomEvent<TerminalInjectDetail>(TERMINAL_INJECT_EVENT, {
+      detail: { command: code },
+    });
+    window.dispatchEvent(event);
+  };
+
+  // Solid "gutter" color used behind sticky line numbers so code doesn't
+  // scroll into them. Slightly tinted from the chat bg for visible separation.
+  const gutterBg = "color-mix(in srgb, var(--color-text) 4%, var(--color-bg))";
+
+  return (
+    <div
+      className="markdown-code-block my-2 overflow-hidden rounded-xl border"
+      style={{
+        borderColor: "color-mix(in srgb, var(--color-border) 90%, transparent)",
+        background: "transparent",
+      }}
+    >
+      {/* Header bar — subtle gray tint (visible but not overpowering) */}
+      <div
+        data-grove-search-skip="true"
+        className="flex items-center justify-between gap-2 px-3 py-1.5 border-b"
+        style={{
+          borderColor: "color-mix(in srgb, var(--color-border) 80%, transparent)",
+          background: "color-mix(in srgb, var(--color-text) 6%, transparent)",
+        }}
+      >
+        <div className="flex min-w-0 items-center gap-1.5">
+          <LangIcon className="h-3.5 w-3.5 shrink-0" style={{ color: "var(--color-text-muted)" }} />
+          <span
+            className="truncate font-mono text-[11px] lowercase tracking-wide"
+            style={{ color: "var(--color-text-muted)" }}
+          >
+            {langLabel}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-0.5">
+          <HeaderButton
+            onClick={() => setIsWrapped((v) => !v)}
+            title={isWrapped ? "Disable word wrap" : "Enable word wrap"}
+            icon={WrapText}
+            active={isWrapped}
+          />
+          <HeaderButton
+            onClick={() => setShowLineNumbers((v) => !v)}
+            title={showLineNumbers ? "Hide line numbers" : "Show line numbers"}
+            icon={Hash}
+            active={showLineNumbers}
+          />
+          {isRunnable && (
+            <HeaderButton
+              onClick={handleRun}
+              title="Run in a new Terminal tab"
+              icon={Play}
+              hoverTone="accent"
+            />
+          )}
+          <HeaderButton
+            onClick={handleCopy}
+            title={copied ? "Copied" : "Copy code"}
+            icon={copied ? Check : Copy}
+            hoverTone={copied ? "success" : "default"}
+          />
+        </div>
+      </div>
+
+      {/* Code body — transparent so it inherits chat bg */}
+      <div className={isWrapped ? "" : "overflow-x-auto"}>
+        <div
+          className="font-mono text-[13px] leading-6"
+          style={{ color: "var(--color-text)" }}
+        >
+          {rawLines.map((_, i) => {
+            const isFirst = i === 0;
+            const isLast = i === rawLines.length - 1;
+            const edgePad = `${isFirst ? "pt-3 " : ""}${isLast ? "pb-3" : ""}`.trim();
+            return (
+              <div key={i} className="flex items-stretch">
+                {showLineNumbers && (
+                  <span
+                    data-grove-search-skip="true"
+                    className={`shrink-0 select-none pr-3 pl-4 text-right sticky left-0 ${edgePad}`}
+                    style={{
+                      color: "color-mix(in srgb, var(--color-text-muted) 60%, transparent)",
+                      minWidth: `calc(${lineNumWidth} + 1.75rem)`,
+                      background: gutterBg,
+                    }}
+                  >
+                    {i + 1}
+                  </span>
+                )}
+                <code
+                  className={`block flex-1 ${showLineNumbers ? "pr-4 pl-3" : "px-4"} ${edgePad} ${isWrapped ? "whitespace-pre-wrap break-all" : "whitespace-pre"}`}
+                  dangerouslySetInnerHTML={{ __html: highlightedLines[i] || "&nbsp;" }}
+                />
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 interface MarkdownRendererProps {
   content: string;
+  /** When provided, inline code matching file path patterns become clickable.
+   *  Must return whether the navigation succeeded — `false` triggers the
+   *  FileChip to fall back to its original markdown rendering (raw <code>
+   *  or <a>) so the user can still see / copy the path. */
+  onFileClick?: (filePath: string, line?: number) => Promise<boolean>;
+  /** When provided, relative image src values are resolved via this function */
+  resolveImageUrl?: (src: string) => string;
+  /** When provided, clicking a rendered mermaid diagram triggers this callback with the SVG */
+  onMermaidClick?: (svg: string) => void;
+  /** When provided, clicking a rendered D2 diagram triggers this callback with the SVG */
+  onD2Click?: (svg: string) => void;
+  /** When provided, clicking an inline image triggers this callback with the resolved URL */
+  onImageClick?: (url: string) => void;
+  /** When true, bash/sh/shell code blocks get a Run button that pastes into the active terminal */
+  enableRunCommand?: boolean;
+  /** When provided, `sketch://<sketch-uuid>` references render as a clickable
+   * sketch chip scoped to this Studio task. Chip labels resolve uuid → name
+   * from this task's sketch index; unknown uuids render as a disabled chip. */
+  sketchContext?: { projectId: string; taskId: string };
+  /** How `sketch://` links render when `sketchContext` is provided.
+   *  - `'chip'` (default): inline SketchChip pill (chat / agent reply UX).
+   *  - `'image'`: inline `<img>` of the sketch render; falls back to plain
+   *    text on 404 / unknown id / load error. Used by the file preview pane
+   *    where a visual is more useful than a label.
+   *  Click behavior in `'image'` mode reuses `onImageClick` (lightbox),
+   *  matching how authored images behave in the same surface. */
+  sketchRenderMode?: "chip" | "image";
+  /** Emit GitHub-style auto-generated `id` attributes on headings. Off by
+   * default: chat / notes / agent replies share one DOM, and stable global
+   * heading ids would collide across messages. Opt in only on surfaces that
+   * own their preview pane (file preview drawer, code review preview). */
+  enableHeadingIds?: boolean;
 }
 
-export function MarkdownRenderer({ content }: MarkdownRendererProps) {
+/** Extract filename from a full file path */
+function getFileName(filePath: string): string {
+  const parts = filePath.split("/");
+  return parts[parts.length - 1];
+}
+
+/** Render an inline file chip with VSCode icon */
+function FileChip({
+  filePath,
+  line,
+  onClick,
+  fallback,
+}: {
+  filePath: string;
+  line?: number;
+  onClick: () => Promise<boolean>;
+  /** Rendered in place of the chip when navigation reports the file is
+   *  missing — restores the original markdown element (raw <code> or <a>)
+   *  so the full path stays visible / selectable. */
+  fallback: React.ReactNode;
+}) {
+  // All hooks first — keep useState (and any future hooks) above the
+  // early-return so the hook order stays stable across the missing
+  // transition. React would otherwise throw "Rendered fewer hooks than
+  // expected" the moment we add a second hook here.
+  // Reset `missing` whenever the chip's target changes. Same FileChip
+  // instance can be reused for a different file as parent re-renders (e.g.
+  // streaming markdown re-emits the same DOM slot with new props); without
+  // this reset, a once-missing path stays collapsed even after the user
+  // retargets to a file that does exist. Uses the canonical React "reset
+  // state on prop change" pattern (https://react.dev/learn/you-might-not-need-an-effect#resetting-all-state-when-a-prop-changes)
+  // — derive in render via a tracker state, not a useEffect.
+  const [missing, setMissing] = useState(false);
+  const [trackedTarget, setTrackedTarget] = useState({ filePath, line });
+  let effectiveMissing = missing;
+  if (trackedTarget.filePath !== filePath || trackedTarget.line !== line) {
+    setTrackedTarget({ filePath, line });
+    setMissing(false);
+    effectiveMissing = false;
+  }
+  const fileName = getFileName(filePath);
+  const lineLabel = line ? `:${line}` : "";
+  const handleClick = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const ok = await onClick();
+    if (!ok) setMissing(true);
+  };
+  if (effectiveMissing) return <>{fallback}</>;
   return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      components={{
-        h1: ({ children }) => (
-          <h1 className="text-lg font-bold text-[var(--color-text)] mt-4 mb-2 first:mt-0">{children}</h1>
+    <button
+      type="button"
+      onClick={handleClick}
+      className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium cursor-pointer
+        bg-[color-mix(in_srgb,var(--color-bg-secondary)_80%,var(--color-bg))]
+        text-[var(--color-highlight)]
+        border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)]
+        hover:bg-[color-mix(in_srgb,var(--color-highlight)_12%,var(--color-bg-secondary))]
+        hover:border-[color-mix(in_srgb,var(--color-highlight)_30%,var(--color-border))]
+        transition-colors align-middle"
+      title={`Open ${filePath}${line ? ` at line ${line}` : ""}`}
+    >
+      <VSCodeIcon filename={fileName} size={13} />
+      <span>{fileName}{lineLabel}</span>
+    </button>
+  );
+}
+
+/** Render a sketch reference as an inline image of its current PNG render.
+ *  Falls back to plain text on any load failure (404 = thumb never uploaded,
+ *  unknown id, network). The fallback intentionally mirrors what the source
+ *  markdown would have shown if the autolink wrap hadn't run, so authors and
+ *  readers see the same string in both states. */
+function SketchImage({
+  projectId,
+  taskId,
+  sketchId,
+  fallbackText,
+  onImageClick,
+}: {
+  projectId: string;
+  taskId: string;
+  sketchId: string;
+  fallbackText: string;
+  onImageClick?: (url: string) => void;
+}) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <>{fallbackText}</>;
+  const url = sketchThumbnailUrl(projectId, taskId, sketchId);
+  return (
+    <img
+      src={url}
+      alt={fallbackText}
+      className={`max-w-full rounded-lg my-2 border border-[var(--color-border)]${onImageClick ? " cursor-pointer hover:opacity-80 transition-opacity" : ""}`}
+      onClick={onImageClick ? () => onImageClick(url) : undefined}
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
+/** Extract plain text from React children recursively */
+function extractText(children: React.ReactNode): string {
+  let text = "";
+  Children.forEach(children, (child) => {
+    if (typeof child === "string") {
+      text += child;
+    } else if (typeof child === "number") {
+      text += String(child);
+    } else if (isValidElement(child)) {
+      const props = child.props as Record<string, unknown>;
+      if (props.children) {
+        text += extractText(props.children as React.ReactNode);
+      }
+    }
+  });
+  return text;
+}
+
+function parseFileHref(href: string): { filePath: string; line?: number } | null {
+  if (/^(https?:\/\/|mailto:)/.test(href)) {
+    return null;
+  }
+
+  let decodedHref = href;
+  try {
+    decodedHref = decodeURIComponent(href);
+  } catch {
+    // Keep the raw href when decoding fails so plain ASCII paths still work.
+  }
+
+  if (decodedHref.startsWith("file://")) {
+    decodedHref = decodedHref.slice("file://".length);
+  }
+
+  const hrefMatch = decodedHref.match(FILE_HREF_RE);
+  if (!hrefMatch) {
+    return null;
+  }
+
+  return {
+    filePath: hrefMatch[1],
+    line: hrefMatch[2] ? parseInt(hrefMatch[2], 10) : undefined,
+  };
+}
+
+export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFileClick, resolveImageUrl, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode = "chip", enableHeadingIds }: MarkdownRendererProps) {
+  const processedContent = useMemo(() => {
+    let out = preprocessInlineCodeUrls(content);
+    if (sketchContext) out = preprocessSketchUrls(out);
+    return out;
+  }, [content, sketchContext]);
+  // Slugger must reset every render: react-markdown calls heading components
+  // in document order, so a per-render slugger sees each heading once and
+  // produces GitHub-style `-1`, `-2` suffixes for repeats. We hold it in a
+  // ref so the memoized `components` closure can read fresh state without
+  // invalidating the memo. Mutating a ref during render is normally a smell;
+  // here it's a documented "render cache reset" pattern.
+  const sluggerRef = useRef<(text: string) => string>(createSlugger());
+  // eslint-disable-next-line react-hooks/refs
+  sluggerRef.current = createSlugger();
+  const components = useMemo((): Components => {
+    const slug = (children: React.ReactNode, fallback: string | undefined) => {
+      if (fallback) return fallback;
+      if (!enableHeadingIds) return undefined;
+      return sluggerRef.current(extractText(children));
+    };
+    return ({
+        h1: ({ children, ...props }) => (
+          <h1 id={slug(children, props.id)} className="text-lg font-bold text-[var(--color-text)] mt-4 mb-2 first:mt-0 scroll-mt-4">{children}</h1>
         ),
-        h2: ({ children }) => (
-          <h2 className="text-base font-semibold text-[var(--color-text)] mt-3 mb-2">{children}</h2>
+        h2: ({ children, ...props }) => (
+          <h2 id={slug(children, props.id)} className="text-base font-semibold text-[var(--color-text)] mt-3 mb-2 scroll-mt-4">{children}</h2>
         ),
-        h3: ({ children }) => (
-          <h3 className="text-sm font-semibold text-[var(--color-text)] mt-3 mb-1">{children}</h3>
+        h3: ({ children, ...props }) => (
+          <h3 id={slug(children, props.id)} className="text-sm font-semibold text-[var(--color-text)] mt-3 mb-1 scroll-mt-4">{children}</h3>
         ),
-        h4: ({ children }) => (
-          <h4 className="text-sm font-medium text-[var(--color-text)] mt-2 mb-1">{children}</h4>
+        h4: ({ children, ...props }) => (
+          <h4 id={slug(children, props.id)} className="text-sm font-medium text-[var(--color-text)] mt-2 mb-1 scroll-mt-4">{children}</h4>
         ),
-        h5: ({ children }) => (
-          <h5 className="text-xs font-semibold text-[var(--color-text)] mt-2 mb-1">{children}</h5>
+        h5: ({ children, ...props }) => (
+          <h5 id={slug(children, props.id)} className="text-xs font-semibold text-[var(--color-text)] mt-2 mb-1 scroll-mt-4">{children}</h5>
         ),
-        h6: ({ children }) => (
-          <h6 className="text-xs font-medium text-[var(--color-text-muted)] mt-2 mb-1">{children}</h6>
+        h6: ({ children, ...props }) => (
+          <h6 id={slug(children, props.id)} className="text-xs font-medium text-[var(--color-text-muted)] mt-2 mb-1 scroll-mt-4">{children}</h6>
         ),
         p: ({ children }) => (
-          <p className="text-sm text-[var(--color-text)] mb-2 last:mb-0 [li>&]:mb-0">{children}</p>
+          <p className="text-sm text-[var(--color-text)] mb-2 last:mb-0 [li>&]:mb-0 break-words">{children}</p>
         ),
         ul: ({ children }) => (
           <ul className="list-disc list-inside text-sm text-[var(--color-text)] mb-2 ml-2 space-y-0.5">{children}</ul>
@@ -38,18 +935,77 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
           <ol className="list-decimal list-inside text-sm text-[var(--color-text)] mb-2 ml-2 space-y-0.5">{children}</ol>
         ),
         li: ({ children }) => (
-          <li className="text-sm text-[var(--color-text)]">{children}</li>
+          <li className="text-sm text-[var(--color-text)] break-words">{children}</li>
         ),
-        a: ({ href, children }) => (
-          <a
-            href={href}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-[var(--color-highlight)] hover:underline"
-          >
-            {children}
-          </a>
-        ),
+        a: ({ href, children }) => {
+          // sketch:// chip — render first so bare sketch URLs never fall
+          // through to the file-path heuristic or the plain link renderer.
+          if (sketchContext && href && href.startsWith("sketch://")) {
+            const id = href.slice("sketch://".length);
+            if (SKETCH_ID_RE.test(id)) {
+              if (sketchRenderMode === "image") {
+                return (
+                  <SketchImage
+                    projectId={sketchContext.projectId}
+                    taskId={sketchContext.taskId}
+                    sketchId={id}
+                    fallbackText={extractText(children) || href}
+                    onImageClick={onImageClick}
+                  />
+                );
+              }
+              return (
+                <SketchChip
+                  projectId={sketchContext.projectId}
+                  taskId={sketchContext.taskId}
+                  sketchId={id}
+                />
+              );
+            }
+          }
+          // Check if the link href looks like a file path (not an external URL)
+          if (onFileClick && href) {
+            const parsedHref = parseFileHref(href);
+            if (parsedHref) {
+              const { filePath, line } = parsedHref;
+              // Also check the link text for "file:line" pattern
+              const text = extractText(children);
+              const textMatch = text.match(FILE_PATH_RE);
+              const finalLine = line ?? (textMatch?.[2] ? parseInt(textMatch[2], 10) : undefined);
+              const fallback = (
+                <a
+                  href={href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[var(--color-highlight)] hover:underline break-words"
+                >
+                  {children}
+                </a>
+              );
+              return (
+                <FileChip
+                  filePath={filePath}
+                  line={finalLine}
+                  onClick={() => onFileClick(filePath, finalLine)}
+                  fallback={fallback}
+                />
+              );
+            }
+          }
+          // External http(s) links are routed through the global click
+          // interceptor in main.tsx (utils/openExternal.ts), which handles
+          // the Tauri-vs-browser split centrally.
+          return (
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[var(--color-highlight)] hover:underline break-words"
+            >
+              {children}
+            </a>
+          );
+        },
         strong: ({ children }) => (
           <strong className="font-semibold text-[var(--color-text)]">{children}</strong>
         ),
@@ -62,23 +1018,84 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
           </blockquote>
         ),
         code: ({ className, children }) => {
-          const isBlock = className?.startsWith("language-");
-          if (isBlock) {
+          const text = extractText(children);
+          // Auto-linkify any code span whose content is a bare http(s) URL —
+          // even if the agent injected whitespace/newlines inside the
+          // backticks, which would otherwise push it into the block branch
+          // below. We collapse internal whitespace to reconstruct the URL.
+          const collapsed = text.replace(/\s+/g, "");
+          if (!className?.startsWith("language-") && /^https?:\/\/\S+$/.test(collapsed)) {
+            // Click handling is done by the global interceptor.
             return (
-              <code className="block text-xs font-mono">{children}</code>
+              <a
+                href={collapsed}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-[var(--color-highlight)] hover:underline break-all cursor-pointer font-mono text-xs"
+              >
+                {collapsed}
+              </a>
             );
           }
+          const isBlock = className?.startsWith("language-") || text.includes("\n");
+          if (isBlock) {
+            if (className === "language-mermaid") {
+              return <MermaidBlock code={text} onPreviewClick={onMermaidClick} />;
+            }
+            if (className === "language-d2") {
+              return <D2Block code={text} onPreviewClick={onD2Click} />;
+            }
+            const language = className?.replace(/^language-/, "");
+            return <CodeBlock code={text.replace(/\n$/, "")} language={language} enableRunCommand={enableRunCommand} />;
+          }
+          // Check if inline code looks like a file path
+          if (onFileClick) {
+            const match = text.match(FILE_PATH_RE);
+            if (match) {
+              const filePath = match[1];
+              const line = match[2] ? parseInt(match[2], 10) : undefined;
+              const fallback = (
+                <code className="px-1 py-0.5 rounded bg-[var(--color-bg-tertiary)] text-[var(--color-highlight)] text-xs font-mono break-all">
+                  {children}
+                </code>
+              );
+              return (
+                <FileChip
+                  filePath={filePath}
+                  line={line}
+                  onClick={() => onFileClick(filePath, line)}
+                  fallback={fallback}
+                />
+              );
+            }
+          }
           return (
-            <code className="px-1 py-0.5 rounded bg-[var(--color-bg-tertiary)] text-[var(--color-highlight)] text-xs font-mono">
+            <code className="px-1 py-0.5 rounded bg-[var(--color-bg-tertiary)] text-[var(--color-highlight)] text-xs font-mono break-all">
               {children}
             </code>
           );
         },
-        pre: ({ children }) => (
-          <pre className="rounded-lg bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] p-3 my-2 overflow-x-auto text-xs font-mono text-[var(--color-text)]">
-            {children}
-          </pre>
-        ),
+        pre: ({ children }) => {
+          return <>{children}</>;
+        },
+        img: ({ src, alt }) => {
+          if (!src) return null;
+          const resolved = resolveImageUrl ? resolveImageUrl(src) : src;
+          return (
+            <img
+              src={resolved}
+              alt={alt ?? ""}
+              className={`max-w-full rounded-lg my-2 border border-[var(--color-border)]${onImageClick ? " cursor-pointer hover:opacity-80 transition-opacity" : ""}`}
+              onClick={onImageClick ? () => onImageClick(resolved) : undefined}
+              onError={(e) => {
+                const el = e.currentTarget;
+                el.style.display = 'none';
+                const placeholder = el.nextElementSibling as HTMLElement | null;
+                if (placeholder) placeholder.style.display = 'inline-flex';
+              }}
+            />
+          );
+        },
         hr: () => (
           <hr className="border-[var(--color-border)] my-3" />
         ),
@@ -112,9 +1129,21 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
           }
           return <input {...props} />;
         },
+    });
+  }, [onFileClick, resolveImageUrl, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode, enableHeadingIds]);
+
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={components}
+      urlTransform={(url) => {
+        if (url.startsWith("sketch://")) return url;
+        if (/^data:image\//i.test(url)) return url;
+        if (url.startsWith("file://")) return url;
+        return defaultUrlTransform(url);
       }}
     >
-      {content}
+      {processedContent}
     </ReactMarkdown>
   );
-}
+});

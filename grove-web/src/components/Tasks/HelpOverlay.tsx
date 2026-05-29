@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { X } from "lucide-react";
 import { KeyBadge } from "../ui";
+import { useIsMobile } from "../../hooks";
 
 interface HelpOverlayProps {
   isOpen: boolean;
@@ -21,18 +22,39 @@ interface ShortcutGroup {
 
 const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
+    title: "Global",
+    entries: [
+      { keys: ["\u2318K"], description: "Command palette" },
+      { keys: ["\u2318P"], description: "Switch project" },
+      { keys: ["\u2318O"], description: "Switch task" },
+      { keys: ["\u23181"], description: "Dashboard" },
+      { keys: ["\u23182"], description: "Tasks" },
+      { keys: ["\u23183"], description: "Skills" },
+      { keys: ["\u23184"], description: "Statistics" },
+      { keys: ["?"], description: "Keyboard shortcuts" },
+    ],
+  },
+  {
+    title: "Workspace",
+    entries: [
+      { keys: ["\u23181-9"], description: "Switch panel tab" },
+      { keys: ["\u2318\u21E7[", "\u2318\u21E7]"], description: "Previous / next tab" },
+      { keys: ["\u2318W", "\u2325W"], description: "Close active tab" },
+    ],
+  },
+  {
     title: "Navigation",
     entries: [
       { keys: ["j", "\u2193"], description: "Select next task" },
       { keys: ["k", "\u2191"], description: "Select previous task" },
-      { keys: ["Enter"], description: "Enter terminal / expand info" },
+      { keys: ["Enter"], description: "Enter workspace" },
       { keys: ["Esc"], description: "Go back" },
     ],
   },
   {
     title: "Info Panel Tabs",
     entries: [
-      { keys: ["1"], description: "Stats tab" },
+      { keys: ["1"], description: "Info tab" },
       { keys: ["2"], description: "Git tab" },
       { keys: ["3"], description: "Notes tab" },
       { keys: ["4"], description: "Comments tab" },
@@ -47,8 +69,10 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: ["s"], description: "Sync" },
       { keys: ["m"], description: "Merge" },
       { keys: ["b"], description: "Rebase (change branch)" },
-      { keys: ["d"], description: "Open Review panel" },
-      { keys: ["e"], description: "Open Editor panel" },
+      { keys: ["i"], description: "Chat" },
+      { keys: ["t"], description: "Terminal" },
+      { keys: ["r"], description: "Review" },
+      { keys: ["e"], description: "Editor" },
     ],
   },
   {
@@ -61,10 +85,17 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
 ];
 
 export function HelpOverlay({ isOpen, onClose }: HelpOverlayProps) {
+  const { isMobile } = useIsMobile();
+
   useEffect(() => {
     if (!isOpen) return;
+    // NOTE: don't handle "?" here — App's top-level useHotkeys already owns
+    // the toggle. Re-binding the same key at bubble phase inside this effect
+    // re-fires the handler on the SAME keydown that just opened us (useEffect
+    // commits before the browser finishes event dispatch in some React-18
+    // flush paths), closing the overlay the instant it appears.
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape" || e.key === "?") {
+      if (e.key === "Escape") {
         e.preventDefault();
         onClose();
       }
@@ -88,13 +119,22 @@ export function HelpOverlay({ isOpen, onClose }: HelpOverlayProps) {
 
           {/* Card */}
           <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: 20 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 20 }}
-            transition={{ duration: 0.2 }}
-            className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-[100] w-full max-w-lg max-h-[80vh] overflow-y-auto"
+            initial={isMobile ? { y: "100%" } : { opacity: 0, scale: 0.95, y: 20 }}
+            animate={isMobile ? { y: 0 } : { opacity: 1, scale: 1, y: 0 }}
+            exit={isMobile ? { y: "100%" } : { opacity: 0, scale: 0.95, y: 20 }}
+            transition={isMobile ? { type: "spring", damping: 30, stiffness: 300 } : { duration: 0.2 }}
+            className={isMobile
+              ? "fixed inset-x-0 bottom-0 z-[100] max-h-[85vh] overflow-y-auto"
+              : "fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-[100] w-full max-w-lg max-h-[80vh] overflow-y-auto"
+            }
           >
-            <div className="bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl shadow-xl overflow-hidden">
+            <div className={`bg-[var(--color-bg-secondary)] border border-[var(--color-border)] ${isMobile ? "rounded-t-2xl" : "rounded-xl"} shadow-xl overflow-hidden`}>
+              {/* Mobile drag indicator */}
+              {isMobile && (
+                <div className="flex justify-center pt-3 pb-1">
+                  <div className="w-10 h-1 rounded-full bg-[var(--color-border)]" />
+                </div>
+              )}
               {/* Header */}
               <div className="flex items-center justify-between px-5 py-3 border-b border-[var(--color-border)] sticky top-0 bg-[var(--color-bg-secondary)] z-10">
                 <h2 className="text-base font-semibold text-[var(--color-text)]">

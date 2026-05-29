@@ -1,22 +1,41 @@
+mod acp;
+mod agent_graph;
+mod agent_usage;
 mod api;
+#[cfg(not(windows))]
 mod app;
+#[cfg(not(windows))]
 mod async_ops_state;
+mod automation;
 mod check;
 mod cli;
+#[cfg(not(windows))]
 mod config_state;
+#[cfg(not(windows))]
 mod dialogs;
 mod diff;
 mod error;
+#[cfg(not(windows))]
 mod event;
+mod fs_link;
 mod git;
 mod hooks;
 mod model;
+#[cfg(not(windows))]
 mod notification_state;
+mod operations;
 mod session;
+mod stats;
 mod storage;
+mod symbols;
+#[cfg(not(windows))]
 mod theme;
 mod tmux;
+#[cfg(feature = "gui")]
+mod tray;
+#[cfg(not(windows))]
 mod ui;
+#[cfg(not(windows))]
 mod ui_state;
 mod update;
 mod watcher;
@@ -27,86 +46,116 @@ use std::panic;
 use std::time::Instant;
 
 use clap::Parser;
+#[cfg(not(windows))]
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+#[cfg(not(windows))]
 use crossterm::execute;
+#[cfg(not(windows))]
 use ratatui::DefaultTerminal;
 
+#[cfg(not(windows))]
 use app::{App, AppMode};
 use cli::{Cli, Commands};
 
 /// Auto-refresh interval in seconds
 const AUTO_REFRESH_INTERVAL_SECS: u64 = 5;
 
-fn main() -> io::Result<()> {
-    // Set up panic hook to restore terminal state on panic
-    let original_hook = panic::take_hook();
-    panic::set_hook(Box::new(move |panic_info| {
-        // Restore terminal state
-        let _ = execute!(io::stdout(), DisableMouseCapture);
-        ratatui::restore();
-        // Call the original panic hook
-        original_hook(panic_info);
-    }));
-    // 解析命令行参数
-    let cli = Cli::parse();
+/// Check storage version and auto-migrate if needed
+fn ensure_storage_version() {
+    use storage::database::CURRENT_STORAGE_VERSION;
 
-    // 如果有子命令，执行 CLI 逻辑
-    if let Some(command) = cli.command {
-        match command {
-            Commands::Hooks { level } => {
-                cli::hooks::execute(level);
-            }
-            Commands::Mcp => {
-                // MCP server requires tokio runtime
-                tokio::runtime::Runtime::new()
-                    .expect("Failed to create tokio runtime")
-                    .block_on(async {
-                        if let Err(e) = cli::mcp::run_mcp_server().await {
-                            eprintln!("MCP server error: {}", e);
-                            std::process::exit(1);
-                        }
-                    });
-            }
-            Commands::Fp => {
-                cli::fp::execute();
-            }
-            Commands::Web { port, no_open, dev } => {
-                tokio::runtime::Runtime::new()
-                    .expect("Failed to create tokio runtime")
-                    .block_on(async {
-                        cli::web::execute(port, no_open, dev).await;
-                    });
-            }
-            Commands::Diff { task_id, port } => {
-                cli::diff::execute(task_id, port);
-            }
-            Commands::Gui { port } => {
-                #[cfg(feature = "gui")]
-                {
-                    tokio::runtime::Runtime::new()
-                        .expect("Failed to create tokio runtime")
-                        .block_on(async {
-                            cli::gui::execute(port).await;
-                        });
-                }
-                #[cfg(not(feature = "gui"))]
-                {
-                    let _ = port; // suppress unused warning
-                    eprintln!("GUI mode is not available in this build.");
-                    eprintln!();
-                    eprintln!("To enable GUI support, rebuild with the 'gui' feature:");
-                    eprintln!("  cargo build --release --features gui");
-                    eprintln!();
-                    eprintln!("Or install with GUI support:");
-                    eprintln!("  cargo install grove-rs --features gui");
-                    std::process::exit(1);
-                }
-            }
-        }
-        return Ok(());
+    let config = storage::config::load_config();
+    let version = config.storage_version.as_deref();
+
+    if version == Some(CURRENT_STORAGE_VERSION) {
+        // Up to date — just ensure DB is initialized
+        let _ = storage::database::connection();
+        storage::database::run_agent_graph_startup_maintenance();
+        return;
     }
 
-    // 否则启动 TUI
+    let has_legacy_files = storage::grove_dir().join("projects").exists()
+        || storage::grove_dir().join("taskgroups.toml").exists()
+        || storage::grove_dir().join("ai").exists()
+        || storage::grove_dir()
+            .join("skills")
+            .join("agents.toml")
+            .exists();
+
+    // Chain migrations: None/1.0 → 1.1 → 2.0 → 2.1 → 2.2 → 2.3 → 2.4
+    match version {
+        Some("1.0") | None => {
+            if has_legacy_files {
+                if storage::grove_dir().join("projects").exists() {
+                    eprintln!("Migrating storage v1.0 → v1.1...");
+                    cli::migrate::execute(false);
+                }
+                eprintln!("Migrating storage v1.1 → v2.0 (SQLite)...");
+                storage::database::migrate_from_files();
+            } else {
+                let _ = storage::database::connection();
+            }
+        }
+        Some("1.1") => {
+            if has_legacy_files {
+                eprintln!("Migrating storage v1.1 → v2.0 (SQLite)...");
+                storage::database::migrate_from_files();
+            } else {
+                let _ = storage::database::connection();
+            }
+        }
+        Some("2.0") => {
+            if storage::database::migrate_v20_fix_empty_slots() {
+                eprintln!("Migrating storage v2.0 → v2.1...");
+            }
+        }
+        Some("2.1") => {
+            // v2.1 → v2.2: Agent Graph schema + chats.toml migration
+            let _ = storage::database::connection();
+        }
+        Some("2.2") => {
+            // v2.2 → v2.3: Review comments JSON → SQLite
+            let _ = storage::database::connection();
+        }
+        Some("2.3") => {
+            // v2.3 → v2.4: Tasks TOML → SQLite
+            let _ = storage::database::connection();
+        }
+        Some("2.4") => {
+            // v2.4 → v2.5: Cost columns added
+            let _ = storage::database::connection();
+        }
+        Some(v) => {
+            eprintln!(
+                "Unknown storage version: {}. Expected {}.",
+                v, CURRENT_STORAGE_VERSION
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // v2.3: Review comments JSON → SQLite. Idempotent (INSERT OR IGNORE) — run for any
+    // pre-2.3 user so that those upgrading from 1.0/1.1/2.0/2.1 don't skip it.
+    if version != Some(CURRENT_STORAGE_VERSION) {
+        storage::database::migrate_review_to_sqlite();
+    }
+
+    // v2.4: Tasks TOML → SQLite. Idempotent (INSERT OR IGNORE, gated by row count).
+    if version != Some(CURRENT_STORAGE_VERSION) {
+        storage::database::migrate_tasks_toml_to_sqlite();
+    }
+
+    // Update version
+    let mut config = storage::config::load_config();
+    config.storage_version = Some(CURRENT_STORAGE_VERSION.to_string());
+    let _ = storage::config::save_config(&config);
+
+    storage::database::run_agent_graph_startup_maintenance();
+}
+
+/// 启动 TUI 界面
+#[cfg(not(windows))]
+fn run_tui() -> io::Result<()> {
     // 环境检查
     let result = check::check_environment();
     if !result.ok {
@@ -139,6 +188,279 @@ fn main() -> io::Result<()> {
     result
 }
 
+fn main() -> io::Result<()> {
+    // Enable backtraces by default so panics show call stacks
+    if std::env::var("RUST_BACKTRACE").is_err() {
+        // SAFETY: called at the very start of main, before any other threads
+        unsafe {
+            std::env::set_var("RUST_BACKTRACE", "1");
+        }
+    }
+
+    #[cfg(feature = "perf-monitor")]
+    api::perf_tracing::install();
+
+    // Set up panic hook to restore terminal state on panic (TUI only)
+    #[cfg(not(windows))]
+    let original_hook = panic::take_hook();
+    #[cfg(not(windows))]
+    panic::set_hook(Box::new(move |panic_info| {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+        ratatui::restore();
+        original_hook(panic_info);
+    }));
+
+    // 解析命令行参数
+    let cli = Cli::parse();
+
+    // 确定要执行的命令
+    let (command, from_replay) = match cli.command {
+        Some(cmd) => (cmd, false),
+        None => {
+            // 无子命令：重放上次启动模式，默认 TUI
+            let config = storage::config::load_config();
+
+            // AppBundle 环境下，始终强制进入 GUI 模式
+            // （忽略 last_launch 中可能存的 Web/Tui，仅保留上次记录的 GUI 端口）
+            #[cfg(feature = "gui")]
+            if matches!(
+                update::detect_install_method(),
+                update::InstallMethod::AppBundle
+            ) {
+                let (port, remote_url) = config
+                    .last_launch
+                    .as_ref()
+                    .and_then(|ll| {
+                        if let storage::config::LastLaunch::Gui { port, remote_url } = ll {
+                            Some((*port, remote_url.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or((3001, None));
+                return {
+                    let (command, from_replay) = (
+                        Commands::Gui {
+                            port,
+                            remote_url: remote_url.clone(),
+                        },
+                        false,
+                    );
+                    // 保存 last_launch
+                    if let Some(last_launch) = command.to_last_launch() {
+                        let mut cfg = storage::config::load_config();
+                        cfg.last_launch = Some(last_launch);
+                        let _ = storage::config::save_config(&cfg);
+                    }
+                    // 直接执行 GUI
+                    tokio::runtime::Runtime::new()
+                        .expect("Failed to create tokio runtime")
+                        .block_on(async {
+                            cli::gui::execute(port, remote_url).await;
+                        });
+                    let _ = from_replay;
+                    Ok(())
+                };
+            }
+
+            // 非 AppBundle：重放上次启动模式，默认 TUI
+            match config.last_launch {
+                Some(ref ll) => {
+                    let label = ll.display_label();
+                    if !matches!(ll, storage::config::LastLaunch::Tui) {
+                        eprintln!("grove → grove {}", label);
+                    }
+                    (ll.to_command(), true)
+                }
+                None => (Commands::Tui, true),
+            }
+        }
+    };
+
+    // 如果是新的启动模式命令（非重放），保存到配置
+    if !from_replay {
+        if let Some(last_launch) = command.to_last_launch() {
+            let mut config = storage::config::load_config();
+            config.last_launch = Some(last_launch);
+            let _ = storage::config::save_config(&config);
+        }
+    }
+
+    // Ensure storage is migrated and DB initialized for UI commands
+    let needs_storage = matches!(
+        command,
+        Commands::Tui | Commands::Web { .. } | Commands::Mobile { .. } | Commands::Gui { .. }
+    );
+    if needs_storage {
+        ensure_storage_version();
+        // 一次性地把当前工作目录(若为 git 仓库)登记成 project。
+        // 旧逻辑放在 GET /projects handler 里,每次请求要 80ms+,纯属浪费。
+        storage::workspace::auto_register_cwd_if_git_repo();
+    }
+
+    // 统一调度
+    match command {
+        Commands::Tui => {
+            #[cfg(windows)]
+            {
+                eprintln!("grove tui is not supported on Windows. Please use WSL2 or run `grove web` instead.");
+                std::process::exit(1);
+            }
+            #[cfg(not(windows))]
+            run_tui()?;
+        }
+        Commands::Hooks { level } => {
+            cli::hooks::execute(level);
+        }
+        Commands::Mcp => {
+            tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime")
+                .block_on(async {
+                    if let Err(e) = cli::mcp::run_mcp_server().await {
+                        eprintln!("MCP server error: {}", e);
+                        std::process::exit(1);
+                    }
+                });
+        }
+        Commands::McpBridge => {
+            std::process::exit(cli::mcp_bridge::run());
+        }
+        Commands::Fp => {
+            #[cfg(windows)]
+            {
+                eprintln!("grove fp is not supported on Windows. Please use WSL2.");
+                std::process::exit(1);
+            }
+            #[cfg(not(windows))]
+            cli::fp::execute();
+        }
+        Commands::Web {
+            port,
+            no_open,
+            dev,
+            remote_url,
+        } => {
+            tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime")
+                .block_on(async {
+                    cli::web::execute(port, no_open, dev, remote_url).await;
+                });
+        }
+        Commands::Mobile {
+            port,
+            no_open,
+            tls,
+            cert,
+            key,
+            host,
+            public,
+            private,
+        } => {
+            tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime")
+                .block_on(async {
+                    cli::web::execute_mobile(port, no_open, tls, cert, key, host, public, private)
+                        .await;
+                });
+        }
+        Commands::Diff { task_id, port } => {
+            cli::diff::execute(task_id, port);
+        }
+        Commands::Gui { port, remote_url } => {
+            #[cfg(feature = "gui")]
+            {
+                // When launched from CLI (not AppBundle), daemonize so the
+                // terminal is released immediately.  The child re-execs itself
+                // with GROVE_GUI_DAEMON=1 and runs the actual GUI.
+                if cli::gui::try_daemonize(port, remote_url.as_deref()) {
+                    return Ok(()); // parent exits, child runs in background
+                }
+
+                tokio::runtime::Runtime::new()
+                    .expect("Failed to create tokio runtime")
+                    .block_on(async {
+                        cli::gui::execute(port, remote_url).await;
+                    });
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                let _ = (port, remote_url);
+                eprintln!("GUI mode is not available in this build.");
+                eprintln!();
+                eprintln!("To enable GUI support, rebuild with the 'gui' feature:");
+                eprintln!("  cargo build --release --features gui");
+                eprintln!();
+                eprintln!("Or install with GUI support:");
+                eprintln!("  cargo install grove-rs --features gui");
+                std::process::exit(1);
+            }
+        }
+        Commands::Acp { agent, cwd } => {
+            tokio::runtime::Runtime::new()
+                .expect("Failed to create tokio runtime")
+                .block_on(async {
+                    let local = tokio::task::LocalSet::new();
+                    local.run_until(cli::acp::execute(agent, cwd)).await;
+                });
+        }
+        Commands::Migrate { prune } => {
+            if prune {
+                storage::database::prune_legacy_files();
+            } else {
+                // Run the exact same migration chain as startup. The legacy
+                // v1.0 → v1.1 file rearranger (`cli::migrate::execute`) is one
+                // step inside that chain, but it's no longer the whole story —
+                // SQLite-era migrations (v1.1 → v2.0, v2.2 → v2.3, …) only run
+                // through `ensure_storage_version`, so calling that function
+                // directly is the only way to keep manual `grove migrate` and
+                // automatic startup migration in sync.
+                ensure_storage_version();
+            }
+        }
+        Commands::Register { path } => {
+            let path = path.unwrap_or_else(|| {
+                std::env::current_dir()
+                    .expect("Failed to get current directory")
+                    .to_string_lossy()
+                    .to_string()
+            });
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            match storage::workspace::upsert_project(&name, &path) {
+                Ok(()) => println!("Registered project: {} ({})", name, path),
+                Err(e) => {
+                    eprintln!("Failed to register project: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Remove { path } => {
+            let path = path.unwrap_or_else(|| {
+                std::env::current_dir()
+                    .expect("Failed to get current directory")
+                    .to_string_lossy()
+                    .to_string()
+            });
+            // Resolve to main repo path (handles worktrees)
+            let resolved = git::repo_root(&path)
+                .and_then(|root| git::get_main_repo_path(&root).or(Ok(root)))
+                .unwrap_or_else(|_| path.clone());
+            match storage::workspace::remove_project(&resolved) {
+                Ok(()) => println!("Removed project: {}", resolved),
+                Err(e) => {
+                    eprintln!("Failed to remove project: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     let mut last_refresh = Instant::now();
 
@@ -151,7 +473,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
 
             // attach 到 session（阻塞，直到用户 detach）
             let _ = session::attach_session(
-                &att.multiplexer,
+                &att.session_type,
                 &att.session,
                 Some(&att.working_dir),
                 Some(&att.env),
@@ -159,7 +481,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             );
 
             // 清除 tmux detach 消息（只清除一行，仅 tmux 需要）
-            if att.multiplexer == storage::config::Multiplexer::Tmux {
+            if matches!(att.session_type, session::SessionType::Tmux) {
                 print!("\x1b[1A\x1b[2K\r");
                 let _ = io::stdout().flush();
             }

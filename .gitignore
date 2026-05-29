@@ -4,6 +4,12 @@ Cargo.lock  # Uncomment if this is a library project
 **/*.rs.bk
 *.pdb
 
+# Tauri build artifacts — gen/schemas/*.json is regenerated on every
+# `cargo build --features gui` / `cargo tauri build`, so tracking it
+# just produces noisy diffs. CI rebuilds from source, doesn't read the
+# committed copy.
+gen/schemas/
+
 # IDE
 .idea/
 .vscode/
@@ -12,15 +18,23 @@ Cargo.lock  # Uncomment if this is a library project
 *~
 .DS_Store
 
-# Claude Code
+# Claude Code / Antigravity
 .claude/
+.antigravitycli/
+.superpowers/
+docs/superpowers/
+
+# Sisyphus
+.sisyphus/
 
 # Development / Marketing materials (not for version control)
 .grove-dev/
 
-# Web Frontend (Node.js / React)
-grove-web/node_modules/
-grove-web/dist/
+# Generic Node.js / Web build artifacts
+**/node_modules/
+**/dist/
+
+# Web Frontend (React)
 grove-web/build/
 grove-web/.next/
 grove-web/.turbo/
@@ -50,3 +64,10 @@ Thumbs.db
 coverage/
 *.lcov
 .nyc_output/
+test_autolink.rs
+examples/test_autolink.rs
+.worktrees/
+
+# Superpowers brainstorm cache
+.superpowers/
+.agentic-team

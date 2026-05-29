@@ -5,7 +5,7 @@ import { ChevronDown, Check, Search, Loader2, AppWindow } from "lucide-react";
 import type { AppInfo } from "../../api";
 import { AppIcon } from "./AppIcon";
 
-export interface AppPickerOption {
+interface AppPickerOption {
   id: string;
   label: string;
   /** App name to match against installed applications */
@@ -15,6 +15,7 @@ export interface AppPickerOption {
 }
 
 // IDE options - will be filtered by installed applications
+// eslint-disable-next-line react-refresh/only-export-components
 export const ideAppOptions: AppPickerOption[] = [
   { id: "vscode", label: "VS Code", appName: "Visual Studio Code", command: "code" },
   { id: "cursor", label: "Cursor", appName: "Cursor", command: "cursor" },
@@ -33,13 +34,17 @@ export const ideAppOptions: AppPickerOption[] = [
 ];
 
 // Terminal options - will be filtered by installed applications
+// eslint-disable-next-line react-refresh/only-export-components
 export const terminalAppOptions: AppPickerOption[] = [
   { id: "system", label: "System Default", appName: "Terminal" },
   { id: "iterm", label: "iTerm2", appName: "iTerm", command: "iterm" },
   { id: "warp", label: "Warp", appName: "Warp", command: "warp" },
+  { id: "ghostty", label: "Ghostty", appName: "Ghostty", command: "ghostty" },
   { id: "kitty", label: "Kitty", appName: "kitty", command: "kitty" },
   { id: "alacritty", label: "Alacritty", appName: "Alacritty", command: "alacritty" },
   { id: "hyper", label: "Hyper", appName: "Hyper", command: "hyper" },
+  { id: "wezterm", label: "WezTerm", appName: "WezTerm", command: "wezterm" },
+  { id: "cmux", label: "cmux", appName: "cmux", command: "cmux" },
 ];
 
 interface InstalledOption {
@@ -65,9 +70,11 @@ interface AppPickerProps {
 }
 
 interface DropdownPosition {
-  top: number;
+  top: number | null;
+  bottom: number | null;
   left: number;
   width: number;
+  maxHeight: number;
 }
 
 export function AppPicker({
@@ -173,23 +180,22 @@ export function AppPicker({
     return null;
   }, [value, applications, options, installedOptions]);
 
-  // Calculate dropdown position
+  // Calculate dropdown position (fixed positioning, viewport-relative)
   const updateDropdownPosition = useCallback(() => {
     if (triggerRef.current) {
       const rect = triggerRef.current.getBoundingClientRect();
-      const viewportHeight = window.innerHeight;
-      const spaceBelow = viewportHeight - rect.bottom;
-      const dropdownHeight = 400;
+      const spaceBelow = window.innerHeight - rect.bottom - 8;
+      const spaceAbove = rect.top - 8;
 
-      const top =
-        spaceBelow < dropdownHeight && rect.top > dropdownHeight
-          ? rect.top + window.scrollY - dropdownHeight - 4
-          : rect.bottom + window.scrollY + 4;
+      // Prefer below; flip above only if more room above and not enough below
+      const showAbove = spaceBelow < 120 && spaceAbove > spaceBelow;
 
       setDropdownPosition({
-        top,
-        left: rect.left + window.scrollX,
+        top: showAbove ? null : rect.bottom + 4,
+        bottom: showAbove ? (window.innerHeight - rect.top + 4) : null,
+        left: rect.left,
         width: Math.max(rect.width, 320),
+        maxHeight: showAbove ? spaceAbove : spaceBelow,
       });
     }
   }, []);
@@ -249,13 +255,15 @@ export function AppPicker({
           exit={{ opacity: 0, y: -10 }}
           transition={{ duration: 0.15 }}
           style={{
-            position: "absolute",
-            top: dropdownPosition.top,
+            position: "fixed",
+            top: dropdownPosition.top ?? undefined,
+            bottom: dropdownPosition.bottom ?? undefined,
             left: dropdownPosition.left,
             width: dropdownPosition.width,
+            maxHeight: dropdownPosition.maxHeight,
             zIndex: 9999,
           }}
-          className="bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg shadow-lg overflow-hidden"
+          className="bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg shadow-lg overflow-y-auto"
         >
           {/* Search input */}
           <div className="p-2 border-b border-[var(--color-border)]">

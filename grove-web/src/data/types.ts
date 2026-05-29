@@ -1,5 +1,9 @@
-// Task status types
-export type TaskStatus = 'live' | 'idle' | 'merged' | 'conflict' | 'broken' | 'archived';
+// Project type
+export type ProjectType = 'repo' | 'studio';
+
+// Task status types — grove-web only uses two states:
+// 'archived' = explicitly archived; 'active' = everything else
+export type TaskStatus = 'active' | 'archived';
 
 export interface Commit {
   hash: string;
@@ -16,12 +20,11 @@ export interface Task {
   branch: string;
   target: string;
   status: TaskStatus;
-  additions: number;
-  deletions: number;
-  filesChanged: number;
-  commits: Commit[];
   createdAt: Date;
   updatedAt: Date;
+  multiplexer: string;
+  createdBy?: string;
+  isLocal?: boolean;
 }
 
 export interface Project {
@@ -29,11 +32,23 @@ export interface Project {
   name: string;
   path: string;
   currentBranch: string;
+  /** Worktree tasks only (Local Task is on `localTask`). */
   tasks: Task[];
+  /** The project's single Local Task (every project has exactly one, always). */
+  localTask: Task | null;
   addedAt: Date;
-  // These are from ProjectListItem, used for display before full project is loaded
+  // From ProjectListItem, used for display before full project is loaded
   taskCount?: number;
-  liveCount?: number;
+  /** Whether this project is backed by a git repository */
+  isGitRepo: boolean;
+  /**
+   * Whether the project's filesystem path still exists. When false, the
+   * project is in a "missing" state — UI should show a warning badge and
+   * only allow Delete to clean up stale metadata.
+   */
+  exists: boolean;
+  /** Project type: 'repo' for code repositories, 'studio' for AI agent workspaces */
+  projectType: ProjectType;
 }
 
 export type ActivityType = 'create' | 'merge' | 'sync' | 'archive' | 'recover';
@@ -57,8 +72,6 @@ export interface Branch {
   name: string;
   isLocal: boolean;
   isCurrent: boolean;
-  lastCommit?: string;
-  aheadBehind?: { ahead: number; behind: number };
 }
 
 // Repository status
@@ -70,7 +83,8 @@ export interface RepoStatus {
   unstaged: number;   // modified but not staged
   untracked: number;  // untracked files count
   hasConflicts: boolean;
-  hasOrigin: boolean; // whether the repo has origin for current branch
+  hasOrigin: boolean; // whether the current branch has an upstream on origin
+  hasRemote: boolean; // whether the repo has an `origin` remote configured
 }
 
 // Commit file change details
@@ -83,49 +97,12 @@ export interface CommitFileChange {
 
 export interface Stats {
   totalTasks: number;
-  liveTasks: number;
-  idleTasks: number;
-  mergedTasks: number;
   archivedTasks: number;
   recentActivity: ActivityItem[];
   fileEdits: FileEdit[];
   weeklyActivity: number[];
 }
 
-// Review comment for code review
-export type ReviewStatus = 'open' | 'resolved' | 'outdated';
-
-export interface ReviewComment {
-  id: string;
-  file: string;
-  line: number;
-  content: string;
-  author: string;
-  status: ReviewStatus;
-  createdAt: Date;
-  resolvedAt?: Date;
-}
-
-// Task notes
-export interface TaskNotes {
-  taskId: string;
-  content: string;
-  updatedAt: Date;
-}
-
-// AI data for tasks
-export interface AITodo {
-  id: string;
-  text: string;
-  completed: boolean;
-}
-
-export interface AIData {
-  taskId: string;
-  summary: string;
-  todos: AITodo[];
-  updatedAt: Date;
-}
 
 // Task filter type
 export type TaskFilter = 'active' | 'archived';
@@ -135,4 +112,50 @@ export interface BlitzTask {
   task: Task;
   projectId: string;
   projectName: string;
+  /** Project type — use this instead of checking task.branch to detect Studio tasks. */
+  projectType: ProjectType;
+}
+
+// ─── TaskGroup (Walkie-Talkie) ───────────────────────────────────────────────
+
+/** System group ID for the main (worktree) tasks group. */
+export const MAIN_GROUP_ID = "_main";
+/** System group ID for local workspace tasks. */
+export const LOCAL_GROUP_ID = "_local";
+
+export interface TaskSlot {
+  /** Slot position — any positive integer (u16 on backend). */
+  position: number;
+  project_id: string;
+  task_id: string;
+  target_chat_id?: string;
+}
+
+export interface TaskGroup {
+  id: string;
+  name: string;
+  color?: string;
+  slots: TaskSlot[];
+  created_at: string;
+}
+
+export interface SlotStatus {
+  agent_status: "idle" | "busy" | "disconnected";
+  task_name: string;
+  project_name: string;
+}
+
+export interface GroupSnapshot {
+  id: string;
+  name: string;
+  color?: string;
+  slots: TaskSlot[];
+  created_at: string;
+  slot_statuses: Record<number, SlotStatus>;
+}
+
+export interface ChatRef {
+  id: string;
+  agent: string;
+  title: string;
 }

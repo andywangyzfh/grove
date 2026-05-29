@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
-import { Calendar, GitCommit, FileCode, Clock, Activity, Loader2 } from "lucide-react";
-import { getTaskStats, type TaskStatsResponse } from "../../../../api";
+import { Calendar, GitCommit, FileCode, Clock, Activity, Loader2, GitBranch, Info } from "lucide-react";
+import { getTaskStats, getDiff, getCommits, type TaskStatsResponse, type DiffResponse, type CommitsResponse } from "../../../../api";
 import type { Task } from "../../../../data/types";
 import { compactPath } from "../../../../utils/pathUtils";
 
@@ -66,7 +66,7 @@ function StatCard({ icon: Icon, label, value, subValue, delay = 0 }: StatCardPro
       transition={{ delay }}
       className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-4"
     >
-      <div className="flex items-center gap-2 text-[var(--color-text-muted)] mb-2">
+      <div className="flex items-center gap-2 text-[var(--color-text-muted)] mb-2 select-none">
         <Icon className="w-4 h-4" />
         <span className="text-xs font-medium uppercase tracking-wide">{label}</span>
       </div>
@@ -115,17 +115,32 @@ function formatRelativeTime(isoString: string): string {
 
 export function StatsTab({ projectId, task }: StatsTabProps) {
   const [stats, setStats] = useState<TaskStatsResponse | null>(null);
+  const [diffData, setDiffData] = useState<DiffResponse | null>(null);
+  const [commitsData, setCommitsData] = useState<CommitsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const totalLines = task.additions + task.deletions;
+  const additions = diffData?.total_additions ?? 0;
+  const deletions = diffData?.total_deletions ?? 0;
+  const filesChanged = diffData?.files.length ?? 0;
+  const commits = commitsData?.commits ?? [];
 
-  // Load task stats from API
+  // Load task stats, diff data, and commits from API
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setIsLoading(true);
+
     setError(null);
-    getTaskStats(projectId, task.id)
-      .then(setStats)
+    Promise.all([
+      getTaskStats(projectId, task.id),
+      getDiff(projectId, task.id).catch(() => null),
+      getCommits(projectId, task.id).catch(() => null),
+    ])
+      .then(([statsRes, diffRes, commitsRes]) => {
+        setStats(statsRes);
+        setDiffData(diffRes);
+        setCommitsData(commitsRes);
+      })
       .catch((err) => {
         console.error("Failed to load task stats:", err);
         setError("Failed to load stats");
@@ -138,7 +153,43 @@ export function StatsTab({ projectId, task }: StatsTabProps) {
     : 1;
 
   return (
-    <div className="space-y-4 overflow-y-auto h-full pr-2">
+    <div className="h-full min-h-0 overflow-y-auto space-y-4 pr-1">
+      {/* Basic Info */}
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0 }}
+        className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-4"
+      >
+        <div className="flex items-center gap-2 mb-3 select-none">
+          <Info className="w-4 h-4 text-[var(--color-text-muted)]" />
+          <h3 className="text-sm font-medium text-[var(--color-text)]">Task Info</h3>
+        </div>
+
+        <div className="space-y-3">
+          <div className="text-base font-semibold text-[var(--color-text)] break-words">{task.name}</div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-[var(--color-text-muted)] mb-1">
+                <GitBranch className="w-3.5 h-3.5" />
+                Branch
+              </div>
+              <code className="block text-sm text-[var(--color-accent)] bg-[var(--color-bg-secondary)] rounded-md px-2 py-1 truncate" title={task.branch}>
+                {task.branch || "—"}
+              </code>
+            </div>
+            <div className="min-w-0">
+              <div className="text-xs font-medium uppercase tracking-wide text-[var(--color-text-muted)] mb-1">Target</div>
+              <code className="block text-sm text-[var(--color-text-muted)] bg-[var(--color-bg-secondary)] rounded-md px-2 py-1 truncate" title={task.target}>
+                {task.target || "—"}
+              </code>
+            </div>
+          </div>
+
+        </div>
+      </motion.div>
+
       {/* Stats Grid */}
       <div className="grid grid-cols-2 gap-3">
         <StatCard
@@ -156,15 +207,15 @@ export function StatsTab({ projectId, task }: StatsTabProps) {
         <StatCard
           icon={GitCommit}
           label="Commits"
-          value={task.commits.length}
-          subValue={task.commits.length > 0 ? `Latest: ${task.commits[0]?.message.slice(0, 30)}...` : "No commits"}
+          value={commits.length}
+          subValue={commits.length > 0 ? `Latest: ${commits[0]?.message.slice(0, 30)}...` : "No commits"}
           delay={0.1}
         />
         <StatCard
           icon={FileCode}
           label="Files Changed"
-          value={task.filesChanged}
-          subValue={`${task.additions} additions, ${task.deletions} deletions`}
+          value={filesChanged}
+          subValue={`${additions} additions, ${deletions} deletions`}
           delay={0.15}
         />
       </div>
@@ -176,22 +227,22 @@ export function StatsTab({ projectId, task }: StatsTabProps) {
         transition={{ delay: 0.2 }}
         className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-4"
       >
-        <h3 className="text-sm font-medium text-[var(--color-text)] mb-3">Task Duration</h3>
+        <h3 className="text-sm font-medium text-[var(--color-text)] mb-3 select-none">Task Duration</h3>
         <div className="flex items-center gap-4">
           <div className="flex-1">
             <div className="text-2xl font-semibold text-[var(--color-text)]">
               {stats?.hourly_activity ? calculateActiveTime(stats.hourly_activity) : isLoading ? "—" : "—"}
             </div>
-            <div className="text-xs text-[var(--color-text-muted)] mt-1">
+            <div className="text-xs text-[var(--color-text-muted)] mt-1 select-none">
               Active time
             </div>
           </div>
           <div className="h-12 w-px bg-[var(--color-border)]" />
           <div className="flex-1">
             <div className="text-2xl font-semibold text-[var(--color-text)]">
-              {totalLines}
+              {additions + deletions}
             </div>
-            <div className="text-xs text-[var(--color-text-muted)] mt-1">
+            <div className="text-xs text-[var(--color-text-muted)] mt-1 select-none">
               Total lines changed
             </div>
           </div>
@@ -226,7 +277,7 @@ export function StatsTab({ projectId, task }: StatsTabProps) {
           transition={{ delay: 0.25 }}
           className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-4"
         >
-          <div className="flex items-center gap-2 mb-3">
+          <div className="flex items-center gap-2 mb-3 select-none">
             <Activity className="w-4 h-4 text-[var(--color-text-muted)]" />
             <h3 className="text-sm font-medium text-[var(--color-text)]">File Edits</h3>
             <span className="text-xs text-[var(--color-text-muted)]">
@@ -305,7 +356,7 @@ export function StatsTab({ projectId, task }: StatsTabProps) {
           transition={{ delay: 0.25 }}
           className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-4"
         >
-          <div className="flex items-center gap-2 mb-3">
+          <div className="flex items-center gap-2 mb-3 select-none">
             <Activity className="w-4 h-4 text-[var(--color-text-muted)]" />
             <h3 className="text-sm font-medium text-[var(--color-text)]">File Edits</h3>
           </div>
@@ -323,7 +374,7 @@ export function StatsTab({ projectId, task }: StatsTabProps) {
           transition={{ delay: 0.35 }}
           className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-4"
         >
-          <div className="flex items-center gap-2 mb-3">
+          <div className="flex items-center gap-2 mb-3 select-none">
             <Clock className="w-4 h-4 text-[var(--color-text-muted)]" />
             <h3 className="text-sm font-medium text-[var(--color-text)]">Activity Timeline</h3>
             <span className="text-xs text-[var(--color-text-muted)]">
@@ -410,7 +461,7 @@ export function StatsTab({ projectId, task }: StatsTabProps) {
       )}
 
       {/* Commit Timeline */}
-      {task.commits.length > 0 && (
+      {commits.length > 0 && (
         <motion.div
           initial={{ opacity: 0, y: 10 }}
           animate={{ opacity: 1, y: 0 }}
@@ -424,7 +475,7 @@ export function StatsTab({ projectId, task }: StatsTabProps) {
 
             {/* Commits */}
             <div className="space-y-3">
-              {task.commits.map((commit, index) => (
+              {commits.map((commit, index) => (
                 <div key={commit.hash} className="flex items-start gap-3 relative">
                   <div
                     className="w-4 h-4 rounded-full border-2 border-[var(--color-highlight)] bg-[var(--color-bg)] flex-shrink-0 z-10"
@@ -439,7 +490,7 @@ export function StatsTab({ projectId, task }: StatsTabProps) {
                     <div className="flex items-center gap-2 text-xs text-[var(--color-text-muted)] mt-0.5">
                       <code className="font-mono">{commit.hash.slice(0, 7)}</code>
                       <span>•</span>
-                      <span>{formatDate(commit.date, commit.timeAgo)}</span>
+                      <span>{commit.time_ago}</span>
                     </div>
                   </div>
                 </div>

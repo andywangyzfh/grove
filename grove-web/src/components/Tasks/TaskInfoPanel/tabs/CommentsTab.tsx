@@ -1,16 +1,17 @@
 import { useState, useEffect, useCallback } from "react";
 import { motion } from "framer-motion";
 import { MessageSquare, CheckCircle, Clock, FileCode, Loader2 } from "lucide-react";
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { MarkdownRenderer } from "../../../ui";
 import type { Task } from "../../../../data/types";
 import { useProject } from "../../../../context/ProjectContext";
 import { getReviewComments, type ReviewCommentEntry } from "../../../../api";
 import { AgentAvatar } from "../../../Review/AgentAvatar";
+import { formatAgentDisplay } from "../../../Review/agentDisplay";
 
 type ReviewStatus = "open" | "resolved" | "outdated";
 
 interface CommentsTabProps {
+  projectId?: string;
   task: Task;
 }
 
@@ -109,28 +110,24 @@ function ReviewCommentCard({ comment }: { comment: ReviewCommentEntry }) {
       {/* Main comment */}
       <div className="p-3">
         <div className="flex items-center gap-2 mb-1.5">
-          <AgentAvatar name={comment.author} size={18} />
-          <span className="text-xs font-medium text-[var(--color-text)]">{comment.author}</span>
+          <AgentAvatar agent={comment.agent} size={18} />
+          <span className="text-xs font-medium text-[var(--color-text)]">{formatAgentDisplay(comment.agent, comment.role)}</span>
           <span className="text-xs text-[var(--color-text-muted)]">{formatTimestamp(comment.timestamp)}</span>
         </div>
         <div className="text-sm text-[var(--color-text)] pl-[26px] markdown-content">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-            {comment.content}
-          </ReactMarkdown>
+          <MarkdownRenderer content={comment.content} />
         </div>
 
         {/* Replies */}
         {comment.replies.length > 0 && comment.replies.map((reply) => (
           <div key={reply.id} className="mt-2.5 pt-2.5 border-t border-[var(--color-border)] pl-[26px]">
             <div className="flex items-center gap-2 mb-1">
-              <AgentAvatar name={reply.author} size={16} />
-              <span className="text-xs font-medium text-[var(--color-text)]">{reply.author}</span>
+              <AgentAvatar agent={reply.agent} size={16} />
+              <span className="text-xs font-medium text-[var(--color-text)]">{formatAgentDisplay(reply.agent, reply.role)}</span>
               <span className="text-xs text-[var(--color-text-muted)]">{formatTimestamp(reply.timestamp)}</span>
             </div>
             <div className="text-sm text-[var(--color-text-muted)] pl-[24px] markdown-content">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {reply.content}
-              </ReactMarkdown>
+              <MarkdownRenderer content={reply.content} />
             </div>
           </div>
         ))}
@@ -141,8 +138,9 @@ function ReviewCommentCard({ comment }: { comment: ReviewCommentEntry }) {
 
 type FilterType = "all" | "open" | "resolved";
 
-export function CommentsTab({ task }: CommentsTabProps) {
+export function CommentsTab({ projectId, task }: CommentsTabProps) {
   const { selectedProject } = useProject();
+  const resolvedProjectId = projectId || selectedProject?.id;
   const [comments, setComments] = useState<ReviewCommentEntry[]>([]);
   const [openCount, setOpenCount] = useState(0);
   const [resolvedCount, setResolvedCount] = useState(0);
@@ -151,11 +149,11 @@ export function CommentsTab({ task }: CommentsTabProps) {
   const [filter, setFilter] = useState<FilterType>("all");
 
   const loadComments = useCallback(async () => {
-    if (!selectedProject) return;
+    if (!resolvedProjectId) return;
 
     try {
       setIsLoading(true);
-      const response = await getReviewComments(selectedProject.id, task.id);
+      const response = await getReviewComments(resolvedProjectId, task.id);
       setComments(response.comments);
       setOpenCount(response.open_count);
       setResolvedCount(response.resolved_count);
@@ -163,13 +161,12 @@ export function CommentsTab({ task }: CommentsTabProps) {
     } catch (err) {
       console.error("Failed to load review comments:", err);
       setComments([]);
-    } finally {
-      setIsLoading(false);
     }
-  }, [selectedProject, task.id]);
+    setIsLoading(false);
+  }, [resolvedProjectId, task.id]);
 
   useEffect(() => {
-    loadComments();
+    Promise.resolve().then(loadComments);
   }, [loadComments]);
 
   if (isLoading) {
@@ -203,9 +200,9 @@ export function CommentsTab({ task }: CommentsTabProps) {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="h-full min-h-0 flex flex-col gap-3 overflow-hidden">
       {/* Filter Buttons */}
-      <div className="flex gap-2 text-sm">
+      <div className="flex flex-wrap gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-2 text-sm shadow-sm">
         <button
           onClick={() => setFilter("all")}
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md transition-colors ${
@@ -242,7 +239,7 @@ export function CommentsTab({ task }: CommentsTabProps) {
       </div>
 
       {/* Comments */}
-      <div className="space-y-3">
+      <div className="min-h-0 flex-1 overflow-y-auto space-y-3 pr-1">
         {filteredComments.length === 0 ? (
           <div className="py-8 text-center">
             <p className="text-sm text-[var(--color-text-muted)]">

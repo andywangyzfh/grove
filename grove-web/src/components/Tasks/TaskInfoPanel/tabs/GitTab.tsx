@@ -6,38 +6,39 @@ import { useProject } from "../../../../context/ProjectContext";
 import { getDiff, getCommits, type DiffResponse, type CommitsResponse } from "../../../../api";
 
 interface GitTabProps {
+  projectId?: string;
   task: Task;
 }
 
-export function GitTab({ task }: GitTabProps) {
+export function GitTab({ projectId, task }: GitTabProps) {
   const { selectedProject } = useProject();
+  const resolvedProjectId = projectId || selectedProject?.id;
   const [diffData, setDiffData] = useState<DiffResponse | null>(null);
   const [commitsData, setCommitsData] = useState<CommitsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const loadGitData = useCallback(async () => {
-    if (!selectedProject) return;
+    if (!resolvedProjectId) return;
 
     try {
       setIsLoading(true);
       setError(null);
       const [diff, commits] = await Promise.all([
-        getDiff(selectedProject.id, task.id),
-        getCommits(selectedProject.id, task.id),
+        getDiff(resolvedProjectId, task.id),
+        getCommits(resolvedProjectId, task.id),
       ]);
       setDiffData(diff);
       setCommitsData(commits);
     } catch (err) {
       console.error("Failed to load git data:", err);
       setError("Failed to load git data. The task may have been deleted or archived.");
-    } finally {
-      setIsLoading(false);
     }
-  }, [selectedProject, task.id]);
+    setIsLoading(false);
+  }, [resolvedProjectId, task.id]);
 
   useEffect(() => {
-    loadGitData();
+    Promise.resolve().then(loadGitData);
   }, [loadGitData]);
 
   if (isLoading) {
@@ -60,26 +61,26 @@ export function GitTab({ task }: GitTabProps) {
     );
   }
 
-  const additions = diffData?.total_additions ?? task.additions;
-  const deletions = diffData?.total_deletions ?? task.deletions;
-  const filesChanged = diffData?.files.length ?? task.filesChanged;
+  const additions = diffData?.total_additions ?? 0;
+  const deletions = diffData?.total_deletions ?? 0;
+  const filesChanged = diffData?.files.length ?? 0;
   const commits = commitsData?.commits ?? [];
 
   return (
     <div className="space-y-4">
       {/* Branch Info */}
       <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-4">
-        <h3 className="text-sm font-medium text-[var(--color-text)] mb-3 flex items-center gap-2">
+        <h3 className="text-sm font-medium text-[var(--color-text)] mb-3 flex items-center gap-2 select-none">
           <GitBranch className="w-4 h-4" />
           Branch Info
         </h3>
         <div className="space-y-2 text-sm">
           <div className="flex justify-between">
-            <span className="text-[var(--color-text-muted)]">Branch</span>
+            <span className="text-[var(--color-text-muted)] select-none">Branch</span>
             <span className="text-[var(--color-text)] font-mono">{task.branch}</span>
           </div>
           <div className="flex justify-between">
-            <span className="text-[var(--color-text-muted)]">Target</span>
+            <span className="text-[var(--color-text-muted)] select-none">Target</span>
             <span className="text-[var(--color-text)] font-mono">{task.target}</span>
           </div>
         </div>
@@ -87,34 +88,34 @@ export function GitTab({ task }: GitTabProps) {
 
       {/* Code Changes */}
       <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-4">
-        <h3 className="text-sm font-medium text-[var(--color-text)] mb-3 flex items-center gap-2">
+        <h3 className="text-sm font-medium text-[var(--color-text)] mb-3 flex items-center gap-2 select-none">
           <FileCode className="w-4 h-4" />
           Changes
         </h3>
         <div className="flex gap-4 text-sm">
           <div>
             <span className="text-[var(--color-success)] font-semibold">+{additions}</span>
-            <span className="text-[var(--color-text-muted)] ml-1">additions</span>
+            <span className="text-[var(--color-text-muted)] ml-1 select-none">additions</span>
           </div>
           <div>
             <span className="text-[var(--color-error)] font-semibold">-{deletions}</span>
-            <span className="text-[var(--color-text-muted)] ml-1">deletions</span>
+            <span className="text-[var(--color-text-muted)] ml-1 select-none">deletions</span>
           </div>
           <div>
             <span className="text-[var(--color-text)] font-semibold">{filesChanged}</span>
-            <span className="text-[var(--color-text-muted)] ml-1">files</span>
+            <span className="text-[var(--color-text-muted)] ml-1 select-none">files</span>
           </div>
         </div>
       </div>
 
       {/* Recent Commits */}
       <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-4">
-        <h3 className="text-sm font-medium text-[var(--color-text)] mb-3 flex items-center gap-2">
+        <h3 className="text-sm font-medium text-[var(--color-text)] mb-3 flex items-center gap-2 select-none">
           <GitCommit className="w-4 h-4" />
           Recent Commits
         </h3>
         {commits.length === 0 ? (
-          <p className="text-sm text-[var(--color-text-muted)]">No commits yet</p>
+          <p className="text-sm text-[var(--color-text-muted)] select-none">No commits yet</p>
         ) : (
           <div className="space-y-2">
             {commits.map((commit, index) => (
@@ -132,7 +133,7 @@ export function GitTab({ task }: GitTabProps) {
                     </code>
                   )}
                   <div className="flex-1 min-w-0">
-                    <p className="text-sm text-[var(--color-text)] truncate">
+                    <p className="text-sm text-[var(--color-text)] break-words">
                       {commit.message}
                     </p>
                     <div className="flex items-center gap-2 mt-0.5 text-xs text-[var(--color-text-muted)]">

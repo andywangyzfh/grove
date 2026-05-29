@@ -1,7 +1,12 @@
 // API client base configuration
-// In dev mode, vite proxy forwards /api to backend
-// In prod mode (served by grove web), use relative path
-const API_BASE_URL = import.meta.env.VITE_API_URL || '';
+// Priority:
+//   1. window.__GROVE_API_BASE__ — injected by `grove web --remote-url` into index.html
+//   2. VITE_API_URL             — set by `grove web --dev` via vite proxy env
+//   3. '' (empty)               — production/GUI mode: use relative URLs
+const API_BASE_URL: string =
+  (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__GROVE_API_BASE__ as string) ||
+  import.meta.env.VITE_API_URL ||
+  '';
 
 export interface ApiError {
   status: number;
@@ -11,6 +16,225 @@ export interface ApiError {
 }
 
 type ErrorPayload = { message: string; data?: unknown };
+
+// ─── Secret Key management (HMAC-SHA256) ─────────────────────────────────────
+
+const SK_KEY = 'grove_auth_sk';
+
+export function getSecretKey(): string | null {
+  return sessionStorage.getItem(SK_KEY);
+}
+
+export function setSecretKey(sk: string) {
+  sessionStorage.setItem(SK_KEY, sk);
+}
+
+export function clearSecretKey() {
+  sessionStorage.removeItem(SK_KEY);
+}
+
+/** Extract secret key from URL hash fragment: /#sk=xxx */
+export function extractSkFromUrl(): string | null {
+  const hash = window.location.hash;
+  if (!hash) return null;
+  const match = hash.match(/[#&]sk=([^&]*)/);
+  return match ? match[1] : null;
+}
+
+/** Extract page intent from URL hash fragment: /#sk=xxx&page=radio */
+export function extractPageFromUrl(): string | null {
+  const hash = window.location.hash;
+  if (!hash) return null;
+  const match = hash.match(/[#&]page=([^&]*)/);
+  return match ? match[1] : null;
+}
+
+const PAGE_INTENT_KEY = 'grove_page_intent';
+
+export function getPageIntent(): string | null {
+  return sessionStorage.getItem(PAGE_INTENT_KEY);
+}
+
+export function setPageIntent(page: string) {
+  sessionStorage.setItem(PAGE_INTENT_KEY, page);
+}
+
+export function clearPageIntent() {
+  sessionStorage.removeItem(PAGE_INTENT_KEY);
+}
+
+// ─── Radio token management ────────────────────────────────────────────────
+
+const RADIO_TOKEN_KEY = 'grove_radio_token';
+
+/** Extract radio token from URL hash fragment: /#page=radio&token=xxx */
+export function extractRadioTokenFromUrl(): string | null {
+  const hash = window.location.hash;
+  if (!hash) return null;
+  const match = hash.match(/[#&]token=([^&]*)/);
+  return match ? match[1] : null;
+}
+
+export function getRadioToken(): string | null {
+  return sessionStorage.getItem(RADIO_TOKEN_KEY);
+}
+
+export function setRadioToken(token: string) {
+  sessionStorage.setItem(RADIO_TOKEN_KEY, token);
+}
+
+export function clearRadioToken() {
+  sessionStorage.removeItem(RADIO_TOKEN_KEY);
+}
+
+
+// ─── HMAC-SHA256 signing ─────────────────────────────────────────────────────
+
+import { hmacSha256Hex } from './hmac';
+
+/** Compute HMAC-SHA256(sk, message) and return hex string. */
+export async function computeHmac(message: string): Promise<string | null> {
+  const sk = getSecretKey();
+  if (!sk) return null;
+  return hmacSha256Hex(sk, message);
+}
+
+/** Generate a random nonce (16 hex chars). */
+function generateNonce(): string {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+/**
+ * Build the canonical path-and-query that goes into the HMAC message.
+ *
+ * Query parameters are sorted by `(key, value)` ascending and rejoined with
+ * `&`. `excludeKeys` are dropped — used by `appendHmacToUrl` to skip the
+ * signature parameters themselves (`ts/nonce/sig`) when re-signing a URL
+ * that may already carry them. Mirror of the Rust `canonical_path` helper
+ * in `src/api/auth.rs`; the two must stay in lockstep.
+ */
+export function canonicalPath(path: string, excludeKeys: string[] = []): string {
+  const qIdx = path.indexOf('?');
+  if (qIdx < 0) return path;
+  const pathname = path.substring(0, qIdx);
+  const query = path.substring(qIdx + 1);
+  if (!query) return pathname;
+  const pairs: [string, string][] = [];
+  for (const part of query.split('&')) {
+    if (!part) continue;
+    const eqIdx = part.indexOf('=');
+    const key = eqIdx < 0 ? part : part.substring(0, eqIdx);
+    const value = eqIdx < 0 ? '' : part.substring(eqIdx + 1);
+    if (excludeKeys.includes(key)) continue;
+    pairs.push([key, value]);
+  }
+  if (pairs.length === 0) return pathname;
+  pairs.sort((a, b) => {
+    if (a[0] !== b[0]) return a[0] < b[0] ? -1 : 1;
+    if (a[1] !== b[1]) return a[1] < b[1] ? -1 : 1;
+    return 0;
+  });
+  return `${pathname}?${pairs.map(([k, v]) => `${k}=${v}`).join('&')}`;
+}
+
+/** Sign a request and return {timestamp, nonce, signature}. */
+async function signRequest(
+  method: string,
+  path: string,
+): Promise<{ timestamp: string; nonce: string; signature: string } | null> {
+  const sk = getSecretKey();
+  if (!sk) return null;
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const nonce = generateNonce();
+  const canonical = canonicalPath(path);
+  const message = `${timestamp}|${nonce}|${method}|${canonical}`;
+  const signature = await computeHmac(message);
+  if (!signature) return null;
+  return { timestamp, nonce, signature };
+}
+
+/** Build HMAC auth headers for an HTTP request. */
+async function getSignedHeaders(
+  method: string,
+  path: string,
+): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+
+  // Radio server mode: use Bearer token instead of HMAC
+  const radioToken = getRadioToken();
+  if (radioToken) {
+    headers['Authorization'] = `Bearer ${radioToken}`;
+    return headers;
+  }
+
+  const sig = await signRequest(method, path);
+  if (sig) {
+    headers['X-Timestamp'] = sig.timestamp;
+    headers['X-Nonce'] = sig.nonce;
+    headers['X-Signature'] = sig.signature;
+  }
+  return headers;
+}
+
+/** Build auth-only headers (no Content-Type — for FormData uploads). */
+async function getAuthOnlyHeaders(
+  method: string,
+  path: string,
+): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {};
+
+  // Radio server mode: use Bearer token instead of HMAC
+  const radioToken = getRadioToken();
+  if (radioToken) {
+    headers['Authorization'] = `Bearer ${radioToken}`;
+    return headers;
+  }
+
+  const sig = await signRequest(method, path);
+  if (sig) {
+    headers['X-Timestamp'] = sig.timestamp;
+    headers['X-Nonce'] = sig.nonce;
+    headers['X-Signature'] = sig.signature;
+  }
+  return headers;
+}
+
+/** Append HMAC signature as query params to a WebSocket URL (async). */
+export async function appendHmacToUrl(url: string): Promise<string> {
+  // Extract pathname + query for signing. The signature must cover existing
+  // query params (e.g. `?session_id=…`) so a MITM can't swap them.
+  let pathWithQuery: string;
+  try {
+    const parsed = new URL(url, window.location.origin);
+    pathWithQuery = parsed.pathname + (parsed.search || '');
+  } catch {
+    const pathMatch = url.match(/wss?:\/\/[^/]+(\/[^#]*)/);
+    pathWithQuery = pathMatch ? pathMatch[1] : '/';
+  }
+
+  // ts/nonce/sig are about to be appended; they must NOT contribute to the
+  // signature itself. Mirrors the server-side exclude list in auth.rs.
+  const canonical = canonicalPath(pathWithQuery, ['ts', 'nonce', 'sig']);
+
+  const sk = getSecretKey();
+  if (!sk) return url;
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const nonce = generateNonce();
+  const message = `${timestamp}|${nonce}|GET|${canonical}`;
+  const signature = await computeHmac(message);
+  if (!signature) return url;
+
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}ts=${timestamp}&nonce=${nonce}&sig=${signature}`;
+}
+
+// ─── Internal helpers ───────────────────────────────────────────────────────
 
 // Try to extract error message (and JSON body) from response
 async function extractErrorPayload(response: Response): Promise<ErrorPayload> {
@@ -35,19 +259,22 @@ async function extractErrorPayload(response: Response): Promise<ErrorPayload> {
   return { message: response.statusText };
 }
 
-export class ApiClient {
+class ApiClient {
   private baseUrl: string;
 
   constructor(baseUrl: string = API_BASE_URL) {
     this.baseUrl = baseUrl;
   }
 
-  async get<T>(path: string): Promise<T> {
+  async get<T>(path: string, signal?: AbortSignal): Promise<T> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: await getSignedHeaders('GET', path),
+      // Grove data is user-specific and changes at any time (MCP writes,
+      // other tabs, background sync). We always want the freshest response;
+      // never let the browser serve a stale cached copy.
+      cache: 'no-store',
+      signal,
     });
 
     if (!response.ok) {
@@ -62,13 +289,15 @@ export class ApiClient {
     return response.json();
   }
 
-  async patch<T, R>(path: string, data: T): Promise<R> {
+  /**
+   * Fetch a text response (assumes UTF-8 encoding).
+   * Uses `response.text()` which decodes the body as UTF-8 by default.
+   * For binary content, use download URLs instead.
+   */
+  async getText(path: string): Promise<string> {
     const response = await fetch(`${this.baseUrl}${path}`, {
-      method: 'PATCH',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(data),
+      method: 'GET',
+      headers: await getSignedHeaders('GET', path),
     });
 
     if (!response.ok) {
@@ -80,15 +309,38 @@ export class ApiClient {
       } as ApiError;
     }
 
-    return response.json();
+    return response.text();
+  }
+
+  async patch<T, R>(path: string, data: T, signal?: AbortSignal): Promise<R> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: 'PATCH',
+      headers: await getSignedHeaders('PATCH', path),
+      body: JSON.stringify(data),
+      signal,
+    });
+
+    if (!response.ok) {
+      const payload = await extractErrorPayload(response);
+      throw {
+        status: response.status,
+        message: payload.message,
+        data: payload.data,
+      } as ApiError;
+    }
+
+    // 204 No Content / empty body 路径：response.json() 会抛 SyntaxError，
+    // callers that declared `Promise<void>` 不需要 body。与 put / delete /
+    // post 同样模式：先取 text，empty 则返 undefined，否则 JSON.parse。
+    const text = await response.text();
+    if (text) return JSON.parse(text) as R;
+    return undefined as R;
   }
 
   async post<T, R>(path: string, data?: T): Promise<R> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: await getSignedHeaders('POST', path),
       body: data ? JSON.stringify(data) : undefined,
     });
 
@@ -101,15 +353,34 @@ export class ApiClient {
       } as ApiError;
     }
 
-    return response.json();
+    // Handle empty body (e.g. 201/204 responses)
+    const text = await response.text();
+    if (text) {
+      return JSON.parse(text) as R;
+    }
+    return undefined as R;
+  }
+
+  async postNoContent(path: string): Promise<void> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: 'POST',
+      headers: await getSignedHeaders('POST', path),
+    });
+
+    if (!response.ok) {
+      const payload = await extractErrorPayload(response);
+      throw {
+        status: response.status,
+        message: payload.message,
+        data: payload.data,
+      } as ApiError;
+    }
   }
 
   async delete<T = void>(path: string): Promise<T> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: 'DELETE',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: await getSignedHeaders('DELETE', path),
     });
 
     if (!response.ok) {
@@ -129,13 +400,12 @@ export class ApiClient {
     return undefined as T;
   }
 
-  async put<T, R>(path: string, data: T): Promise<R> {
+  async postFormData<R>(path: string, formData: FormData, signal?: AbortSignal): Promise<R> {
     const response = await fetch(`${this.baseUrl}${path}`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(data),
+      method: 'POST',
+      headers: await getAuthOnlyHeaders('POST', path),
+      body: formData,
+      signal,
     });
 
     if (!response.ok) {
@@ -149,7 +419,108 @@ export class ApiClient {
 
     return response.json();
   }
+
+  /**
+   * POST raw binary data (e.g. a PNG blob) with auth headers and an explicit
+   * Content-Type. Returns `true` on 2xx, `false` on 409 (treat-as-stale).
+   * Throws on other non-2xx responses.
+   */
+  async postBinary(
+    path: string,
+    body: Blob | ArrayBuffer,
+    contentType: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const headers = await getAuthOnlyHeaders('POST', path);
+    headers['Content-Type'] = contentType;
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: 'POST',
+      headers,
+      body,
+      signal,
+    });
+    if (response.ok) return true;
+    if (response.status === 409) return false;
+    const payload = await extractErrorPayload(response);
+    throw {
+      status: response.status,
+      message: payload.message,
+      data: payload.data,
+    } as ApiError;
+  }
+
+  /**
+   * PUT with `keepalive: true` — survives page unload so we can flush
+   * in-flight debounced saves. Browser caps the body at ~64 KB; callers that
+   * might exceed this should fall back to regular `put`. No-response callers
+   * only.
+   */
+  async putKeepalive<T>(path: string, data: T): Promise<void> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: 'PUT',
+      headers: await getSignedHeaders('PUT', path),
+      body: JSON.stringify(data),
+      keepalive: true,
+    });
+    if (!response.ok) {
+      const payload = await extractErrorPayload(response);
+      throw {
+        status: response.status,
+        message: payload.message,
+        data: payload.data,
+      } as ApiError;
+    }
+  }
+
+  async put<T, R>(path: string, data: T): Promise<R> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: 'PUT',
+      headers: await getSignedHeaders('PUT', path),
+      body: JSON.stringify(data),
+    });
+
+    if (!response.ok) {
+      const payload = await extractErrorPayload(response);
+      throw {
+        status: response.status,
+        message: payload.message,
+        data: payload.data,
+      } as ApiError;
+    }
+
+    // Handle 204 No Content (empty body)
+    const text = await response.text();
+    if (text) {
+      return JSON.parse(text) as R;
+    }
+    return undefined as R;
+  }
 }
 
 // Default client instance
 export const apiClient = new ApiClient();
+
+/// Get the API host for WebSocket connections.
+/// Priority: __GROVE_API_BASE__ > VITE_API_URL > window.location.host
+export function getApiHost(): string {
+  // Remote mode: injected by grove web --remote-url
+  const remoteBase = (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__GROVE_API_BASE__) as string | undefined;
+  if (remoteBase) {
+    try {
+      const url = new URL(remoteBase);
+      return url.host;
+    } catch {
+      // fallback
+    }
+  }
+  const envUrl = import.meta.env.VITE_API_URL;
+  if (envUrl) {
+    try {
+      const url = new URL(envUrl, window.location.origin);
+      return url.host;
+    } catch {
+      // fallback
+    }
+  }
+  return window.location.host;
+}

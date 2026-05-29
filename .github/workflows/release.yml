@@ -25,34 +25,73 @@ jobs:
       - name: Get tag
         id: tag
         run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-      - name: Create Release
+      - name: Create or reset Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create ${{ steps.tag.outputs.tag }} --draft --title ${{ steps.tag.outputs.tag }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          if gh release view "$TAG" &>/dev/null; then
+            # Release already exists — switch to draft and clear all assets
+            gh release edit "$TAG" --draft
+            gh release view "$TAG" --json assets --jq '.assets[].name' \
+              | xargs -I{} gh release delete-asset "$TAG" "{}" --yes || true
+          else
+            gh release create "$TAG" --draft --title "$TAG"
+          fi
 
-  # Build for macOS (Apple Silicon)
-  build-macos-arm:
-    needs: create-release
-    runs-on: macos-latest
+  # Build frontend once and share as an artifact across all build jobs
+  build-frontend:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22.14.0'
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
+          cache: 'pnpm'
+          cache-dependency-path: grove-web/pnpm-lock.yaml
       - name: Build Frontend
         run: |
           cd grove-web
-          pnpm install --no-frozen-lockfile
+          pnpm install --frozen-lockfile
           pnpm run build
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: grove-web/dist
+          retention-days: 1
+
+  # Build for macOS (Apple Silicon)
+  build-macos-arm:
+    needs: [create-release, build-frontend, build-extension]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: grove-web/dist
+      - name: Download extension dist
+        uses: actions/download-artifact@v4
+        with:
+          name: grove-extension-dist
+          path: grove-extension/dist
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-arm-gui
+          add-job-id-key: false
+          save-if: false
       - name: Build (with GUI support)
         run: cargo build --release --target aarch64-apple-darwin --features gui
       - name: Package
@@ -63,32 +102,35 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload ${{ needs.create-release.outputs.tag }} \
+          gh release upload ${{ needs.create-release.outputs.tag }} --clobber \
             target/aarch64-apple-darwin/release/grove-${{ needs.create-release.outputs.tag }}-aarch64-apple-darwin.tar.gz
 
   # Build for macOS (Intel)
   build-macos-intel:
-    needs: create-release
+    needs: [create-release, build-frontend, build-extension]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
         with:
-          node-version: '22.14.0'
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+          name: frontend-dist
+          path: grove-web/dist
+      - name: Download extension dist
+        uses: actions/download-artifact@v4
         with:
-          version: 9
-      - name: Build Frontend
-        run: |
-          cd grove-web
-          pnpm install --no-frozen-lockfile
-          pnpm run build
+          name: grove-extension-dist
+          path: grove-extension/dist
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-intel-gui
+          add-job-id-key: false
+          save-if: false
       - name: Build (with GUI support)
         run: cargo build --release --target x86_64-apple-darwin --features gui
       - name: Package
@@ -99,32 +141,35 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload ${{ needs.create-release.outputs.tag }} \
+          gh release upload ${{ needs.create-release.outputs.tag }} --clobber \
             target/x86_64-apple-darwin/release/grove-${{ needs.create-release.outputs.tag }}-x86_64-apple-darwin.tar.gz
 
   # Build for Linux (x86_64) - using musl for maximum compatibility
   build-linux-x64:
-    needs: create-release
+    needs: [create-release, build-frontend, build-extension]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
         with:
-          node-version: '22.14.0'
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+          name: frontend-dist
+          path: grove-web/dist
+      - name: Download extension dist
+        uses: actions/download-artifact@v4
         with:
-          version: 9
-      - name: Build Frontend
-        run: |
-          cd grove-web
-          pnpm install --no-frozen-lockfile
-          pnpm run build
+          name: grove-extension-dist
+          path: grove-extension/dist
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x64-musl
+          add-job-id-key: false
+          save-if: false
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
@@ -137,30 +182,34 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload ${{ needs.create-release.outputs.tag }} \
+          gh release upload ${{ needs.create-release.outputs.tag }} --clobber \
             target/x86_64-unknown-linux-musl/release/grove-${{ needs.create-release.outputs.tag }}-x86_64-unknown-linux-musl.tar.gz
 
   # Build for Linux (ARM64) - using cross for reliable cross-compilation
   build-linux-arm:
-    needs: create-release
+    needs: [create-release, build-frontend, build-extension]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
         with:
-          node-version: '22.14.0'
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+          name: frontend-dist
+          path: grove-web/dist
+      - name: Download extension dist
+        uses: actions/download-artifact@v4
         with:
-          version: 9
-      - name: Build Frontend
-        run: |
-          cd grove-web
-          pnpm install --no-frozen-lockfile
-          pnpm run build
+          name: grove-extension-dist
+          path: grove-extension/dist
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-arm-cross
+          cache-all-crates: true
+          add-job-id-key: false
+          save-if: false
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross
       - name: Build
@@ -173,12 +222,201 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload ${{ needs.create-release.outputs.tag }} \
+          gh release upload ${{ needs.create-release.outputs.tag }} --clobber \
             target/aarch64-unknown-linux-musl/release/grove-${{ needs.create-release.outputs.tag }}-aarch64-unknown-linux-musl.tar.gz
+
+  # Build Linux desktop GUI (x86_64)
+  build-linux-gui-x64:
+    needs: [create-release, build-frontend, build-extension]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: grove-web/dist
+      - name: Download extension dist
+        uses: actions/download-artifact@v4
+        with:
+          name: grove-extension-dist
+          path: grove-extension/dist
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-linux-x64-gnu-gui
+          add-job-id-key: false
+          save-if: false
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+      - name: Build (with GUI support)
+        run: cargo build --release --target x86_64-unknown-linux-gnu --features gui
+      - name: Package
+        run: |
+          cd target/x86_64-unknown-linux-gnu/release
+          tar -czf grove-${{ needs.create-release.outputs.tag }}-x86_64-unknown-linux-gnu-gui.tar.gz grove
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ needs.create-release.outputs.tag }} --clobber \
+            target/x86_64-unknown-linux-gnu/release/grove-${{ needs.create-release.outputs.tag }}-x86_64-unknown-linux-gnu-gui.tar.gz
+
+  # Build for Windows (x86_64)
+  build-windows-x64:
+    needs: [create-release, build-frontend, build-extension]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: grove-web/dist
+      - name: Download extension dist
+        uses: actions/download-artifact@v4
+        with:
+          name: grove-extension-dist
+          path: grove-extension/dist
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-windows-x64-gui
+          add-job-id-key: false
+          save-if: false
+      - name: Build (with GUI support)
+        run: cargo build --release --target x86_64-pc-windows-msvc --features gui
+      - name: Package
+        shell: bash
+        run: |
+          cd target/x86_64-pc-windows-msvc/release
+          7z a grove-${{ needs.create-release.outputs.tag }}-x86_64-pc-windows-msvc.zip grove.exe
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release upload ${{ needs.create-release.outputs.tag }} --clobber \
+            target/x86_64-pc-windows-msvc/release/grove-${{ needs.create-release.outputs.tag }}-x86_64-pc-windows-msvc.zip
+
+  # Build macOS universal .app + DMG (arm64 + x86_64 combined)
+  build-macos-dmg:
+    needs: [create-release, build-frontend, build-extension]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: grove-web/dist
+      - name: Download extension dist
+        uses: actions/download-artifact@v4
+        with:
+          name: grove-extension-dist
+          path: grove-extension/dist
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-dmg-universal
+          cache-all-crates: true
+          add-job-id-key: false
+          save-if: false
+      - name: Cache Tauri CLI binary
+        uses: actions/cache@v4
+        id: cache-tauri
+        with:
+          path: ~/.cargo/bin/cargo-tauri
+          key: cargo-tauri-2.10.0-${{ runner.os }}
+      - name: Install Tauri CLI
+        if: steps.cache-tauri.outputs.cache-hit != 'true'
+        run: cargo install tauri-cli --version "=2.10.0" --locked
+      - name: Build universal DMG
+        run: |
+          cargo tauri build --target universal-apple-darwin --features gui \
+            --config '{"build":{"beforeBuildCommand":""}}'
+      - name: Rename and upload DMG
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.create-release.outputs.tag }}"
+          DMG=$(find target/universal-apple-darwin/release/bundle/dmg -name "*.dmg" | head -1)
+          cp "$DMG" "grove-${TAG}-universal-apple-darwin.dmg"
+          gh release upload "${TAG}" "grove-${TAG}-universal-apple-darwin.dmg" --clobber
+
+  # Build Chrome extension. Two roles:
+  #   1. Upload the unpacked `dist/` as an actions artifact so every grove
+  #      binary build job below can rust-embed it (extension.rs uses
+  #      `#[derive(Embed)] #[folder = "grove-extension/dist"]` — without
+  #      this, the in-app "Download Companion" button serves an empty zip
+  #      because the embed had nothing to bake in at compile time).
+  #   2. Upload the standalone zip as a release attachment for users who
+  #      want to side-load the extension without running grove.
+  build-extension:
+    needs: [create-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.14.0'
+          cache: 'pnpm'
+          cache-dependency-path: grove-extension/pnpm-lock.yaml
+      - name: Build Extension
+        run: |
+          cd grove-extension
+          pnpm install --frozen-lockfile
+          pnpm run build
+      - name: Upload extension dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grove-extension-dist
+          path: grove-extension/dist
+          retention-days: 1
+          if-no-files-found: error
+      - name: Zip extension dist
+        run: |
+          cd grove-extension/dist
+          zip -r ../../grove-extension-${{ needs.create-release.outputs.tag }}.zip ./*
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ needs.create-release.outputs.tag }} --clobber \
+            grove-extension-${{ needs.create-release.outputs.tag }}.zip
 
   # Publish the release
   publish-release:
-    needs: [create-release, build-macos-arm, build-macos-intel, build-linux-x64, build-linux-arm]
+    needs: [create-release, build-macos-arm, build-macos-intel, build-linux-x64, build-linux-arm, build-linux-gui-x64, build-macos-dmg, build-windows-x64, build-extension]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -186,3 +424,97 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release edit ${{ needs.create-release.outputs.tag }} --draft=false
+
+  # Update Homebrew Tap formula
+  update-homebrew:
+    needs: [create-release, publish-release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set version
+        id: version
+        run: |
+          TAG="${{ needs.create-release.outputs.tag }}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+
+      - name: Download release assets and compute checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          BASE_URL="https://github.com/GarrickZ2/grove/releases/download/${TAG}"
+          TARGETS="aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
+
+          for target in $TARGETS; do
+            curl -sSL -o "grove-${target}.tar.gz" "${BASE_URL}/grove-${TAG}-${target}.tar.gz"
+          done
+
+          # Compute sha256 and export as env vars
+          echo "SHA_AARCH64_DARWIN=$(sha256sum grove-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)" >> $GITHUB_ENV
+          echo "SHA_X86_64_DARWIN=$(sha256sum grove-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)" >> $GITHUB_ENV
+          echo "SHA_X86_64_LINUX=$(sha256sum grove-x86_64-unknown-linux-musl.tar.gz | cut -d' ' -f1)" >> $GITHUB_ENV
+          echo "SHA_AARCH64_LINUX=$(sha256sum grove-aarch64-unknown-linux-musl.tar.gz | cut -d' ' -f1)" >> $GITHUB_ENV
+
+      - name: Generate formula
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          cat > grove.rb << 'FORMULA'
+          class Grove < Formula
+            desc "The complete AI development workflow — from spec to ship"
+            homepage "https://garrickz2.github.io/grove/"
+            version "VERSION_PLACEHOLDER"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/GarrickZ2/grove/releases/download/v#{version}/grove-v#{version}-aarch64-apple-darwin.tar.gz"
+                sha256 "SHA_AARCH64_DARWIN_PLACEHOLDER"
+              elsif Hardware::CPU.intel?
+                url "https://github.com/GarrickZ2/grove/releases/download/v#{version}/grove-v#{version}-x86_64-apple-darwin.tar.gz"
+                sha256 "SHA_X86_64_DARWIN_PLACEHOLDER"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/GarrickZ2/grove/releases/download/v#{version}/grove-v#{version}-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "SHA_AARCH64_LINUX_PLACEHOLDER"
+              elsif Hardware::CPU.intel?
+                url "https://github.com/GarrickZ2/grove/releases/download/v#{version}/grove-v#{version}-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "SHA_X86_64_LINUX_PLACEHOLDER"
+              end
+            end
+
+            def install
+              bin.install "grove"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/grove --version")
+            end
+          end
+          FORMULA
+
+          # Replace placeholders with actual values
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" grove.rb
+          sed -i "s/SHA_AARCH64_DARWIN_PLACEHOLDER/${SHA_AARCH64_DARWIN}/g" grove.rb
+          sed -i "s/SHA_X86_64_DARWIN_PLACEHOLDER/${SHA_X86_64_DARWIN}/g" grove.rb
+          sed -i "s/SHA_X86_64_LINUX_PLACEHOLDER/${SHA_X86_64_LINUX}/g" grove.rb
+          sed -i "s/SHA_AARCH64_LINUX_PLACEHOLDER/${SHA_AARCH64_LINUX}/g" grove.rb
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' grove.rb
+
+      - name: Push to Homebrew Tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone https://x-access-token:${TAP_TOKEN}@github.com/GarrickZ2/homebrew-grove.git tap
+          mkdir -p tap/Formula
+          cp grove.rb tap/Formula/grove.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/grove.rb
+          git commit -m "Update grove to ${{ steps.version.outputs.version }}"
+          git push

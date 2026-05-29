@@ -1,6 +1,7 @@
-import { useRef, useEffect, useState, useCallback } from "react";
+import { useRef, useEffect, useLayoutEffect, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
+import { useIsMobile } from "../../hooks";
 
 export interface ContextMenuItem {
   id: string;
@@ -19,6 +20,108 @@ interface ContextMenuProps {
 }
 
 export function ContextMenu({ items, position, onClose }: ContextMenuProps) {
+  const { isMobile, isTouchDevice } = useIsMobile();
+
+  // On mobile/touch, render as Action Sheet
+  if ((isMobile || isTouchDevice) && position) {
+    return <ActionSheet items={items} isOpen={!!position} onClose={onClose} />;
+  }
+
+  return <DesktopContextMenu items={items} position={position} onClose={onClose} />;
+}
+
+// --- Action Sheet (mobile) ---
+function ActionSheet({ items, isOpen, onClose }: { items: ContextMenuItem[]; isOpen: boolean; onClose: () => void }) {
+  useEffect(() => {
+    if (isOpen) {
+      document.body.style.overflow = "hidden";
+    } else {
+      document.body.style.overflow = "";
+    }
+    return () => { document.body.style.overflow = ""; };
+  }, [isOpen]);
+
+  const getVariantColor = (variant: ContextMenuItem["variant"]) => {
+    switch (variant) {
+      case "warning": return "text-[var(--color-warning)]";
+      case "danger": return "text-[var(--color-error)]";
+      default: return "text-[var(--color-text)]";
+    }
+  };
+
+  return createPortal(
+    <AnimatePresence>
+      {isOpen && (
+        <>
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={onClose}
+            className="fixed inset-0 z-[9998] bg-black/50"
+          />
+          <motion.div
+            initial={{ y: "100%" }}
+            animate={{ y: 0 }}
+            exit={{ y: "100%" }}
+            transition={{ type: "spring", damping: 30, stiffness: 300 }}
+            className="fixed inset-x-0 bottom-0 z-[9999] pb-[env(safe-area-inset-bottom)]"
+          >
+            <div className="glass-overlay rounded-t-2xl">
+              {/* Drag indicator */}
+              <div className="flex justify-center pt-3 pb-2">
+                <div className="w-10 h-1 rounded-full bg-[var(--color-border)]" />
+              </div>
+
+              <div className="px-2 pb-3 max-h-[60vh] overflow-y-auto">
+                {items.map((item) => {
+                  if (item.divider) {
+                    return <div key={item.id} className="my-1 border-t border-[var(--color-border)]" />;
+                  }
+                  const Icon = item.icon;
+                  return (
+                    <button
+                      key={item.id}
+                      onClick={() => {
+                        if (!item.disabled) {
+                          item.onClick();
+                          onClose();
+                        }
+                      }}
+                      disabled={item.disabled}
+                      className={`
+                        w-full flex items-center gap-3 px-4 py-3 text-sm rounded-lg transition-colors
+                        ${getVariantColor(item.variant)}
+                        ${item.disabled ? "opacity-50 cursor-not-allowed" : "active:bg-[var(--color-bg-tertiary)]"}
+                      `}
+                    >
+                      {Icon && <Icon className="w-5 h-5" />}
+                      <span>{item.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Cancel button */}
+              <div className="px-2 pb-3">
+                <button
+                  onClick={onClose}
+                  className="w-full py-3 text-sm font-medium text-[var(--color-text-muted)] bg-[var(--color-bg-secondary)] rounded-lg active:bg-[var(--color-bg-tertiary)] transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        </>
+      )}
+    </AnimatePresence>,
+    document.body
+  );
+}
+
+// --- Desktop Context Menu ---
+function DesktopContextMenu({ items, position, onClose }: ContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [adjusted, setAdjusted] = useState<{ x: number; y: number } | null>(null);
   const [focusedIndex, setFocusedIndex] = useState(-1);
@@ -28,38 +131,28 @@ export function ContextMenu({ items, position, onClose }: ContextMenuProps) {
     .map((item, i) => (!item.divider && !item.disabled ? i : -1))
     .filter((i) => i !== -1);
 
-  // Reset focus when menu opens/closes
-  useEffect(() => {
-    if (position) {
-      setFocusedIndex(-1);
-    }
-  }, [position]);
-
-  // Adjust position to keep menu within viewport
-  useEffect(() => {
+  /* eslint-disable react-hooks/set-state-in-effect -- position sync requires setState in layout effect */
+  // Reset focus and adjust position when menu opens/closes
+  useLayoutEffect(() => {
     if (!position) {
       setAdjusted(null);
       return;
     }
-    // Start with the mouse position, adjust after render
-    setAdjusted(position);
-  }, [position]);
-
-  // After render, check bounds and adjust
-  useEffect(() => {
-    if (!position || !menuRef.current) return;
-    const rect = menuRef.current.getBoundingClientRect();
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
+    setFocusedIndex(-1);
+    // Start with mouse position, then clamp to viewport
     let { x, y } = position;
-    if (x + rect.width > vw) x = vw - rect.width - 8;
-    if (y + rect.height > vh) y = vh - rect.height - 8;
-    if (x < 0) x = 8;
-    if (y < 0) y = 8;
-    if (x !== adjusted?.x || y !== adjusted?.y) {
-      setAdjusted({ x, y });
+    if (menuRef.current) {
+      const rect = menuRef.current.getBoundingClientRect();
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      if (x + rect.width > vw) x = vw - rect.width - 8;
+      if (y + rect.height > vh) y = vh - rect.height - 8;
+      if (x < 0) x = 8;
+      if (y < 0) y = 8;
     }
-  });
+    setAdjusted({ x, y });
+  }, [position]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   // Close on click outside
   useEffect(() => {
@@ -164,7 +257,7 @@ export function ContextMenu({ items, position, onClose }: ContextMenuProps) {
           exit={{ opacity: 0, scale: 0.95 }}
           transition={{ duration: 0.12 }}
           style={{ top: pos.y, left: pos.x }}
-          className="fixed z-[9999] min-w-[160px] py-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-xl"
+          className="glass-popover fixed z-[9999] min-w-[160px] py-1 rounded-lg"
           data-hotkeys-dialog
         >
           {items.map((item, index) => {

@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { Button } from "../../ui";
 import { DiffReviewPage } from "../../Review";
+import type { FileNavRequest } from "../../Review";
 
 interface TaskCodeReviewProps {
   /** Project ID */
@@ -19,6 +20,13 @@ interface TaskCodeReviewProps {
   fullscreen?: boolean;
   /** Toggle fullscreen mode */
   onToggleFullscreen?: () => void;
+  /** Hide the review header (for FlexLayout tabs) */
+  hideHeader?: boolean;
+  /** External navigation request — open a file (optionally at a line) in Review */
+  navigateToFile?: FileNavRequest | null;
+  /** Whether the project is a git repository (non-git projects don't have Changes mode) */
+  isGitRepo?: boolean;
+  isChatBusy?: boolean;
 }
 
 export function TaskCodeReview({
@@ -27,18 +35,23 @@ export function TaskCodeReview({
   onClose,
   fullscreen = false,
   onToggleFullscreen,
+  hideHeader = false,
+  navigateToFile,
+  isGitRepo,
+  isChatBusy,
 }: TaskCodeReviewProps) {
-  const containerClass = `flex-1 flex flex-col bg-[var(--color-bg-secondary)] overflow-hidden ${fullscreen ? '' : 'rounded-lg border border-[var(--color-border)]'}`;
+  const containerClass = `h-full min-h-0 flex-1 flex flex-col bg-[var(--color-bg-secondary)] overflow-hidden ${fullscreen ? '' : 'rounded-lg border border-[var(--color-border)]'}`;
 
   return (
     <motion.div
       initial={{ x: "100%", opacity: 0 }}
-      animate={{ x: 0, opacity: 1 }}
+      animate={{ x: 0, opacity: 1, transitionEnd: { transform: "none" } }}
       exit={{ x: "100%", opacity: 0 }}
       transition={{ type: "spring", damping: 25, stiffness: 200 }}
       className={containerClass}
     >
-      {/* Header */}
+      {/* Header - 只在非 hideHeader 模式下显示 */}
+      {!hideHeader && (
       <div className="flex items-center justify-between px-4 py-2 bg-[var(--color-bg)] border-b border-[var(--color-border)]">
         <div className="flex items-center gap-2 text-sm text-[var(--color-text)]">
           <Code className="w-4 h-4" />
@@ -60,13 +73,18 @@ export function TaskCodeReview({
           </Button>
         </div>
       </div>
+      )}
 
       {/* Embedded diff review */}
-      <div className="flex-1 overflow-hidden">
+      <div className="flex-1 min-h-0 overflow-hidden">
         <DiffReviewPage
+          key={`${projectId}:${taskId}`}
           projectId={projectId}
           taskId={taskId}
           embedded
+          navigateToFile={navigateToFile}
+          isGitRepo={isGitRepo}
+          isChatBusy={isChatBusy}
         />
       </div>
     </motion.div>

@@ -20,13 +20,67 @@ use notify::{
     Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 
-pub use storage::{clear_edit_history, load_edit_history, save_edit_history, EditEvent};
+pub use storage::{load_edit_history, save_edit_history, EditEvent};
 
 /// Debounce window in seconds - ignore duplicate events for same file within this window
 const DEBOUNCE_SECS: i64 = 2;
 
 /// How often to refresh the git tracked files cache (in seconds)
 const GIT_CACHE_REFRESH_SECS: u64 = 60;
+
+/// Filter out filesystem noise that would otherwise pollute the edit history.
+///
+/// Two categories:
+/// - **OS/editor cruft**: `.DS_Store`, `Thumbs.db`, vim swap/backup files,
+///   emacs lockfiles. Never carry semantic meaning.
+/// - **Atomic-write temp files**: `<name>.tmp.<digits>` (Claude Code, Cursor,
+///   many others write here then rename to the target). The follow-up
+///   rename produces a separate event for the real file, so we don't lose
+///   the edit by skipping the tmp.
+///
+/// For git projects this filter is technically redundant with `git ls-files`
+/// (tmp files aren't tracked), but the ls-files cache refreshes only every
+/// 60s — newly created tmp files in the gap could slip through. For Studio
+/// projects (no git) this is the only line of defense.
+fn is_noise_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+
+    // OS metadata files
+    if matches!(name, ".DS_Store" | "Thumbs.db" | "desktop.ini" | "4913") {
+        return true;
+    }
+
+    // Editor swap / backup / lockfiles
+    if name.starts_with(".#")
+        || name.ends_with('~')
+        || name.ends_with(".swp")
+        || name.ends_with(".swo")
+        || name.ends_with(".swn")
+        || name.ends_with(".bak")
+        || name.ends_with(".orig")
+    {
+        return true;
+    }
+
+    // `<name>.tmp.<digits-or-hex>` — atomic-write pattern from many AI tools
+    // and editors. Suffix must be non-empty and all hex/digit chars to avoid
+    // accidentally matching a real file like `report.tmp.draft`.
+    if let Some(tmp_idx) = name.rfind(".tmp.") {
+        let suffix = &name[tmp_idx + ".tmp.".len()..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return true;
+        }
+    }
+
+    // Bare `.tmp` suffix
+    if name.ends_with(".tmp") {
+        return true;
+    }
+
+    false
+}
 
 /// Get list of git-tracked files in a directory
 fn get_git_tracked_files(worktree_path: &Path) -> HashSet<PathBuf> {
@@ -40,7 +94,7 @@ fn get_git_tracked_files(worktree_path: &Path) -> HashSet<PathBuf> {
             let stdout = String::from_utf8_lossy(&output.stdout);
             stdout
                 .lines()
-                .map(|line| PathBuf::from(line.trim()))
+                .map(|line| PathBuf::from(crate::git::git_unquote(line.trim())))
                 .collect()
         }
         _ => HashSet::new(),
@@ -96,7 +150,7 @@ impl TaskEditHistory {
     /// Get files sorted by edit count (descending)
     pub fn files_by_count(&self) -> Vec<(&PathBuf, u32)> {
         let mut files: Vec<_> = self.file_counts.iter().map(|(k, v)| (k, *v)).collect();
-        files.sort_by(|a, b| b.1.cmp(&a.1));
+        files.sort_by_key(|b| std::cmp::Reverse(b.1));
         files
     }
 
@@ -142,6 +196,11 @@ impl TaskEditHistory {
     }
 }
 
+/// Per-task event subscriber. Called from the watcher thread for every
+/// debounced edit event matching the registered `task_id`. Implementors
+/// must be lightweight — heavy work should be moved off-thread.
+pub type SubscriberFn = dyn Fn(&EditEvent) + Send + Sync + 'static;
+
 /// Manages file watching for multiple tasks
 pub struct FileWatcher {
     /// Sender to control the watcher thread
@@ -150,6 +209,10 @@ pub struct FileWatcher {
     histories: Arc<RwLock<HashMap<String, TaskEditHistory>>>,
     /// Pending events to flush
     pending_events: Arc<RwLock<HashMap<String, Vec<EditEvent>>>>,
+    /// Per-task callbacks invoked from the watcher thread for each
+    /// debounced edit event. Used by the symbol indexer to keep its
+    /// in-memory index in sync with disk; other consumers can plug in.
+    subscribers: Arc<RwLock<HashMap<String, Vec<Arc<SubscriberFn>>>>>,
     /// Project key for storage
     project_key: String,
 }
@@ -173,7 +236,32 @@ impl FileWatcher {
             control_tx: None,
             histories: Arc::new(RwLock::new(HashMap::new())),
             pending_events: Arc::new(RwLock::new(HashMap::new())),
+            subscribers: Arc::new(RwLock::new(HashMap::new())),
             project_key: project_key.to_string(),
+        }
+    }
+
+    /// Register a callback for `task_id`. Multiple callbacks per task
+    /// are supported; they fire in registration order. Idempotent in
+    /// the sense that repeated registrations stack — call `unsubscribe`
+    /// to clear.
+    #[allow(dead_code)]
+    pub fn subscribe<F>(&self, task_id: impl Into<String>, callback: F)
+    where
+        F: Fn(&EditEvent) + Send + Sync + 'static,
+    {
+        if let Ok(mut subs) = self.subscribers.write() {
+            subs.entry(task_id.into())
+                .or_default()
+                .push(Arc::new(callback));
+        }
+    }
+
+    /// Drop all callbacks for `task_id`. No-op if none were registered.
+    #[allow(dead_code)]
+    pub fn unsubscribe(&self, task_id: &str) {
+        if let Ok(mut subs) = self.subscribers.write() {
+            subs.remove(task_id);
         }
     }
 
@@ -182,10 +270,29 @@ impl FileWatcher {
         let (control_tx, control_rx) = channel();
         let histories = Arc::clone(&self.histories);
         let pending_events = Arc::clone(&self.pending_events);
+        let subscribers = Arc::clone(&self.subscribers);
         let project_key = self.project_key.clone();
 
         thread::spawn(move || {
-            run_watcher_thread(control_rx, histories, pending_events, project_key);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_watcher_thread(
+                    control_rx,
+                    histories,
+                    pending_events,
+                    subscribers,
+                    project_key,
+                );
+            }));
+            if let Err(e) = result {
+                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                eprintln!("[Grove] File watcher thread panicked: {}", msg);
+            }
         });
 
         self.control_tx = Some(control_tx);
@@ -296,6 +403,7 @@ fn run_watcher_thread(
     control_rx: Receiver<WatcherCommand>,
     histories: Arc<RwLock<HashMap<String, TaskEditHistory>>>,
     pending_events: Arc<RwLock<HashMap<String, Vec<EditEvent>>>>,
+    subscribers: Arc<RwLock<HashMap<String, Vec<Arc<SubscriberFn>>>>>,
     project_key: String,
 ) {
     let (event_tx, event_rx) = channel();
@@ -346,6 +454,12 @@ fn run_watcher_thread(
                         let _ = watcher.unwatch(&path);
                         path_to_task.remove(&path);
                         git_tracked_cache.remove(&path);
+                    }
+                    // Also drop any subscriber callbacks for this task so
+                    // they release their captured Arcs and don't fire on
+                    // a residual late event.
+                    if let Ok(mut subs) = subscribers.write() {
+                        subs.remove(&task_id);
                     }
                 }
                 WatcherCommand::Shutdown => {
@@ -413,9 +527,16 @@ fn run_watcher_thread(
                                     continue;
                                 }
 
+                                // Drop OS cruft and atomic-write tmp files
+                                // before any git/disk check.
+                                if is_noise_file(&relative_path) {
+                                    continue;
+                                }
+
                                 // Only track git-tracked files
+                                // Empty set means no git repo (Studio project) - track all files
                                 if let Some(tracked) = git_tracked_cache.get(watch_path) {
-                                    if !tracked.contains(&relative_path) {
+                                    if !tracked.is_empty() && !tracked.contains(&relative_path) {
                                         continue;
                                     }
                                 }
@@ -444,6 +565,28 @@ fn run_watcher_thread(
                         .entry(task_id.clone())
                         .or_insert_with(TaskEditHistory::new);
                     history.add_event(event.clone());
+                }
+            }
+
+            // Dispatch to per-task subscribers. We snapshot the
+            // callbacks per task under a short read lock, then call
+            // them outside the lock so a slow callback can't stall
+            // event processing for unrelated tasks.
+            let snapshots: HashMap<String, Vec<Arc<SubscriberFn>>> = match subscribers.read() {
+                Ok(subs) => batch
+                    .iter()
+                    .map(|(tid, _)| tid.clone())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .filter_map(|tid| subs.get(&tid).map(|v| (tid, v.clone())))
+                    .collect(),
+                Err(_) => HashMap::new(),
+            };
+            for (task_id, event) in &batch {
+                if let Some(callbacks) = snapshots.get(task_id) {
+                    for cb in callbacks {
+                        cb(event);
+                    }
                 }
             }
 

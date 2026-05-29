@@ -1,0 +1,85 @@
+import type { GroupSnapshot, ChatRef } from "../data/types";
+
+// ─── Target Mode ────────────────────────────────────────────────────────────
+
+export type TargetMode =
+  | { mode: "chat"; chat_id: string }
+  | { mode: "terminal" };
+
+// ─── Client → Server ────────────────────────────────────────────────────────
+
+export type WalkieTalkieClientMessage =
+  | { type: "switch_group"; group_id: string }
+  | { type: "select_task"; group_id: string; position: number; target?: TargetMode }
+  | { type: "send_prompt"; group_id: string; position: number; text: string; chat_id?: string | null; target?: TargetMode }
+  | { type: "switch_chat"; group_id: string; position: number; direction: "next" | "prev" }
+  | { type: "set_target"; group_id: string; position: number; target: TargetMode };
+
+// ─── Server → Client ────────────────────────────────────────────────────────
+
+export type WalkieTalkieServerMessage =
+  | { type: "connected"; groups: GroupSnapshot[]; theme: string }
+  | { type: "task_status"; project_id: string; task_id: string; agent_status: "idle" | "busy" | "disconnected" }
+  | { type: "prompt_sent"; group_id: string; position: number; status: "ok" | "error"; error?: string }
+  | { type: "chat_info"; position: number; active_chat: ChatRef | null; available_chats: ChatRef[] }
+  | { type: "group_updated"; groups: GroupSnapshot[] }
+  | { type: "theme_changed"; theme: string };
+
+// ─── Radio Events (Desktop ← Radio) ───────────────────────────────────────
+
+export type NodeStatus =
+  | "connecting"
+  | "idle"
+  | "busy"
+  | "permission_required"
+  | "disconnected";
+
+export type RadioEvent =
+  | { type: "focus_task"; project_id: string; task_id: string; target?: TargetMode }
+  | { type: "focus_target"; project_id: string; task_id: string; target: TargetMode }
+  | { type: "terminal_input"; project_id: string; task_id: string; text: string }
+  | { type: "prompt_sent"; project_id: string; task_id: string }
+  | { type: "task_status"; project_id: string; task_id: string; agent_status: "idle" | "busy" | "disconnected" }
+  | {
+      type: "chat_status";
+      project_id: string;
+      task_id: string;
+      chat_id: string;
+      status: NodeStatus;
+      /** Populated when status==="permission_required". */
+      permission?: {
+        description: string;
+        options: Array<{ option_id: string; name: string; kind: string }>;
+      };
+      /** Display fields filled by acp/mod.rs::emit() for menubar tray etc. */
+      project_name?: string;
+      task_name?: string;
+      chat_title?: string;
+      agent?: string;
+      /** User prompt — populated when status==="busy". */
+      prompt?: string;
+      /** Final assistant message — populated when status==="idle" after busy. */
+      message?: string;
+      /** TodoWrite-style plan progress — number of `completed` entries.
+       *  Pairs with `todo_total`. Absent for chats whose agent never emits a plan. */
+      todo_completed?: number;
+      /** Total entries in the latest plan. See `todo_completed`. */
+      todo_total?: number;
+    }
+  | {
+      type: "pending_changed";
+      project_id: string;
+      task_id: string;
+      msg_id: string;
+      from_chat_id: string;
+      to_chat_id: string;
+      op: "inserted" | "deleted";
+      body_excerpt?: string;
+    }
+  | { type: "hook_added"; project_id: string; task_id: string }
+  | { type: "chat_list_changed"; project_id: string; task_id: string }
+  | { type: "client_connected" }
+  | { type: "client_disconnected" }
+  | { type: "client_count"; count: number }
+  | { type: "group_changed" }
+  | { type: "theme_changed" };

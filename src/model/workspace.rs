@@ -3,9 +3,8 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::session;
-use crate::storage::workspace::{self as storage, project_hash};
-use crate::storage::{config, tasks};
+use crate::storage::tasks;
+use crate::storage::workspace::{self as storage, project_hash, ProjectType};
 
 /// 项目信息（带运行时统计）
 #[derive(Debug, Clone)]
@@ -21,6 +20,10 @@ pub struct ProjectInfo {
     pub task_count: usize,
     /// Live 状态的任务数
     pub live_count: usize,
+    /// 是否为 git 仓库
+    pub is_git_repo: bool,
+    /// 文件系统路径是否还存在(false = "missing" 状态)
+    pub exists: bool,
 }
 
 /// Workspace 状态
@@ -56,17 +59,24 @@ impl WorkspaceState {
 
         self.projects = registered
             .into_iter()
+            .filter(|p| p.project_type != ProjectType::Studio)
             .map(|p| {
                 // 计算任务数（使用项目路径的 hash 作为存储 key）
                 let hash = project_hash(&p.path);
-                let (task_count, live_count) = count_tasks(&hash);
+                let task_count = count_tasks(&hash);
+                let exists = std::path::Path::new(&p.path).exists();
+                // Live check: 避免用户在 Grove 外部 `git init` 后 UI 不刷新
+                // (和 API 侧保持一致的语义)
+                let is_git_repo = exists && crate::git::is_git_usable(&p.path);
 
                 ProjectInfo {
                     name: p.name,
                     path: p.path,
                     added_at: p.added_at,
                     task_count,
-                    live_count,
+                    live_count: 0,
+                    is_git_repo,
+                    exists,
                 }
             })
             .collect();
@@ -250,21 +260,7 @@ impl WorkspaceState {
 
 /// 计算任务数量
 /// project_key: 项目路径的 hash，用于加载任务数据
-fn count_tasks(project_key: &str) -> (usize, usize) {
+fn count_tasks(project_key: &str) -> usize {
     let active_tasks = tasks::load_tasks(project_key).unwrap_or_default();
-    let task_count = active_tasks.len();
-
-    let global_mux = config::load_config().multiplexer;
-
-    // 计算 live 数量（检查 session 是否运行）
-    let live_count = active_tasks
-        .iter()
-        .filter(|t| {
-            let task_mux = session::resolve_multiplexer(&t.multiplexer, &global_mux);
-            let sname = session::resolve_session_name(&t.session_name, project_key, &t.id);
-            session::session_exists(&task_mux, &sname)
-        })
-        .count();
-
-    (task_count, live_count)
+    active_tasks.len()
 }

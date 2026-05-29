@@ -1,8 +1,15 @@
 //! Web server CLI command
 
 use crate::api;
+use crate::api::auth::{self, ServerAuth};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+
+/// Create a ServerAuth with no auth (grove web mode — no auth required)
+fn no_auth() -> Arc<ServerAuth> {
+    Arc::new(ServerAuth::no_auth())
+}
 
 /// Default port for the web server
 pub const DEFAULT_PORT: u16 = 3001;
@@ -85,13 +92,190 @@ fn find_project_dir() -> Option<PathBuf> {
 }
 
 /// Execute the web server
-pub async fn execute(port: u16, no_open: bool, dev: bool) {
-    if dev {
+///
+/// When `remote_url` is `Some`, no local API server is started. Instead a
+/// minimal HTTP server serves the static frontend with
+/// `window.__GROVE_API_BASE__` injected into `index.html`, so that
+/// `AuthGate` and `apiClient` direct every API call to the remote Grove
+/// server (typically `grove mobile`). The form appears as usual for password input.
+pub async fn execute(port: u16, no_open: bool, dev: bool, remote_url: Option<String>) {
+    if let Some(base_url) = remote_url {
+        execute_remote_mode(port, no_open, base_url).await;
+    } else if dev {
         // Development mode: run vite dev server + API server
         execute_dev_mode(port, no_open).await;
     } else {
         // Production mode: serve static files
         execute_prod_mode(port, no_open).await;
+    }
+}
+
+/// Resolve the bind host for `grove mobile`.
+///
+/// Priority: `--private` (localhost) > `--host` > `--public` (0.0.0.0) > auto-detected LAN IP > fallback 0.0.0.0
+fn resolve_mobile_host(host: Option<String>, public: bool, private: bool) -> String {
+    if private {
+        return "127.0.0.1".to_string();
+    }
+    if let Some(h) = host {
+        return h;
+    }
+    if public {
+        return "0.0.0.0".to_string();
+    }
+    // Default: bind to detected LAN IP (more secure than 0.0.0.0)
+    api::get_lan_ip().unwrap_or_else(|| {
+        eprintln!("Warning: could not detect LAN IP, falling back to 0.0.0.0");
+        "0.0.0.0".to_string()
+    })
+}
+
+/// Minimum acceptable length for a user-supplied passkey.
+///
+/// Threat model is *online* HMAC brute force from the LAN — attacker has to
+/// send a real signed request per guess (~1000 req/s ceiling), not offline
+/// hash cracking. 8 mixed alphanumeric chars (~218 trillion combos) is many
+/// millennia at that rate. Real risk is dictionary words, which length alone
+/// can't stop; the mixed letter+digit requirement filters out the worst.
+const MIN_PASSKEY_LEN: usize = 8;
+
+/// Validate a user-typed passkey from the interactive prompt. Auto-generated
+/// keys (32 random bytes hex) bypass this entirely.
+fn validate_passkey(pk: &str) -> Result<(), String> {
+    let trimmed = pk.trim();
+    if trimmed.is_empty() {
+        return Err("passkey cannot be empty".to_string());
+    }
+    if trimmed.len() < MIN_PASSKEY_LEN {
+        return Err(format!(
+            "passkey must be at least {} characters (got {})",
+            MIN_PASSKEY_LEN,
+            trimmed.len()
+        ));
+    }
+    let has_letter = trimmed.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit = trimmed.chars().any(|c| c.is_ascii_digit());
+    if !(has_letter && has_digit) {
+        return Err("passkey must contain both letters and digits".to_string());
+    }
+    Ok(())
+}
+
+/// TLS configuration for `start_server`.
+pub enum TlsMode {
+    /// No TLS.
+    Off,
+    /// Auto-generate a self-signed certificate.
+    SelfSigned,
+    /// Use user-provided certificate and key files.
+    Custom { cert: String, key: String },
+}
+
+/// Read a passkey interactively, ssh-keygen style.
+///
+/// - TTY + empty input → auto-generate.
+/// - TTY + non-empty → validate and use.
+/// - No TTY (piped/CI) → auto-generate (we can't prompt).
+///
+/// Hidden input via `rpassword` keeps the value off the screen; the value
+/// never appears as a process argv either, so it stays out of `~/.zsh_history`.
+fn read_passkey_interactive(public_bind: bool) -> (String, bool) {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return (auth::generate_secret_key(), true);
+    }
+
+    let prompt = "Enter passkey (empty to auto-generate): ";
+    let input = match rpassword::prompt_password(prompt) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to read passkey: {} — auto-generating.", e);
+            return (auth::generate_secret_key(), true);
+        }
+    };
+
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return (auth::generate_secret_key(), true);
+    }
+
+    if let Err(msg) = validate_passkey(trimmed) {
+        eprintln!("Error: {}", msg);
+        std::process::exit(2);
+    }
+
+    if public_bind {
+        eprintln!(
+            "Warning: a user-chosen passkey + --public exposes Grove to your full \
+             LAN. Only do this on a network you trust."
+        );
+    }
+
+    (trimmed.to_string(), false)
+}
+
+/// Execute the mobile-friendly web server (LAN-accessible with HMAC-SHA256 auth)
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_mobile(
+    port: u16,
+    no_open: bool,
+    tls: bool,
+    cert: Option<String>,
+    key: Option<String>,
+    host: Option<String>,
+    public: bool,
+    private: bool,
+) {
+    let bind_host = resolve_mobile_host(host, public, private);
+    let (sk, key_is_generated) = read_passkey_interactive(bind_host == "0.0.0.0");
+    let auth = Arc::new(ServerAuth::hmac(sk, key_is_generated));
+
+    // Determine TLS mode: --cert/--key implies --tls
+    let tls_mode = match (cert, key) {
+        (Some(c), Some(k)) => TlsMode::Custom { cert: c, key: k },
+        _ if tls => TlsMode::SelfSigned,
+        _ => TlsMode::Off,
+    };
+
+    // Check for embedded assets first
+    let has_embedded = api::has_embedded_assets();
+    let static_dir = api::find_static_dir();
+
+    let open_browser = !no_open;
+
+    // If no embedded assets and no external files, try to build
+    if !has_embedded && static_dir.is_none() {
+        if let Some(project_dir) = find_project_dir() {
+            if build_frontend(&project_dir) {
+                let built_dir = project_dir.join("grove-web").join("dist");
+                if let Err(e) = api::start_server(
+                    &bind_host,
+                    port,
+                    Some(built_dir),
+                    open_browser,
+                    auth,
+                    tls_mode,
+                )
+                .await
+                {
+                    eprintln!("Server error: {}", e);
+                    std::process::exit(1);
+                }
+                return;
+            }
+        }
+
+        eprintln!("Could not find or build frontend files.");
+        eprintln!("Please build the frontend first:");
+        eprintln!("  cd grove-web && npm install && npm run build");
+        std::process::exit(1);
+    }
+
+    if let Err(e) =
+        api::start_server(&bind_host, port, static_dir, open_browser, auth, tls_mode).await
+    {
+        eprintln!("Server error: {}", e);
+        std::process::exit(1);
     }
 }
 
@@ -154,7 +338,9 @@ async fn execute_dev_mode(api_port: u16, no_open: bool) {
     println!("\nPress Ctrl+C to stop");
 
     // Start API server (blocking) - don't open browser (Vite handles frontend)
-    if let Err(e) = api::start_server(api_port, None, false).await {
+    if let Err(e) =
+        api::start_server("127.0.0.1", api_port, None, false, no_auth(), TlsMode::Off).await
+    {
         eprintln!("API server error: {}", e);
     }
 
@@ -178,7 +364,16 @@ async fn execute_prod_mode(port: u16, no_open: bool) {
         if let Some(project_dir) = find_project_dir() {
             if build_frontend(&project_dir) {
                 let built_dir = project_dir.join("grove-web").join("dist");
-                if let Err(e) = api::start_server(port, Some(built_dir), open_browser).await {
+                if let Err(e) = api::start_server(
+                    "127.0.0.1",
+                    port,
+                    Some(built_dir),
+                    open_browser,
+                    no_auth(),
+                    TlsMode::Off,
+                )
+                .await
+                {
                     eprintln!("Server error: {}", e);
                     std::process::exit(1);
                 }
@@ -194,7 +389,64 @@ async fn execute_prod_mode(port: u16, no_open: bool) {
     }
 
     // Start the server (will use embedded assets if no external static_dir)
-    if let Err(e) = api::start_server(port, static_dir, open_browser).await {
+    if let Err(e) = api::start_server(
+        "127.0.0.1",
+        port,
+        static_dir,
+        open_browser,
+        no_auth(),
+        TlsMode::Off,
+    )
+    .await
+    {
+        eprintln!("Server error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+/// Execute the web server in remote mode.
+///
+/// Starts the unified Axum server with the reverse proxy router configured.
+/// Both Web and GUI modes now share the exact same reverse proxy logic, preventing
+/// duplication, port collision, and cross-origin CSRF/CORS issues!
+async fn execute_remote_mode(port: u16, no_open: bool, base_url: String) {
+    use std::sync::Arc;
+
+    let api_base = base_url.trim_end_matches('/').to_string();
+
+    let (listener, actual_port) = match api::bind_with_fallback("127.0.0.1", port, 10).await {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!(
+                "Failed to bind to 127.0.0.1 starting from port {}: {}",
+                port, e
+            );
+            std::process::exit(1);
+        }
+    };
+
+    println!(
+        "Grove web (remote mode): frontend on http://localhost:{}",
+        actual_port
+    );
+    println!("Grove web (remote mode): API target  -> {}", api_base);
+
+    // Create the same proxy router used by the GUI mode!
+    let auth = Arc::new(ServerAuth::no_auth());
+
+    // Check for embedded or external static assets
+    let static_dir = api::find_static_dir();
+    let app = api::create_router(static_dir, auth, Some(api_base));
+
+    if !no_open {
+        let url = format!("http://localhost:{}", actual_port);
+        println!("Opening browser: {}", url);
+        let _ = open::that(&url);
+    }
+
+    println!("\nPress Ctrl+C to stop");
+
+    if let Err(e) = axum::serve(listener, app).await {
         eprintln!("Server error: {}", e);
         std::process::exit(1);
     }

@@ -1,15 +1,20 @@
 //! CLI 模块
 
+pub mod acp;
 pub mod diff;
 pub mod fp;
 pub mod hooks;
 pub mod mcp;
+pub mod mcp_bridge;
+pub mod migrate;
 pub mod web;
 
 #[cfg(feature = "gui")]
 pub mod gui;
 
 use clap::{Parser, Subcommand};
+
+use crate::storage::config::LastLaunch;
 
 #[derive(Parser)]
 #[command(name = "grove")]
@@ -22,6 +27,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Launch the terminal UI (same as running 'grove' with no arguments)
+    Tui,
     /// Send hook notifications
     Hooks {
         #[command(subcommand)]
@@ -29,6 +36,13 @@ pub enum Commands {
     },
     /// Start MCP server (stdio transport) for AI integration
     Mcp,
+    /// Stdio↔HTTP bridge for the agent_graph MCP. Used by ACP agents whose
+    /// MCP client doesn't accept ACP-injected MCP servers (e.g. Trae) — the
+    /// user wires `command = "grove", args = ["mcp-bridge"]` into the agent's
+    /// own MCP config; the bridge inherits `GROVE_MCP_TOKEN` / `GROVE_MCP_PORT`
+    /// from the parent agent process and forwards stdio JSON-RPC to the
+    /// running Grove server's HTTP MCP listener.
+    McpBridge,
     /// Interactive file picker using fzf
     Fp,
     /// Start the web UI server (API + frontend)
@@ -42,6 +56,11 @@ pub enum Commands {
         /// Development mode (run Vite dev server with HMR)
         #[arg(long)]
         dev: bool,
+        /// Connect to a remote Grove server instead of starting a local one.
+        /// The local web server will only serve the frontend; all API calls
+        /// will be proxied/directed to this URL (e.g. http://192.168.1.5:3001).
+        #[arg(long, value_name = "URL")]
+        remote_url: Option<String>,
     },
     /// Open diff review for a task in the browser
     Diff {
@@ -56,5 +75,149 @@ pub enum Commands {
         /// Port for the internal API server
         #[arg(short, long, default_value_t = 3001)]
         port: u16,
+        /// Connect to a remote Grove server instead of starting a local one.
+        /// The Tauri window will load the remote URL directly without starting
+        /// a local API server (e.g. http://192.168.1.5:3001).
+        #[arg(long, value_name = "URL")]
+        remote_url: Option<String>,
     },
+    /// Start an interactive ACP chat session with an AI agent
+    Acp {
+        /// Agent name (e.g., "claude")
+        agent: String,
+        /// Working directory
+        #[arg(long, default_value = ".")]
+        cwd: String,
+    },
+    /// Start the mobile-friendly web server (LAN-accessible with HMAC-SHA256 auth)
+    Mobile {
+        /// Port to listen on
+        #[arg(short, long, default_value_t = web::DEFAULT_PORT)]
+        port: u16,
+        /// Don't automatically open browser
+        #[arg(long)]
+        no_open: bool,
+        /// Enable TLS (auto-generates self-signed cert if --cert/--key not provided)
+        #[arg(long)]
+        tls: bool,
+        /// Path to TLS certificate file (PEM). Implies --tls
+        #[arg(long, requires = "key")]
+        cert: Option<String>,
+        /// Path to TLS private key file (PEM). Implies --tls
+        #[arg(long, requires = "cert")]
+        key: Option<String>,
+        /// Bind to a specific host address (default: auto-detected LAN IP)
+        #[arg(long, conflicts_with_all = ["private", "public"])]
+        host: Option<String>,
+        /// Bind to 0.0.0.0 (all interfaces)
+        #[arg(long, conflicts_with_all = ["private", "host"])]
+        public: bool,
+        /// Bind to localhost only (127.0.0.1); disables LAN access
+        #[arg(long, conflicts_with_all = ["host", "public"])]
+        private: bool,
+    },
+    /// Migrate storage to the latest format. Same flow that runs at startup —
+    /// safe to invoke manually if a previous run was interrupted.
+    Migrate {
+        /// Remove legacy files that have already been migrated to SQLite.
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Register a project in Grove
+    Register {
+        /// Path to the project (defaults to current directory)
+        path: Option<String>,
+    },
+    /// Remove a project from Grove
+    Remove {
+        /// Path to the project (defaults to current directory)
+        path: Option<String>,
+    },
+}
+
+impl Commands {
+    /// 将启动模式命令转换为 `LastLaunch`（非启动模式命令返回 None）
+    pub fn to_last_launch(&self) -> Option<LastLaunch> {
+        match self {
+            Commands::Tui => Some(LastLaunch::Tui),
+            Commands::Web {
+                port,
+                no_open,
+                dev,
+                remote_url,
+            } => Some(LastLaunch::Web {
+                port: *port,
+                no_open: *no_open,
+                dev: *dev,
+                remote_url: remote_url.clone(),
+            }),
+            Commands::Mobile {
+                port,
+                no_open,
+                tls,
+                cert,
+                key,
+                host,
+                public,
+                private,
+            } => Some(LastLaunch::Mobile {
+                port: *port,
+                no_open: *no_open,
+                tls: *tls,
+                cert: cert.clone(),
+                key: key.clone(),
+                host: host.clone(),
+                public: *public,
+                private: *private,
+            }),
+            Commands::Gui { port, remote_url } => Some(LastLaunch::Gui {
+                port: *port,
+                remote_url: remote_url.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl LastLaunch {
+    /// 将 `LastLaunch` 转换回 `Commands` 以便统一调度
+    pub fn to_command(&self) -> Commands {
+        match self {
+            LastLaunch::Tui => Commands::Tui,
+            LastLaunch::Web {
+                port,
+                no_open,
+                dev,
+                remote_url,
+            } => Commands::Web {
+                port: *port,
+                no_open: *no_open,
+                dev: *dev,
+                remote_url: remote_url.clone(),
+            },
+            LastLaunch::Mobile {
+                port,
+                no_open,
+                tls,
+                cert,
+                key,
+                host,
+                public,
+                private,
+            } => Commands::Mobile {
+                port: *port,
+                no_open: *no_open,
+                tls: *tls,
+                cert: cert.clone(),
+                key: key.clone(),
+                host: host.clone(),
+                public: *public,
+                private: *private,
+            },
+            LastLaunch::Gui { port, remote_url } => Commands::Gui {
+                port: *port,
+                remote_url: remote_url.clone(),
+            },
+        }
+    }
 }
