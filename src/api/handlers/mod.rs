@@ -15,10 +15,12 @@ pub mod extension;
 pub mod folder;
 pub mod git;
 pub mod hooks;
+pub mod keymap;
 pub mod libraries;
 pub mod marketplace;
 #[cfg(feature = "perf-monitor")]
 pub mod perf;
+pub mod plugins;
 pub mod projects;
 pub mod render;
 pub mod skills;

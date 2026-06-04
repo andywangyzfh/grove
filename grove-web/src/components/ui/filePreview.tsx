@@ -17,6 +17,7 @@ import {
 } from "./VirtualizedMarkdownRenderer";
 import { PreviewCommentHost } from "../Review/PreviewCommentHost";
 import type { PreviewCommentLocator, PreviewCommentDraft } from "../../context";
+import { useKeyboardScope, useCommand, useContextKey } from "../../keyboard";
 
 
 export function getExtBadge(name: string): string {
@@ -303,22 +304,76 @@ export function FilePreviewDrawer({
     }
   }, [searchOpen, isIframeRenderer, previewId]);
 
-  // Cmd/Ctrl+F: only intercept when this drawer contains the keyboard focus.
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key !== "f" || !(e.metaKey || e.ctrlKey)) return;
-      const root = drawerRef.current;
-      if (!root) return;
-      const target = document.activeElement;
-      if (!target || !root.contains(target)) return;
-      e.preventDefault();
-      e.stopPropagation();
-      e.stopImmediatePropagation();
-      setSearchOpen((v) => !v);
-    };
-    window.addEventListener("keydown", handler, true);
-    return () => window.removeEventListener("keydown", handler, true);
-  }, []);
+  // ── Keyboard scopes & commands ─────────────────────────────────────────
+  // Layered scopes: deeper scope (modal > fullscreen > drawer) handles
+  // Escape first via stack ordering — no priority field, no
+  // stopImmediatePropagation. Cmd/Ctrl+F gated by `enabled` so it only
+  // fires when focus is inside the drawer (preserving the original
+  // root.contains check). Scope names match the catalog declarations in
+  // src/keyboard/catalog/filePreview.ts ("preview", "preview.search",
+  // "preview.fullscreen", "preview.commentMode", "preview.commentModal").
+  useKeyboardScope("preview");
+  useKeyboardScope("preview.search", searchOpen);
+  useKeyboardScope("preview.fullscreen", fullscreen || groveFullscreen);
+  useKeyboardScope("preview.commentMode", commentMode);
+  useKeyboardScope("preview.commentModal", pendingLocator !== null);
+  useContextKey("canToggleSource", canToggleSource);
+
+  const drawerContainsFocus = () =>
+    !!drawerRef.current?.contains(document.activeElement);
+
+  // Escape lightbox check: when the lightbox is open it owns Escape via its
+  // own scope (see ImageLightbox). Until every consumer of FilePreviewDrawer
+  // mounts a lightbox-aware version, keep the data-attribute fallback so a
+  // stray lightbox doesn't double-fire close handlers.
+  const lightboxNotOpen = () =>
+    !document.querySelector('[data-lightbox-active="true"]');
+
+  useCommand("preview.toggleSearch", () => setSearchOpen((v) => !v), {
+    enabled: drawerContainsFocus,
+  });
+
+  useCommand("preview.close", onClose, { enabled: lightboxNotOpen }, [onClose]);
+
+  useCommand(
+    "preview.exitFullscreen",
+    () => {
+      if (groveFullscreen) setGroveFullscreen(false);
+      else if (fullscreen) setFullscreen(false);
+    },
+    { enabled: lightboxNotOpen },
+    [fullscreen, groveFullscreen],
+  );
+
+  useCommand("preview.closeSearch", () => setSearchOpen(false));
+
+  useCommand("preview.exitCommentMode", () => setCommentMode(false));
+
+  useCommand("preview.closeCommentModal", () => {
+    setPendingLocator(null);
+    setCommentText("");
+    setEditingDraftId(null);
+  });
+
+  // Action commands — mirror the header button behaviour so the command
+  // palette / future key bindings drive the same UI state. `toggleFullscreen`
+  // targets the panel-fullscreen mode (the Maximize2 button); the Grove
+  // fullscreen mode stays mouse-only since the catalog only ships one
+  // "Toggle Fullscreen" entry.
+  useCommand("preview.toggleFullscreen", () => setFullscreen((f) => !f));
+  useCommand("preview.download", onDownload, [onDownload]);
+  useCommand(
+    "preview.toggleSource",
+    () => setShowSource((s) => !s),
+    { enabled: () => canToggleSource },
+    [canToggleSource],
+  );
+  useCommand(
+    "preview.toggleComment",
+    () => setCommentMode((v) => !v),
+    { enabled: () => commentable && !showSource },
+    [commentable, showSource],
+  );
 
   // Reset search state when file changes
   useEffect(() => {
@@ -332,33 +387,6 @@ export function FilePreviewDrawer({
       cancelled = true;
     };
   }, [fileName]);
-
-  // Esc: exit true fullscreen first, then panel fullscreen, otherwise close the drawer. Uses capture +
-  // stopImmediatePropagation so the global useHotkeys (which also runs in
-  // capture phase and would close the workspace on Esc) never fires.
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      // Let the Lightbox handle Esc when it's open.
-      if (document.querySelector('[data-lightbox-active="true"]')) return;
-      // Let the comment modal handle its own Esc first — without this, the
-      // drawer handler swallows Esc and closes the whole drawer, losing any
-      // in-progress comment text.
-      if (pendingLocator) return;
-      e.preventDefault();
-      e.stopPropagation();
-      e.stopImmediatePropagation();
-      if (groveFullscreen) {
-        setGroveFullscreen(false);
-      } else if (fullscreen) {
-        setFullscreen(false);
-      } else {
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", handler, true);
-    return () => window.removeEventListener("keydown", handler, true);
-  }, [fullscreen, groveFullscreen, onClose, pendingLocator]);
 
   useEffect(() => {
     if (!commentable) return;
@@ -412,19 +440,6 @@ export function FilePreviewDrawer({
       cancelled = true;
     };
   }, [fileName]);
-
-  useEffect(() => {
-    if (!pendingLocator) return;
-    const handler = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      e.preventDefault();
-      e.stopPropagation();
-      e.stopImmediatePropagation();
-      closeCommentModal();
-    };
-    window.addEventListener("keydown", handler, true);
-    return () => window.removeEventListener("keydown", handler, true);
-  }, [pendingLocator]);
 
   const submitPreviewComment = () => {
     if (!pendingLocator || !commentText.trim() || !renderer) return;

@@ -3,11 +3,81 @@ import { motion } from "framer-motion";
 import { X, Plus, FolderOpen, GitBranch, Sparkles, Code2, Globe } from "lucide-react";
 import { Button } from "../ui";
 import { DialogShell } from "../ui/DialogShell";
+import { FolderTreePickerDialog } from "./FolderTreePickerDialog";
 import { useIsMobile } from "../../hooks";
 import { apiClient } from "../../api/client";
+import { useCommand, useKeyboardScope } from "../../keyboard";
 
 type ProjectMode = "coding" | "studio";
 type CodingTab = "existing" | "new" | "git";
+
+// Smart-parse a user-pasted string into a canonical git URL.
+// Handles standard https URLs, SSH URLs, bare owner/repo shortcuts, and
+// web UI URLs from GitHub/GitLab (tree, blob, pulls, merge_requests, etc.).
+// Mirrors the logic in Skills/AddSourceDialog.tsx.
+function parseGitInput(raw: string): { url: string; name?: string } {
+  const input = raw.trim();
+  if (!input) return { url: "" };
+  if (input.length > 2000) return { url: "" };
+
+  // HTTP/HTTPS URLs
+  if (/^https?:\/\//i.test(input)) {
+    try {
+      const urlObj = new URL(input);
+      let pathname = urlObj.pathname;
+
+      // Look for web UI markers to split the repo URL from the rest of the path.
+      // Matches: tree, blob, pulls, pull, issues, merge_requests, actions, etc.
+      const markerMatch = pathname.match(
+        /\/(?:-\/)?(?:tree|blob|pulls|pull|issues|issue|merge_requests|actions|projects|wiki|releases|tags|commits|commit|branches|milestones|settings)(?:\/|$)/i
+      );
+
+      if (markerMatch && markerMatch.index !== undefined && markerMatch.index > 0) {
+        pathname = pathname.slice(0, markerMatch.index);
+      }
+
+      // Clean up trailing slash and any trailing .git (handling duplicate .git too)
+      const cleanPathname = pathname.replace(/\/+$/, "").replace(/(?:\.git)+$/i, "");
+
+      if (cleanPathname && cleanPathname !== "/") {
+        urlObj.pathname = cleanPathname + ".git";
+      } else {
+        urlObj.pathname = cleanPathname;
+      }
+
+      // Clear out query parameters and hashes
+      urlObj.search = "";
+      urlObj.hash = "";
+
+      // Derive repo name from the cleaned pathname
+      const segments = cleanPathname.split("/").filter(Boolean);
+      const name = segments.length > 0 ? segments[segments.length - 1] : undefined;
+
+      return { url: urlObj.toString(), name };
+    } catch {
+      // Fallback if URL parsing fails
+    }
+  }
+
+  // SSH form — leave as-is (already canonical, but clean up duplicate .git)
+  if (/^git@[^:]+:[^/]+\/.+/.test(input)) {
+    const cleanedSsh = input.replace(/\/+$/, "").replace(/(?:\.git)+$/i, "");
+    const segments = cleanedSsh.split(/[/:]/).filter(Boolean);
+    const name = segments.length > 0 ? segments[segments.length - 1].replace(/\.git$/, "") : undefined;
+    return { url: `${cleanedSsh}.git`, name };
+  }
+
+  // Bare owner/repo shortcut
+  const shortMatch = input.match(/^([A-Za-z0-9][\w.-]*)\/([A-Za-z0-9][\w.-]*?)(?:\.git)?$/);
+  if (shortMatch) {
+    return {
+      url: `https://github.com/${shortMatch[1]}/${shortMatch[2]}.git`,
+      name: shortMatch[2],
+    };
+  }
+
+  return { url: input };
+}
 
 interface AddProjectDialogProps {
   isOpen: boolean;
@@ -55,6 +125,8 @@ export function AddProjectDialog({
   const [error, setError] = useState("");
   const { isMobile } = useIsMobile();
 
+  const [pickerOpen, setPickerOpen] = useState<null | "existing" | "parent">(null);
+
   const prevIsOpenRef = useRef(isOpen);
 
   /* eslint-disable react-hooks/set-state-in-effect */
@@ -73,6 +145,7 @@ export function AddProjectDialog({
       setGitName("");
       setGitNameTouched(false);
       setError("");
+      setPickerOpen(null);
     }
     prevIsOpenRef.current = isOpen;
   }, [isOpen, initialMode]);
@@ -119,41 +192,69 @@ export function AddProjectDialog({
     return parts[parts.length - 1] ?? "";
   };
 
-  // Auto-derive a project name from a git URL — mirrors backend infer_repo_name.
+  // Auto-derive a project name from a git URL — uses parseGitInput to
+  // handle web UI URLs (merge_requests, pulls, tree, etc.) properly.
   const deriveNameFromGitUrl = (u: string): string => {
-    const trimmed = u.trim().replace(/\/+$/, "");
-    if (!trimmed) return "";
+    const parsed = parseGitInput(u);
+    if (parsed.name) return parsed.name;
+    // Fallback: last path segment
+    const trimmed = (parsed.url || u).trim().replace(/\/+$/, "").replace(/(?:\.git)+$/i, "");
     const last = trimmed.split(/[/:]/).pop() ?? trimmed;
-    return last.replace(/\.git$/, "");
+    return last;
   };
 
   const displayedExistingName = existingNameTouched ? existingName : deriveNameFromPath(path);
   const displayedGitName = gitNameTouched ? gitName : deriveNameFromGitUrl(gitUrl);
 
+  // In remote/mobile mode the native dialog would open on the server's
+  // physical screen (invisible to the remote user) and `Command::output()`
+  // blocks until someone dismisses it on that screen — so the request hangs
+  // and our "fallback when null/throw" path never triggers. Skip the native
+  // call entirely in that mode and go straight to the web picker.
+  // `window.__GROVE_REMOTE__` is set by AuthGate when `/api/v1/auth/info`
+  // reports either `remote: true` or `required: true`.
+  const isRemoteMode = (): boolean =>
+    (window as unknown as Record<string, unknown>).__GROVE_REMOTE__ === true;
+
   // Use apiClient (not raw fetch) so HMAC headers are attached in mobile mode.
   const handleBrowseExisting = async () => {
+    if (isRemoteMode()) {
+      setPickerOpen("existing");
+      return;
+    }
     try {
       const data = await apiClient.get<{ path: string | null }>("/api/v1/browse-folder");
       if (data.path) {
         setPath(data.path);
+        if (!existingNameTouched) setExistingName(deriveNameFromPath(data.path));
         setError("");
+      } else {
+        // Native dialog unavailable (headless host) — open web picker.
+        setPickerOpen("existing");
       }
     } catch (err) {
       console.error("Failed to browse folder:", err);
-      setError("Failed to open folder picker");
+      // Network/API failure — fall back to web picker rather than dead-ending.
+      setPickerOpen("existing");
     }
   };
 
   const handleBrowseParent = async () => {
+    if (isRemoteMode()) {
+      setPickerOpen("parent");
+      return;
+    }
     try {
       const data = await apiClient.get<{ path: string | null }>("/api/v1/browse-folder");
       if (data.path) {
         setParentDir(data.path);
         setError("");
+      } else {
+        setPickerOpen("parent");
       }
     } catch (err) {
       console.error("Failed to browse folder:", err);
-      setError("Failed to open folder picker");
+      setPickerOpen("parent");
     }
   };
 
@@ -211,9 +312,24 @@ export function AddProjectDialog({
       setError("Git URL is required");
       return;
     }
+    // Normalize the URL before submitting — strip web UI paths, add .git suffix
+    const parsed = parseGitInput(gitUrl);
+    const finalUrl = parsed.url || gitUrl.trim();
     setError("");
-    const finalName = displayedGitName.trim();
-    await onClone(gitUrl.trim(), finalName || undefined);
+    const finalName = (gitNameTouched ? gitName : parsed.name || deriveNameFromGitUrl(gitUrl)).trim();
+    await onClone(finalUrl, finalName || undefined);
+  };
+
+  // Normalize git URL on blur so merge_requests/pulls/tree URLs become clone URLs
+  const handleGitUrlBlur = () => {
+    if (!gitUrl.trim()) return;
+    const parsed = parseGitInput(gitUrl);
+    if (parsed.url && parsed.url !== gitUrl.trim()) {
+      setGitUrl(parsed.url);
+      if (!gitNameTouched && parsed.name) {
+        setGitName(parsed.name);
+      }
+    }
   };
 
   const handleSubmit = () => {
@@ -236,17 +352,23 @@ export function AddProjectDialog({
     return "Create Project";
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-      e.preventDefault();
-      handleSubmit();
-    }
-  };
+  // Catalog handlers register inside <AddProjectDialogBindings> only while
+  // isOpen=true. Multiple AddProjectDialog wrappers can coexist (Workspace +
+  // Projects pane); a top-level useCommand would otherwise overwrite each
+  // other on every re-render — only the last-mounted dialog's binding
+  // would be live.
+  useKeyboardScope("dialog.addProject", isOpen);
 
   return (
+    <>
     <DialogShell isOpen={isOpen} onClose={resetAndClose}>
+      {isOpen && (
+        <AddProjectDialogBindings
+          onClose={resetAndClose}
+          onSubmit={handleSubmit}
+        />
+      )}
       <div
-        onKeyDown={handleKeyDown}
         className="bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl shadow-xl overflow-hidden w-[480px] max-w-[95vw]"
       >
         {/* Header */}
@@ -350,6 +472,7 @@ export function AddProjectDialog({
                       type="text"
                       value={gitUrl}
                       onChange={(e) => { setGitUrl(e.target.value); setError(""); }}
+                      onBlur={handleGitUrlBlur}
                       placeholder="https://github.com/user/repo.git"
                       className={`w-full px-3 py-2 bg-[var(--color-bg)] border rounded-lg
                         text-sm text-[var(--color-text)] placeholder:text-[var(--color-text-muted)]
@@ -532,7 +655,43 @@ export function AddProjectDialog({
         </div>
       </div>
     </DialogShell>
+    <FolderTreePickerDialog
+      isOpen={pickerOpen !== null}
+      onClose={() => setPickerOpen(null)}
+      onSelect={(p) => {
+        if (pickerOpen === "existing") {
+          setPath(p);
+          if (!existingNameTouched) setExistingName(deriveNameFromPath(p));
+        } else if (pickerOpen === "parent") {
+          setParentDir(p);
+        }
+        setError("");
+        setPickerOpen(null);
+      }}
+      title={pickerOpen === "parent" ? "Select Parent Directory" : "Select Project Folder"}
+    />
+    </>
   );
+}
+
+// Registers the dialog.addProject.* catalog handlers only while the dialog
+// is actually open. See top-of-component comment for the multi-mount rationale.
+function AddProjectDialogBindings({
+  onClose,
+  onSubmit,
+}: {
+  onClose: () => void;
+  onSubmit: () => void | Promise<void>;
+}) {
+  useCommand("dialog.addProject.close", onClose, [onClose]);
+  useCommand(
+    "dialog.addProject.submit",
+    () => {
+      void onSubmit();
+    },
+    [onSubmit],
+  );
+  return null;
 }
 
 /** Wrapper that animates height changes smoothly and enforces a min-height */

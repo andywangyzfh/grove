@@ -4,6 +4,7 @@ import { Search } from "lucide-react";
 import { useProject, useTheme } from "../../context";
 import type { Project } from "../../data/types";
 import { getProjectStyle } from "../../utils/projectStyle";
+import { useCommand } from "../../keyboard";
 
 interface ProjectCommandPaletteProps {
   isOpen: boolean;
@@ -18,6 +19,7 @@ export function ProjectCommandPalette({ isOpen, onClose, onProjectSelect }: Proj
   const [highlightedIndex, setHighlightedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const isKeyboardNav = useRef(false);
 
   const filteredProjects = useMemo(() => {
     if (!searchQuery) return projects;
@@ -41,6 +43,8 @@ export function ProjectCommandPalette({ isOpen, onClose, onProjectSelect }: Proj
   }, [searchQuery]);
 
   useEffect(() => {
+    if (!isKeyboardNav.current) return;
+    isKeyboardNav.current = false;
     if (!listRef.current) return;
     const items = listRef.current.querySelectorAll("[data-palette-item]");
     const item = items[highlightedIndex] as HTMLElement | undefined;
@@ -54,17 +58,32 @@ export function ProjectCommandPalette({ isOpen, onClose, onProjectSelect }: Proj
     if (switched) onProjectSelect?.();
   }, [selectedProject, selectProject, onClose, onProjectSelect]);
 
+  // Register the `palette.project.select` catalog command so it is
+  // discoverable / rebindable. Mirrors the local Enter key path; the
+  // local onKeyDown still handles Enter directly since this palette
+  // does not push its own keyboard scope.
+  useCommand(
+    "palette.project.select",
+    () => {
+      const project = filteredProjects[highlightedIndex];
+      if (project) handleSelect(project);
+    },
+    { enabled: () => isOpen && filteredProjects.length > 0 },
+  );
+
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault();
+        isKeyboardNav.current = true;
         setHighlightedIndex((prev) =>
           prev < filteredProjects.length - 1 ? prev + 1 : 0
         );
         break;
       case "ArrowUp":
         e.preventDefault();
+        isKeyboardNav.current = true;
         setHighlightedIndex((prev) =>
           prev > 0 ? prev - 1 : filteredProjects.length - 1
         );

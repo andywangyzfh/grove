@@ -65,10 +65,10 @@ import { FileTreeSidebar } from './FileTreeSidebar';
 import { DiffFileView, resetGlobalMatchIndex } from './DiffFileView';
 import { ConversationSidebar } from './ConversationSidebar';
 import { CodeSearchBar } from './CodeSearchBar';
-import { MessageSquare, ChevronUp, ChevronDown, PanelLeftClose, PanelLeftOpen, Crosshair, GitCompare, FileText, RefreshCw, Code, Columns2, Eye } from 'lucide-react';
+import { MessageSquare, ChevronUp, ChevronDown, PanelLeftClose, PanelLeftOpen, Crosshair, GitCompare, FileText, RefreshCw, Code, Columns2, Eye, ZoomIn, ZoomOut } from 'lucide-react';
 import { VersionSelector } from './VersionSelector';
 import { useIsMobile } from '../../hooks';
-import { useHotkeys } from '../../hooks/useHotkeys';
+import { useKeyboardScope, useCommand, useContextKey } from '../../keyboard';
 import './diffTheme.css';
 
 /** External navigation request — navigate to a file (optionally at a line) */
@@ -199,6 +199,15 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       return new Map();
     }
   });
+
+  const [autoViewedRules, setAutoViewedRules] = useState<string[]>(() => {
+    try {
+      const stored = localStorage.getItem(`grove:project:${projectId}:autoViewedRules`);
+      return stored ? JSON.parse(stored) as string[] : [];
+    } catch {
+      return [];
+    }
+  });
   const [sidebarSearch, setSidebarSearch] = useState('');
   const [collapsedFiles, setCollapsedFiles] = useState<Set<string>>(new Set());
   const [replyFormCommentId, setReplyFormCommentId] = useState<number | null>(null);
@@ -253,6 +262,33 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     }
     return 'latest';
   });
+
+  const [fontSize, setFontSize] = useState<number>(() => {
+    const saved = localStorage.getItem("grove:review.fontSize");
+    return saved ? parseInt(saved, 10) : 12;
+  });
+
+  const handleZoomIn = useCallback(() => {
+    setFontSize((prev) => {
+      const next = Math.min(prev + 1, 30);
+      localStorage.setItem("grove:review.fontSize", String(next));
+      return next;
+    });
+  }, []);
+
+  const handleZoomOut = useCallback(() => {
+    setFontSize((prev) => {
+      const next = Math.max(prev - 1, 9);
+      localStorage.setItem("grove:review.fontSize", String(next));
+      return next;
+    });
+  }, []);
+
+  const handleZoomReset = useCallback(() => {
+    setFontSize(12);
+    localStorage.setItem("grove:review.fontSize", "12");
+  }, []);
+
   const [collapsedCommentIds, setCollapsedCommentIds] = useState<Set<number>>(new Set());
   const [versions, setVersions] = useState<VersionOption[]>([]);
   const currentDiffRefs = useMemo(() => {
@@ -305,6 +341,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
   // Code search state (Ctrl+F)
   const [codeSearchVisible, setCodeSearchVisible] = useState(false);
+  const [codeSearchFocusTrigger, setCodeSearchFocusTrigger] = useState(0);
   const [codeSearchQuery, setCodeSearchQuery] = useState('');
   const [codeSearchCaseSensitive, setCodeSearchCaseSensitive] = useState(false);
   const [codeSearchCurrentIndex, setCodeSearchCurrentIndex] = useState(0);
@@ -404,6 +441,26 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
   const sortedDiffFiles = useMemo(() => {
     if (viewMode === 'full') {
+      // Comment-based virtual files: files that have a review comment but
+      // don't appear in any of the in-repo file lists. Only surfaced in
+      // "All Files" mode so they don't pollute the Changes (vN..latest) range.
+      const realPaths = new Set(allFiles);
+      const commentVirtualFiles: DiffFile[] = [];
+      const seenVirtual = new Set<string>();
+      for (const c of comments) {
+        if (!c.file_path || realPaths.has(c.file_path) || seenVirtual.has(c.file_path)) continue;
+        seenVirtual.add(c.file_path);
+        commentVirtualFiles.push({
+          old_path: '',
+          new_path: c.file_path,
+          change_type: 'added' as const,
+          hunks: [],
+          is_binary: false,
+          additions: 0,
+          deletions: 0,
+          is_virtual: true,
+        });
+      }
       const temporaryVirtualFiles: DiffFile[] = Array.from(temporaryVirtualPaths).map(path => ({
         old_path: '',
         new_path: path,
@@ -423,9 +480,8 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         additions: 0,
         deletions: 0,
       }));
-      const existingPaths = new Set(allFiles);
-      const uniqueVirtualFiles = temporaryVirtualFiles.filter(vf => !existingPaths.has(vf.new_path));
-      return sortTreeOrder([...allFileDiffFiles, ...uniqueVirtualFiles]);
+      const virtualFiles = [...commentVirtualFiles, ...temporaryVirtualFiles];
+      return sortTreeOrder([...allFileDiffFiles, ...virtualFiles]);
     }
     if (!diffData) return [];
     const statFiles: DiffFile[] = diffData.files.map(e => ({
@@ -439,7 +495,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       is_untracked: e.status === 'U',
     }));
     return sortTreeOrder(statFiles);
-  }, [viewMode, allFiles, diffData, temporaryVirtualPaths, sortTreeOrder]);
+  }, [viewMode, allFiles, diffData, temporaryVirtualPaths, comments, sortTreeOrder]);
 
   const baseFiles = (viewMode === 'full' && focusMode) ? focusFiles : sortedDiffFiles;
 
@@ -461,22 +517,8 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     displayFilesRef.current = displayFiles;
   }, [displayFiles]);
 
-  const activeFilePath = useMemo(() => {
-    const found = displayFiles.find((f) => f.new_path === selectedFile && !f.new_path.endsWith('/'));
-    if (found) return found.new_path;
-    return displayFiles.find((f) => !f.new_path.endsWith('/'))?.new_path || null;
-  }, [displayFiles, selectedFile]);
-
-
   // Auto-detect iframe mode
   const isEmbedded = embedded ?? (typeof window !== 'undefined' && window !== window.parent);
-
-  // currentFileIndex derived from activeFilePath — stays in sync without setState in effect
-  const currentFileIndex = useMemo(() => {
-    if (!activeFilePath) return 0;
-    const idx = displayFiles.findIndex((f) => f.new_path === activeFilePath);
-    return idx >= 0 ? idx : 0;
-  }, [displayFiles, activeFilePath]);
 
   // Resolve pending navigation once displayFiles updates (after mode switch)
   // Also re-run when navigateToFile changes (for when Review tab already exists)
@@ -551,8 +593,12 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   }, [displayFiles, navigateToFile, viewMode, focusMode, projectId, taskId, appendLazyFiles]);
 
   // Load full file content with concurrency control
-  const loadFullFileContent = useCallback(async (filePath: string) => {
-    if (fullFileContents.has(filePath) || loadingFiles.has(filePath) || failedFullFilesRef.current.has(filePath)) return;
+  const loadFullFileContent = useCallback(async (filePath: string, forceReload = false) => {
+    if ((!forceReload && fullFileContents.has(filePath)) || loadingFiles.has(filePath) || failedFullFilesRef.current.has(filePath)) return;
+
+    if (forceReload) {
+      failedFullFilesRef.current.delete(filePath);
+    }
 
     // Add to queue
     requestQueue.current.push(filePath);
@@ -624,8 +670,8 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     setFocusMode(false);
   }, [focusMode, allFiles, projectId, taskId]);
 
-  const loadFileDiff = useCallback(async (filePath: string, fromRef?: string, toRef?: string) => {
-    if (fileDiffCacheRef.current.has(filePath) || loadingDiffsRef.current.has(filePath)) return;
+  const loadFileDiff = useCallback(async (filePath: string, fromRef?: string, toRef?: string, forceReload = false) => {
+    if ((!forceReload && fileDiffCacheRef.current.has(filePath)) || loadingDiffsRef.current.has(filePath)) return;
     loadingDiffsRef.current = new Set(loadingDiffsRef.current).add(filePath);
     let caught: unknown = null;
     try {
@@ -647,19 +693,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     }
   }, [projectId, taskId]);
 
-  // Trigger diff load whenever the active file changes in CHANGES mode.
-  // Uses activeFilePath (derived) so the first file's diff loads even when selectedFile is null.
-  // Note: loadFileDiff dedupes via fileDiffCacheRef + loadingDiffsRef, so it is safe to fire
-  // even while a pending navigation is being resolved — without this, when the resolved
-  // navigation target equals the fallback activeFilePath, neither this effect (deps unchanged)
-  // nor the navigation effect (which doesn't load) ever triggers the fetch.
-  // loadFileDiff sets fetch state internally; this is a legitimate fetch-on-prop-change
-  // sync, not the cascading-render pattern the rule targets.
-  useEffect(() => {
-    if (!activeFilePath || viewMode !== 'diff') return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    loadFileDiff(activeFilePath, currentDiffRefs.fromRef, currentDiffRefs.toRef);
-  }, [activeFilePath, viewMode, currentDiffRefs.fromRef, currentDiffRefs.toRef, loadFileDiff]);
+
 
   const handleExpandDir = useCallback(async (dirPath: string): Promise<DirEntry[]> => {
     const result = await getTaskDirEntries(projectId, taskId, dirPath);
@@ -700,39 +734,106 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       return hashes;
     }
 
-    // In Changes mode, compute hash based on cached diff content
+    // In Changes mode, compute hash based on stable diff properties (path, status, additions, deletions)
     if (!diffData) return hashes;
     for (const f of diffData.files) {
-      const cached = fileDiffCache.get(f.path);
       let hash = 5381;
-      if (cached && typeof cached !== 'string' && cached.hunks) {
-        for (const h of cached.hunks) {
-          for (const l of h.lines) {
-            for (let i = 0; i < l.content.length; i++) {
-              hash = ((hash << 5) + hash) + l.content.charCodeAt(i);
-              hash = hash & hash;
-            }
-          }
-        }
-      } else {
-        for (let i = 0; i < f.path.length; i++) {
-          hash = ((hash << 5) + hash) + f.path.charCodeAt(i);
-          hash = hash & hash;
-        }
+      const hashStr = `${f.path}:${f.status}:${f.additions}:${f.deletions}`;
+      for (let i = 0; i < hashStr.length; i++) {
+        hash = ((hash << 5) + hash) + hashStr.charCodeAt(i);
+        hash = hash & hash;
       }
       hashes.set(f.path, hash.toString(36));
     }
     return hashes;
-  }, [diffData, viewMode, displayFiles, fileDiffCache]);
+  }, [diffData, viewMode, displayFiles]);
+
+  const matchesRules = useCallback((path: string) => {
+    let matched = false;
+    for (const rule of autoViewedRules) {
+      const isNegated = rule.startsWith('!');
+      const pattern = isNegated ? rule.slice(1) : rule;
+      // Convert glob to regex
+      const regexStr = pattern
+        .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+        .replace(/\*\*/g, '___DOUBLE_STAR___')
+        .replace(/\*/g, '[^/]*')
+        .replace(/\?/g, '[^/]')
+        .replace(/___DOUBLE_STAR___/g, '.*');
+      const regex = new RegExp(`^${regexStr}$`);
+      if (regex.test(path)) {
+        matched = !isNegated;
+      }
+    }
+    return matched;
+  }, [autoViewedRules]);
 
   // Compute viewed status per file: 'none' | 'viewed' | 'updated'
   const getFileViewedStatus = useCallback((path: string): 'none' | 'viewed' | 'updated' => {
     const savedHash = viewedFiles.get(path);
+    if (savedHash === 'UNVIEWED') {
+      return 'none';
+    }
+    if (matchesRules(path)) {
+      return 'viewed';
+    }
     if (!savedHash) return 'none';
     const currentHash = fileHashes.get(path);
     if (currentHash && savedHash !== currentHash) return 'updated';
     return 'viewed';
-  }, [viewedFiles, fileHashes]);
+  }, [viewedFiles, fileHashes, matchesRules]);
+
+  // "Hide viewed files" toggle — lifted here (from FileTreeSidebar) so the
+  // jump-to-first-unviewed fallback below re-runs reactively when it changes.
+  const [hideViewed, setHideViewed] = useState<boolean>(
+    () => localStorage.getItem('grove:review.hideViewed') === 'true'
+  );
+  const handleToggleHideViewed = useCallback(() => {
+    setHideViewed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('grove:review.hideViewed', String(next));
+      } catch { /* ignore localStorage issues */ }
+      return next;
+    });
+  }, []);
+
+  const activeFilePath = useMemo(() => {
+    const found = displayFiles.find((f) => f.new_path === selectedFile && !f.new_path.endsWith('/'));
+    if (found) return found.new_path;
+
+    // Fallback: when "hide viewed" is enabled, jump to the first file that is
+    // not a directory placeholder and not yet viewed.
+    if (hideViewed) {
+      const firstNotViewed = displayFiles.find(
+        (f) => !f.new_path.endsWith('/') && getFileViewedStatus(f.new_path) !== 'viewed'
+      );
+      if (firstNotViewed) return firstNotViewed.new_path;
+    }
+
+    return displayFiles.find((f) => !f.new_path.endsWith('/'))?.new_path || null;
+  }, [displayFiles, selectedFile, getFileViewedStatus, hideViewed]);
+
+  // currentFileIndex derived from activeFilePath — stays in sync without setState in effect
+  const currentFileIndex = useMemo(() => {
+    if (!activeFilePath) return 0;
+    const idx = displayFiles.findIndex((f) => f.new_path === activeFilePath);
+    return idx >= 0 ? idx : 0;
+  }, [displayFiles, activeFilePath]);
+
+  // Trigger diff load whenever the active file changes in CHANGES mode.
+  // Uses activeFilePath (derived) so the first file's diff loads even when selectedFile is null.
+  // Note: loadFileDiff dedupes via fileDiffCacheRef + loadingDiffsRef, so it is safe to fire
+  // even while a pending navigation is being resolved — without this, when the resolved
+  // navigation target equals the fallback activeFilePath, neither this effect (deps unchanged)
+  // nor the navigation effect (which doesn't load) ever triggers the fetch.
+  // loadFileDiff sets fetch state internally; this is a legitimate fetch-on-prop-change
+  // sync, not the cascading-render pattern the rule targets.
+  useEffect(() => {
+    if (!activeFilePath || viewMode !== 'diff') return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadFileDiff(activeFilePath, currentDiffRefs.fromRef, currentDiffRefs.toRef);
+  }, [activeFilePath, viewMode, currentDiffRefs.fromRef, currentDiffRefs.toRef, loadFileDiff]);
 
   // Version options for FROM / TO selectors
   const versionList = versions;
@@ -759,17 +860,6 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       setLoading(true);
       setFileDiffCache(new Map());
       loadingDiffsRef.current = new Set();
-    } else {
-      // In silent mode, only clear the cache of the active selected file
-      // so it is allowed to reload its diff data silently.
-      const selected = selectedFileRef.current;
-      if (selected) {
-        setFileDiffCache((prev) => {
-          const next = new Map(prev);
-          next.delete(selected);
-          return next;
-        });
-      }
     }
 
     let data: Awaited<ReturnType<typeof getDiffStats>> | null = null;
@@ -795,7 +885,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         const selected = selectedFileRef.current;
         const stillPresent = selected ? data.files.some((f) => f.path === selected) : false;
         if (selected && stillPresent) {
-          loadFileDiff(selected, fromRef, toRef);
+          loadFileDiff(selected, fromRef, toRef, silent);
         }
       }
     }
@@ -829,11 +919,18 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       });
     } else {
       // Changes mode: fetch commits first to ensure the version dropdown is up-to-date.
-      // Read fromVersion/toVersion via refs so an in-mode dropdown change doesn't
-      // re-fire this whole effect (spinner flash + scroll reset + double-fetch).
-      getCommits(projectId, taskId)
-        .then((commitsData) => {
+      // Parallel-fetch task files so allFiles is populated for file autocomplete (@) support!
+      Promise.all([
+        getCommits(projectId, taskId),
+        getTaskFiles(projectId, taskId).catch(() => ({ files: [] as string[] }))
+      ])
+        .then(([commitsData, filesData]) => {
           if (fetchGenRef.current !== gen) return;
+
+          if (filesData && filesData.files) {
+            setAllFiles(filesData.files);
+          }
+
           const opts = buildVersionOpts(commitsData);
           setVersions(opts);
 
@@ -895,31 +992,9 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       setFileDiffCache(new Map());
       loadingDiffsRef.current = new Set();
       lazyRootDirEntriesRef.current = [];
-    } else {
-      // Silent path: only invalidate the active file's caches. Wiping
-      // fullFileContents/loadingFiles globally would flash the visible file's
-      // content during an "Agent turn finished" auto-refresh.
-      const selected = selectedFileRef.current;
-      if (selected) {
-        setFileDiffCache((prev) => {
-          const next = new Map(prev);
-          next.delete(selected);
-          return next;
-        });
-        setFullFileContents((prev) => {
-          if (!prev.has(selected)) return prev;
-          const next = new Map(prev);
-          next.delete(selected);
-          return next;
-        });
-        setLoadingFiles((prev) => {
-          if (!prev.has(selected)) return prev;
-          const next = new Set(prev);
-          next.delete(selected);
-          return next;
-        });
-      }
     }
+
+    const selected = selectedFileRef.current;
 
     const commentsPromise = getReviewComments(projectId, taskId).then((result) => {
       if (fetchGenRef.current !== gen) return;
@@ -952,13 +1027,23 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         const fromOpt = opts.find((v) => v.id === from);
         const toOpt = opts.find((v) => v.id === to);
 
+        const filesPromise = getTaskFiles(projectId, taskId)
+          .then((result) => {
+            if (fetchGenRef.current !== gen) return;
+            setAllFiles(result.files);
+          })
+          .catch(() => null);
+
         await Promise.all([
           refetchDiff({ fromRef: fromOpt?.ref, toRef: toOpt?.ref, keepSelection: true, silent, gen }),
           commentsPromise,
+          filesPromise,
         ]);
       } else if (focusMode) {
+        const fullContentPromise = selected ? loadFullFileContent(selected, true).catch(() => null) : Promise.resolve();
         await Promise.all([
           commentsPromise,
+          fullContentPromise,
           getTaskDirEntries(projectId, taskId, '').then((result) => {
             if (fetchGenRef.current !== gen) return;
             lazyRootDirEntriesRef.current = result.entries;
@@ -966,8 +1051,10 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
           }).catch(() => null),
         ]);
       } else {
+        const fullContentPromise = selected ? loadFullFileContent(selected, true).catch(() => null) : Promise.resolve();
         await Promise.all([
           commentsPromise,
+          fullContentPromise,
           getTaskFiles(projectId, taskId).then((result) => {
             if (fetchGenRef.current !== gen) return;
             setAllFiles(result.files);
@@ -983,7 +1070,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     if (caught !== null) {
       throw caught;
     }
-  }, [refetchDiff, projectId, taskId, viewMode, focusMode, appendLazyFiles]);
+  }, [refetchDiff, projectId, taskId, viewMode, focusMode, appendLazyFiles, loadFullFileContent]);
 
   // Two callers: the manual refresh button / hotkey-r path (loud, shows
   // spinner) and the agent-turn-finished auto-refresh path (silent). Splitting
@@ -1155,26 +1242,11 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         }
 
         if (!cancelled) {
-          // Detect virtual files (files with comments but not in diff)
-          // Include all comment types (file, inline) - any comment with a file_path
-          const existingFilePaths = new Set(data.files.map(f => f.path));
-          const virtualFilePaths = reviewComments
-            .filter(c => c.file_path && !existingFilePaths.has(c.file_path))
-            .map(c => c.file_path!)
-            .filter((path, idx, arr) => arr.indexOf(path) === idx);
-
-          if (virtualFilePaths.length > 0) {
-            const virtualEntries = virtualFilePaths.map(path => ({
-              path,
-              status: 'A' as const,
-              additions: 0,
-              deletions: 0,
-              is_binary: false,
-            }));
-            setDiffData({ ...data, files: [...data.files, ...virtualEntries] });
-          } else {
-            setDiffData(data);
-          }
+          // Store pure diff data. Virtual files (files with comments that aren't
+          // in the diff range) are computed in sortedDiffFiles for "All Files"
+          // mode only — adding them to diffData would leak them into "Changes"
+          // mode and inflate the file count for the selected vN..latest range.
+          setDiffData(data);
           if (filesData) {
             setAllFiles(filesData.files);
           }
@@ -1263,22 +1335,31 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   }, [viewMode, focusMode, diffData, projectId, taskId, versions, fromVersion, toVersion]);
 
 
-  // Listen for Ctrl+F / Cmd+F to open code search
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
-        e.preventDefault();
-        setCodeSearchVisible(true);
-      }
-      // ESC to close code search — skip if a lightbox is open (it handles ESC itself)
-      if (e.key === 'Escape' && codeSearchVisible && !document.querySelector('[data-lightbox-active]')) {
-        setCodeSearchVisible(false);
-        setCodeSearchQuery('');
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [codeSearchVisible]);
+  // ── Keyboard scopes & commands ─────────────────────────────────────────
+  // diffReview        — page-level scope, always active while mounted
+  // diffReview.search — pushed when code search is visible; its Escape
+  //                     command sits on top of stack and closes search
+  //                     before the page-level commands run.
+  useKeyboardScope('diffReview');
+  useKeyboardScope('diffReview.search', codeSearchVisible);
+  useContextKey('fileOpen', !!activeFilePath);
+
+  const lightboxNotOpen = useCallback(() => !document.querySelector('[data-lightbox-active]'), []);
+
+  useCommand('diffReview.openSearch', () => {
+    setCodeSearchVisible(true);
+    setCodeSearchFocusTrigger((n) => n + 1);
+  }, []);
+
+  useCommand(
+    'diffReview.closeSearch',
+    () => {
+      setCodeSearchVisible(false);
+      setCodeSearchQuery('');
+    },
+    { enabled: lightboxNotOpen },
+    [lightboxNotOpen],
+  );
 
   // Update match count and handle navigation. setState happens inside the timer
   // (asynchronous), so it does not cascade-render synchronously inside the effect.
@@ -1455,14 +1536,28 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   const handleToggleViewed = useCallback((path: string) => {
     setViewedFiles((prev) => {
       const next = new Map(prev);
-      if (next.has(path)) {
-        next.delete(path);
-        // When unmarking as viewed, keep current collapsed state
+      const savedHash = prev.get(path);
+      const matchesRule = matchesRules(path);
+
+      if (matchesRule) {
+        if (savedHash === 'UNVIEWED') {
+          next.delete(path);
+        } else {
+          next.set(path, 'UNVIEWED');
+        }
       } else {
-        const hash = fileHashes.get(path) || '';
-        next.set(path, hash);
-        // Auto-collapse when marking as viewed
-        setCollapsedFiles((prevCollapsed) => new Set(prevCollapsed).add(path));
+        const currentHash = fileHashes.get(path) || '';
+        // If already viewed and the hash matches, toggle it off (unviewed)
+        if (savedHash && savedHash === currentHash) {
+          next.delete(path);
+          // When unmarking as viewed, keep current collapsed state
+        } else {
+          // If unviewed (no savedHash) OR updated (savedHash !== currentHash),
+          // mark it as viewed (store the new current hash) and clear the Updated status
+          next.set(path, currentHash);
+          // Auto-collapse when marking as viewed
+          setCollapsedFiles((prevCollapsed) => new Set(prevCollapsed).add(path));
+        }
       }
       // Persist to localStorage
       try {
@@ -1470,12 +1565,46 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       } catch { /* ignore quota errors */ }
       return next;
     });
-  }, [fileHashes, viewedStorageKey]);
+  }, [fileHashes, viewedStorageKey, matchesRules]);
 
   // Toggle viewed status of the active file
   const handleToggleActiveViewed = useCallback(() => {
     if (activeFilePath) handleToggleViewed(activeFilePath);
   }, [activeFilePath, handleToggleViewed]);
+
+  // Mark active file as viewed (one-way; never unmarks). Used by the
+  // diffReview.markViewed command for an unambiguous "I'm done with this file"
+  // intent — toggleViewed already covers the bi-directional case.
+  const handleMarkActiveViewed = useCallback(() => {
+    if (!activeFilePath) return;
+    setViewedFiles((prev) => {
+      const matchesRule = matchesRules(activeFilePath);
+      if (matchesRule) {
+        if (prev.get(activeFilePath) !== 'UNVIEWED') return prev;
+        const next = new Map(prev);
+        next.delete(activeFilePath);
+        try {
+          localStorage.setItem(viewedStorageKey, JSON.stringify(Array.from(next.entries())));
+        } catch { /* ignore quota errors */ }
+        return next;
+      } else {
+        const hash = fileHashes.get(activeFilePath) || '';
+        // No-op if already viewed with the same hash — avoids a needless re-render
+        // + localStorage write whenever the user re-fires the command.
+        if (prev.get(activeFilePath) === hash) return prev;
+        const next = new Map(prev);
+        next.set(activeFilePath, hash);
+        try {
+          localStorage.setItem(viewedStorageKey, JSON.stringify(Array.from(next.entries())));
+        } catch { /* ignore quota errors */ }
+        return next;
+      }
+    });
+    setCollapsedFiles((prev) => {
+      if (prev.has(activeFilePath)) return prev;
+      return new Set(prev).add(activeFilePath);
+    });
+  }, [activeFilePath, fileHashes, viewedStorageKey, matchesRules]);
 
   // Toggle Changes / All Files mode
   const handleToggleViewMode = useCallback(() => {
@@ -1483,18 +1612,19 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     void handleSetViewMode(nextMode);
   }, [viewMode, handleSetViewMode]);
 
-  // Review panel keyboard shortcuts
-  useHotkeys(
-    [
-      { key: 'j', handler: goToNextFile },
-      { key: 'k', handler: goToPrevFile },
-      { key: 'v', handler: handleToggleActiveViewed },
-      { key: 'r', handler: handleRefresh },
-      { key: 'Shift+Tab', handler: handleToggleViewMode, options: { preventDefault: true } },
-      { key: 'p', handler: handleToggleActivePreview },
-    ],
-    [goToNextFile, goToPrevFile, handleToggleActiveViewed, handleRefresh, handleToggleViewMode, handleToggleActivePreview]
-  );
+  // Review panel keyboard shortcuts — all scoped to the diff review page.
+  useCommand('diffReview.nextFile', goToNextFile, { enabled: () => displayFiles.length > 0 }, [goToNextFile, displayFiles.length]);
+  useCommand('diffReview.prevFile', goToPrevFile, { enabled: () => displayFiles.length > 0 }, [goToPrevFile, displayFiles.length]);
+  useCommand('diffReview.toggleViewed', handleToggleActiveViewed, { enabled: () => !!activeFilePath }, [handleToggleActiveViewed, activeFilePath]);
+  useCommand('diffReview.refresh', handleRefresh, [handleRefresh]);
+  useCommand('diffReview.toggleViewMode', handleToggleViewMode, [handleToggleViewMode]);
+  useCommand('diffReview.togglePreview', handleToggleActivePreview, { enabled: () => !!activeFilePath && !!getPreviewRenderer(activeFilePath ?? '') }, [handleToggleActivePreview, activeFilePath]);
+  useCommand('diffReview.markViewed', handleMarkActiveViewed, { enabled: () => !!activeFilePath }, [handleMarkActiveViewed, activeFilePath]);
+  useCommand('diffReview.toggleSidebar', () => setSidebarVisible((v) => !v), [setSidebarVisible]);
+
+  useCommand('view.zoom.increase', handleZoomIn, [handleZoomIn]);
+  useCommand('view.zoom.decrease', handleZoomOut, [handleZoomOut]);
+  useCommand('view.zoom.reset', handleZoomReset, [handleZoomReset]);
 
   // Toggle collapse — in diff mode, load the diff when expanding a previously-collapsed file
   const handleToggleCollapse = useCallback((path: string) => {
@@ -1769,15 +1899,25 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     );
   }
 
-  const viewedCount = displayFiles.filter((f) => getFileViewedStatus(f.new_path) === 'viewed').length;
-  const totalFiles = displayFiles.length;
+  // Exclude directory placeholders (new_path ending in '/') from counts — in
+  // full+focus mode they appear in displayFiles and a broad auto-view rule
+  // (e.g. '**') would otherwise inflate both totals.
+  const countableFiles = displayFiles.filter((f) => !f.new_path.endsWith('/'));
+  const viewedCount = countableFiles.filter((f) => getFileViewedStatus(f.new_path) === 'viewed').length;
+  const totalFiles = countableFiles.length;
   const isEmpty = displayFiles.length === 0;
 
   // Ensure selectedFile is valid - if not, use first file
   const validSelectedFile = activeFilePath;
 
   return (
-    <div className={`diff-review-page ${isEmbedded ? 'embedded' : ''}`}>
+    <div
+      className={`diff-review-page ${isEmbedded ? 'embedded' : ''}`}
+      style={{
+        '--diff-font-size': `${fontSize}px`,
+        '--diff-line-height': `${fontSize + 8}px`,
+      } as React.CSSProperties}
+    >
       {/* Page Header with Mode Selector */}
       <div className="diff-page-header">
         <div className="diff-page-title">Code Review</div>
@@ -1829,7 +1969,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
             title="Focus mode — show one file at a time"
           >
             <Crosshair style={{ width: 12, height: 12 }} />
-            Focus
+            <span className="toolbar-label">Focus</span>
           </button>
           {focusModeWarn && (
             <span
@@ -1852,7 +1992,9 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
             ) : (
               <Eye style={{ width: 12, height: 12 }} />
             )}
-            {displayMode === 'code' ? 'Code' : displayMode === 'split' ? 'Split' : 'Preview'}
+            <span className="toolbar-label">
+              {displayMode === 'code' ? 'Code' : displayMode === 'split' ? 'Split' : 'Preview'}
+            </span>
           </button>
           {viewMode === 'diff' && (
             <div className="diff-view-toggle">
@@ -1860,14 +2002,16 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
                 className={viewType === 'unified' ? 'active' : ''}
                 onClick={() => setViewType('unified')}
               >
-                Unified
+                <span className="toolbar-label">Unified</span>
+                <span className="toolbar-label-short">Uni</span>
               </button>
               {!isMobile && (
                 <button
                   className={viewType === 'split' ? 'active' : ''}
                   onClick={() => setViewType('split')}
                 >
-                  Split
+                  <span className="toolbar-label">Split</span>
+                  <span className="toolbar-label-short">Spl</span>
                 </button>
               )}
             </div>
@@ -1880,39 +2024,65 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
             </div>
           )}
           <span style={{ fontWeight: 600, color: 'var(--color-text)' }}>
-            {totalFiles} file{totalFiles !== 1 ? 's' : ''}
+            {totalFiles}
+            <span className="toolbar-label"> file{totalFiles !== 1 ? 's' : ''}</span>
           </span>
           {viewMode === 'diff' && (
-            <>
+            <span className="diff-stats flex items-center gap-1.5">
               <span className="stat-add">+{diffData?.total_additions ?? 0}</span>
               <span className="stat-del">-{diffData?.total_deletions ?? 0}</span>
-            </>
+            </span>
           )}
         </div>
         <div className="diff-toolbar-right">
           <ViewedProgress viewed={viewedCount} total={totalFiles} />
-          <button
-            className="diff-toolbar-btn"
-            onClick={goToPrevFile}
-            title="Previous file"
-            disabled={currentFileIndex === 0}
-          >
-            <ChevronUp style={{ width: 14, height: 14 }} />
-          </button>
-          <button
-            className="diff-toolbar-btn"
-            onClick={goToNextFile}
-            title="Next file"
-            disabled={currentFileIndex === totalFiles - 1}
-          >
-            <ChevronDown style={{ width: 14, height: 14 }} />
-          </button>
+          <div className="flex items-center border border-[var(--color-border)] rounded-md bg-[var(--color-bg)] h-7 p-0.5 ml-1.5 mr-1">
+            <button
+              onClick={handleZoomOut}
+              className="px-2 h-full flex items-center justify-center text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] rounded-[4px] cursor-pointer transition-colors"
+              title="Zoom out"
+            >
+              <ZoomOut className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={handleZoomReset}
+              className="px-2.5 h-full flex items-center justify-center text-xs font-medium text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] rounded-[4px] cursor-pointer select-none transition-colors"
+              title="Reset zoom (12px)"
+            >
+              {fontSize}px
+            </button>
+            <button
+              onClick={handleZoomIn}
+              className="px-2 h-full flex items-center justify-center text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] rounded-[4px] cursor-pointer transition-colors"
+              title="Zoom in"
+            >
+              <ZoomIn className="w-3.5 h-3.5" />
+            </button>
+          </div>
+          <div className="flex items-center border border-[var(--color-border)] rounded-md bg-[var(--color-bg)] h-7 p-0.5 mr-1">
+            <button
+              onClick={goToPrevFile}
+              className="w-7 h-full flex items-center justify-center rounded-[4px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed cursor-pointer transition-colors"
+              title="Previous file"
+              disabled={currentFileIndex === 0}
+            >
+              <ChevronUp className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={goToNextFile}
+              className="w-7 h-full flex items-center justify-center rounded-[4px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed cursor-pointer transition-colors"
+              title="Next file"
+              disabled={currentFileIndex === totalFiles - 1}
+            >
+              <ChevronDown className="w-3.5 h-3.5" />
+            </button>
+          </div>
           <button
             className={`diff-toolbar-btn ${convSidebarVisible ? 'active' : ''}`}
             onClick={() => setConvSidebarVisible((v) => !v)}
             title={convSidebarVisible ? 'Hide conversation' : 'Show conversation'}
           >
-            <MessageSquare style={{ width: 14, height: 14 }} />
+            <MessageSquare className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
@@ -1957,11 +2127,16 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
               fileCommentCounts={fileCommentCounts}
               collapsed={!sidebarVisible}
               getFileViewedStatus={getFileViewedStatus}
+              hideViewed={hideViewed}
+              onToggleHideViewed={handleToggleHideViewed}
               onCreateVirtualPath={handleCreateVirtualPath}
               viewMode={viewMode}
               onExpandDir={viewMode === 'full' && focusMode ? handleExpandDir : undefined}
               onLoadFileDiff={viewMode === 'full' && focusMode ? loadFileDiff : undefined}
               taskPath={taskPath}
+              projectId={projectId}
+              autoViewedRules={autoViewedRules}
+              onUpdateAutoViewedRules={setAutoViewedRules}
             />
 
             {/* Diff content */}
@@ -2057,6 +2232,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       {/* Code Search Bar (Ctrl+F) */}
       <CodeSearchBar
         visible={codeSearchVisible}
+        focusTrigger={codeSearchFocusTrigger}
         query={codeSearchQuery}
         caseSensitive={codeSearchCaseSensitive}
         currentIndex={codeSearchQuery ? codeSearchCurrentIndex : 0}

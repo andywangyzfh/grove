@@ -387,12 +387,16 @@ fn filter_tools(all: Vec<Tool>) -> Vec<Tool> {
         "sketch_read",
         "sketch_draw",
     ]);
+    // Skill-authoring tools — available while working inside any real task
+    // (Coding or Studio) so an agent can capture a skill mid-flow.
+    let authoring: HashSet<&'static str> = HashSet::from(["skill_create", "skill_list"]);
     // Union of every in-task tool (used to carve out the orchestrator surface
     // — orchestrator never sees any in-task tool, including sketch).
     let any_in_task: HashSet<&str> = common_in_task
         .iter()
         .chain(coding_only.iter())
         .chain(studio_only.iter())
+        .chain(authoring.iter())
         .copied()
         .collect();
 
@@ -407,13 +411,17 @@ fn filter_tools(all: Vec<Tool>) -> Vec<Tool> {
         TaskEnvKind::Coding => all
             .into_iter()
             .filter(|t| {
-                common_in_task.contains(t.name.as_ref()) || coding_only.contains(t.name.as_ref())
+                common_in_task.contains(t.name.as_ref())
+                    || coding_only.contains(t.name.as_ref())
+                    || authoring.contains(t.name.as_ref())
             })
             .collect(),
         TaskEnvKind::Studio => all
             .into_iter()
             .filter(|t| {
-                common_in_task.contains(t.name.as_ref()) || studio_only.contains(t.name.as_ref())
+                common_in_task.contains(t.name.as_ref())
+                    || studio_only.contains(t.name.as_ref())
+                    || authoring.contains(t.name.as_ref())
             })
             .collect(),
         TaskEnvKind::InTaskUnknown => all
@@ -495,6 +503,15 @@ pub struct SingleReply {
     /// Set to true to mark the comment as resolved. Only the original comment creator can resolve.
     /// The creator is identified by matching agent_name + role against the comment's author field.
     pub resolve: Option<bool>,
+}
+
+/// Parameters for reading review comments
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ReadReviewParams {
+    /// Optional file path/name query for fuzzy matching. Only comments in files with matching paths are returned.
+    pub file_search: Option<String>,
+    /// Optional comment ID for precise retrieval of a single comment and its replies.
+    pub comment_id: Option<u32>,
 }
 
 /// Batch reply parameters - reply to multiple comments at once
@@ -583,6 +600,19 @@ pub struct EditNoteParams {
     pub task_id: String,
     /// New note content (markdown). Replaces entire note. Pass empty string to clear.
     pub content: String,
+}
+
+/// Create a local skill entry (in-task authoring tool)
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SkillCreateParams {
+    /// Package (category) the skill belongs to. Upserted: reused if it already
+    /// exists as a local package; created under `~/.grove/skills/local/<package>/`
+    /// if new. Fails if the name is an existing read-only git package.
+    pub package: String,
+    /// Skill name — also the directory name and the SKILL.md `name` field.
+    pub name: String,
+    /// One-line description for the SKILL.md front-matter.
+    pub description: String,
 }
 
 /// Start a chat session for a task (management tool)
@@ -1068,11 +1098,13 @@ fn resolve_agent_identity(
             let agent = normalize_agent_name(&meta.agent_name);
             let model = meta
                 .current_model_id
+                .clone()
                 .and_then(|id| {
                     meta.available_models
                         .iter()
                         .find(|(m_id, _)| m_id == &id)
                         .map(|(_, name)| name.clone())
+                        .or(Some(id))
                 })
                 .unwrap_or_default();
             let role = params_role.unwrap_or("").to_string();
@@ -1121,6 +1153,39 @@ impl GroveMcpServer {
         let json = serde_json::to_string_pretty(&result)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Create a new skill entry in a local package, then author it with your own tools
+    #[tool(
+        name = "skill_create",
+        description = "Create a new skill in a local (writable) package, then author its content YOURSELF. Upserts the package: reused if it already exists as a local package, created if new (fails if the name is a read-only git package). Grove only writes a SKILL.md scaffold (name + description front-matter) and returns the absolute skill directory path. After calling this, use YOUR OWN file tools (Write/Edit) to fill in the SKILL.md body and add any sub-files (scripts/, references/, assets/) under that directory — Grove does not need to be told when you're done. The skill then appears in Grove's Explore tab; the user installs/associates it manually."
+    )]
+    async fn grove_skill_create(
+        &self,
+        params: Parameters<SkillCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        blocking_json_result(move || {
+            let created =
+                crate::operations::skills::create_local_skill(&p.package, &p.name, &p.description)
+                    .map_err(|e| mcp_err(&e.to_string()))?;
+            serde_json::to_value(&created)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))
+        })
+        .await
+    }
+
+    /// List skill packages and their skills, flagging which are writable
+    #[tool(
+        name = "skill_list",
+        description = "List all skill packages and the skills inside each. Every package is flagged `writable`: true for local packages you can create/edit/delete skills in, false for read-only git packages. Call this before creating a skill to see what already exists, to pick a package, or to locate a skill to edit."
+    )]
+    async fn grove_skill_list(&self) -> Result<CallToolResult, McpError> {
+        blocking_json(|| {
+            let packages = crate::operations::skills::list_packages();
+            serde_json::json!({ "packages": packages })
+        })
+        .await
     }
 
     /// Register a project by local path (idempotent)
@@ -1465,7 +1530,10 @@ impl GroveMcpServer {
         name = "read_review",
         description = "Read code review comments for the current Grove task. Returns comments with IDs, locations, content, and status (open/resolved/outdated). Use grove_reply_review to respond to comments. Call grove_status first to ensure you are in a Grove task."
     )]
-    async fn grove_read_review(&self) -> Result<CallToolResult, McpError> {
+    async fn grove_read_review(
+        &self,
+        params: Parameters<ReadReviewParams>,
+    ) -> Result<CallToolResult, McpError> {
         let (task_id, project_path) = get_task_context()
             .ok_or_else(|| McpError::invalid_request("Not in a Grove task", None))?;
 
@@ -1476,6 +1544,22 @@ impl GroveMcpServer {
                 "No code review comments yet.",
             )])),
             Ok(mut data) => {
+                // Apply filters if provided
+                if let Some(ref query) = params.0.file_search {
+                    let query_lower = query.to_lowercase();
+                    data.comments.retain(|c| {
+                        if let Some(ref path) = c.file_path {
+                            path.to_lowercase().contains(&query_lower)
+                        } else {
+                            false
+                        }
+                    });
+                }
+
+                if let Some(id) = params.0.comment_id {
+                    data.comments.retain(|c| c.id == id);
+                }
+
                 // 动态检测 outdated
                 let worktree = env::var("GROVE_WORKTREE").unwrap_or_default();
                 let target = env::var("GROVE_TARGET").unwrap_or_default();

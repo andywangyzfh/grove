@@ -244,6 +244,26 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS ux_audio_terms_effective
             ON audio_terms (COALESCE(project_hash, ''), type, COALESCE(from_term, ''), target_term);
 
+        -- User keymap overrides (Command System)
+        -- One row per (command, binding): a command may hold multiple bindings
+        -- (VSCode/Zed style), so the primary key is composite (command_id,key).
+        -- The static catalog lives in frontend code (src/keyboard/catalog/*.ts)
+        -- — this table only stores deltas.
+        CREATE TABLE IF NOT EXISTS keymap_overrides (
+            command_id  TEXT NOT NULL,
+            key         TEXT NOT NULL,
+            when_ctx    TEXT NOT NULL DEFAULT '',
+            scope       TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (command_id, key)
+        );
+
+        -- User keymap disabled commands (Command System)
+        -- Disabling is independent of override — a user can disable a
+        -- command without changing its key (and vice versa).
+        CREATE TABLE IF NOT EXISTS keymap_disabled (
+            command_id  TEXT PRIMARY KEY
+        );
+
         -- Skill Agents
         CREATE TABLE IF NOT EXISTS skill_agents (
             id                 TEXT PRIMARY KEY,
@@ -363,6 +383,26 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             effort        TEXT,
             duty          TEXT,
             system_prompt TEXT NOT NULL DEFAULT '',
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        );
+
+        -- Plugins registry. One row per installed/registered plugin (a folder
+        -- containing plugin.json). `source` decides where local_path points and
+        -- whether delete removes files:
+        --   'dev'   → local_path is the user's own folder (referenced, not
+        --             copied; edits hot-reload; delete only drops the row).
+        --   'local' → copied into ~/.grove/plugins/<id> (delete removes files).
+        --   'git'   → cloned into ~/.grove/plugins/<id> from git_url[/subpath]
+        --             (delete removes files).
+        CREATE TABLE IF NOT EXISTS plugins (
+            id            TEXT PRIMARY KEY,
+            name          TEXT NOT NULL,
+            version       TEXT NOT NULL DEFAULT '0.0.0',
+            source        TEXT NOT NULL,
+            local_path    TEXT NOT NULL UNIQUE,
+            git_url       TEXT,
+            subpath       TEXT,
             created_at    TEXT NOT NULL,
             updated_at    TEXT NOT NULL
         );
@@ -629,6 +669,35 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
              CREATE UNIQUE INDEX IF NOT EXISTS uniq_pending_pair ON agent_pending_message(from_session, to_session);
              CREATE INDEX IF NOT EXISTS idx_pending_task ON agent_pending_message(project, task_id);
              COMMIT;",
+        )?;
+    }
+
+    // keymap_overrides gained a composite PK (command_id, key) for multi-binding
+    // support. Still in development, so there is NO data migration: if the legacy
+    // single-column-PK table is present, just drop it and recreate it empty with
+    // the composite key (user keymap customisations are disposable in dev). The
+    // old shape is detected by its `command_id  TEXT PRIMARY KEY` declaration;
+    // idempotent — the rebuilt table no longer matches the LIKE.
+    let keymap_is_legacy: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='keymap_overrides'
+               AND sql LIKE '%command_id  TEXT PRIMARY KEY%'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if keymap_is_legacy {
+        conn.execute_batch(
+            "DROP TABLE keymap_overrides;
+             CREATE TABLE keymap_overrides (
+                 command_id  TEXT NOT NULL,
+                 key         TEXT NOT NULL,
+                 when_ctx    TEXT NOT NULL DEFAULT '',
+                 scope       TEXT NOT NULL DEFAULT '',
+                 PRIMARY KEY (command_id, key)
+             );",
         )?;
     }
 

@@ -16,9 +16,9 @@ pub use state::{init_file_watchers, shutdown_file_watchers};
 
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{header, Response, StatusCode, Uri},
-    middleware,
+    middleware::{self, Next},
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
     Router,
@@ -85,6 +85,18 @@ pub fn create_api_router() -> Router {
             "/custom-agents/{id}",
             patch(handlers::custom_agent::update).delete(handlers::custom_agent::delete),
         )
+        // User keymap (Command System)
+        .route(
+            "/keymap",
+            get(handlers::keymap::list).delete(handlers::keymap::reset_all),
+        )
+        .route("/keymap/override", put(handlers::keymap::set_override))
+        .route("/keymap/overrides", put(handlers::keymap::set_overrides))
+        .route(
+            "/keymap/override/{id}",
+            delete(handlers::keymap::remove_override),
+        )
+        .route("/keymap/disabled", put(handlers::keymap::set_disabled))
         // Environment API
         .route("/env/check", get(handlers::env::check_all))
         .route("/env/check/{name}", get(handlers::env::check_one))
@@ -177,8 +189,81 @@ pub fn create_api_router() -> Router {
             "/extension/open-chrome",
             post(handlers::extension::open_chrome_extensions),
         )
+        // Plugin development API (scaffold a starter into a chosen folder)
+        .route(
+            "/plugins/browse-folder",
+            get(handlers::plugins::browse_plugin_folder),
+        )
+        .route(
+            "/plugins/scaffold",
+            post(handlers::plugins::scaffold_plugin),
+        )
+        .route(
+            "/plugins/install-local",
+            post(handlers::plugins::install_local),
+        )
+        .route("/plugins/install-git", post(handlers::plugins::install_git))
+        .route(
+            "/plugins/install-zip",
+            post(handlers::plugins::install_zip).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/plugins",
+            get(handlers::plugins::list_plugins).post(handlers::plugins::register_plugin),
+        )
+        .route("/plugins/{id}", delete(handlers::plugins::delete_plugin))
+        .route(
+            "/plugins/{id}/reveal",
+            post(handlers::plugins::reveal_plugin_folder),
+        )
+        .route(
+            "/plugins/{id}/data-dir",
+            get(handlers::plugins::list_plugin_data),
+        )
+        .route(
+            "/plugins/{id}/data/{*path}",
+            get(handlers::plugins::read_plugin_data)
+                .put(handlers::plugins::write_plugin_data)
+                .delete(handlers::plugins::delete_plugin_data),
+        )
+        .route(
+            "/plugins/{id}/data-bytes/{*path}",
+            get(handlers::plugins::read_plugin_bytes).put(handlers::plugins::write_plugin_bytes),
+        )
+        .route(
+            "/plugins/{id}/asset/{*path}",
+            get(handlers::plugins::serve_plugin_asset),
+        )
+        .route(
+            "/plugins/{id}/project-file",
+            get(handlers::plugins::read_project_file),
+        )
+        .route(
+            "/plugins/{id}/project-dir",
+            get(handlers::plugins::list_project_dir),
+        )
+        .route(
+            "/plugins/{id}/backend/invoke",
+            post(handlers::plugins::backend_invoke),
+        )
+        .route("/plugins/{id}/exec", post(handlers::plugins::exec_command))
+        .route("/plugins/{id}/events", post(handlers::plugins::emit_event))
+        .route(
+            "/plugins/{id}/events/subscribe",
+            get(handlers::plugins::subscribe_events),
+        )
+        .route(
+            "/plugins/{id}/update-sdk",
+            post(handlers::plugins::update_plugin_sdk),
+        )
+        .route("/plugins/{id}/chat/list", get(handlers::plugins::chat_list))
+        .route(
+            "/plugins/{id}/chat/send",
+            post(handlers::plugins::chat_send),
+        )
         // Folder selection API
         .route("/browse-folder", get(handlers::folder::browse_folder))
+        .route("/folders/list", get(handlers::folder::list_folder))
         // Read file API (for Plan File rendering)
         .route("/read-file", get(handlers::folder::read_file))
         // Terminal WebSocket
@@ -673,6 +758,10 @@ pub fn create_api_router() -> Router {
             post(handlers::skills::sync_all_sources),
         )
         .route(
+            "/skills/sources/auto-sync",
+            post(handlers::skills::auto_sync_sources),
+        )
+        .route(
             "/skills/sources/check-updates",
             post(handlers::skills::check_updates),
         )
@@ -683,6 +772,10 @@ pub fn create_api_router() -> Router {
         .route(
             "/skills/sources/{name}/sync",
             post(handlers::skills::sync_source),
+        )
+        .route(
+            "/skills/sources/{name}/rename",
+            post(handlers::skills::rename_source),
         )
         // Skills API — Explore & Install
         .route("/skills/explore", get(handlers::skills::explore_skills))
@@ -695,6 +788,10 @@ pub fn create_api_router() -> Router {
         .route(
             "/skills/installed/{repo_key}/{*repo_path}",
             delete(handlers::skills::uninstall_skill),
+        )
+        .route(
+            "/skills/local/{source}/{*repo_path}",
+            delete(handlers::skills::delete_local_skill),
         )
         // TaskGroup API
         .route(
@@ -759,6 +856,43 @@ pub fn create_api_router() -> Router {
     v1
 }
 
+/// Cache-Control header value for an embedded asset, or None for the default.
+///
+/// Service workers must revalidate on every request so updates propagate
+/// within one navigation; everything else (Vite content-hashed assets,
+/// index.html served as SPA fallback) uses the browser's default heuristics.
+fn cache_control_for(path: &str) -> Option<&'static str> {
+    if path == "sw.js" {
+        Some("no-cache")
+    } else {
+        None
+    }
+}
+
+/// Axum middleware that applies the `cache_control_for` policy to responses.
+///
+/// Attached to the static-asset fallback on both code paths of `create_router`
+/// (the `ServeDir` debug branch AND the `serve_embedded` release branch), so
+/// the policy lives in exactly one place — `cache_control_for` — and both
+/// serving paths route through it. Because `.layer()` wraps the entire router,
+/// this runs on every request; the explicit policy check no-ops for any path
+/// `cache_control_for` returns `None` for, so the cost on non-matching
+/// requests is one string compare.
+async fn sw_cache_control_middleware(request: Request, next: Next) -> impl IntoResponse {
+    // axum exposes the URI's absolute path; cache_control_for expects the
+    // path trimmed of its leading slash (matches the form serve_embedded
+    // uses internally), so trim here for a single source of truth.
+    let path = request.uri().path().trim_start_matches('/').to_string();
+    let mut response = next.run(request).await;
+    if let Some(cc) = cache_control_for(&path) {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            cc.parse().expect("static header value parses"),
+        );
+    }
+    response
+}
+
 /// Serve embedded static files
 async fn serve_embedded(uri: Uri) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
@@ -776,6 +910,8 @@ async fn serve_embedded(uri: Uri) -> impl IntoResponse {
     match file {
         Some(content) => {
             let mime = mime_guess::from_path(serve_path).first_or_octet_stream();
+            // Cache-Control is applied by sw_cache_control_middleware on
+            // both router branches, so no inline header injection here.
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime.as_ref())
@@ -841,10 +977,28 @@ pub fn create_router(
         // /auth/verify can't be probed cross-origin. Sec-Fetch-Site / Origin /
         // Referer are checked for non-safe methods; safe methods (GET/HEAD/OPTIONS,
         // including WebSocket upgrades and CORS preflight) pass through.
-        Router::new()
+        let base = Router::new()
             .nest("/api/v1", protected_api)
             .nest("/api/v1", auth_router)
-            .layer(middleware::from_fn(csrf::csrf_middleware))
+            .layer(middleware::from_fn(csrf::csrf_middleware));
+
+        // GUI-only loopback endpoints: only registered in gui builds (server binds
+        // 127.0.0.1 there). Non-gui builds (web, mobile) simply don't expose these routes.
+        #[cfg(feature = "gui")]
+        let base = {
+            let gui_router = Router::new()
+                .route(
+                    "/gui/open-task",
+                    post(handlers::hooks::handle_gui_open_task),
+                )
+                .route(
+                    "/gui/resolve-permission",
+                    post(handlers::hooks::handle_gui_resolve_permission),
+                );
+            base.nest("/api/v1", gui_router)
+        };
+
+        base
     };
 
     // Priority: external static_dir > embedded assets
@@ -852,9 +1006,15 @@ pub fn create_router(
     if let Some(dir) = static_dir {
         let index_file = dir.join("index.html");
         let serve_dir = ServeDir::new(&dir).not_found_service(ServeFile::new(&index_file));
-        api_router.fallback_service(serve_dir).layer(cors)
+        api_router
+            .fallback_service(serve_dir)
+            .layer(middleware::from_fn(sw_cache_control_middleware))
+            .layer(cors)
     } else if has_embedded_assets() {
-        api_router.fallback(serve_embedded).layer(cors)
+        api_router
+            .fallback(serve_embedded)
+            .layer(middleware::from_fn(sw_cache_control_middleware))
+            .layer(cors)
     } else {
         api_router.layer(cors)
     }
@@ -1289,6 +1449,16 @@ pub async fn start_server(
     auth: Arc<ServerAuth>,
     tls_mode: crate::cli::web::TlsMode,
 ) -> std::io::Result<()> {
+    // Record our loopback base so a plugin's MCP server (a node child process,
+    // not an authenticated Grove client) knows where to POST events. Always
+    // loopback — the MCP server runs on this same machine regardless of bind.
+    crate::plugins::events::set_server_base(format!("http://127.0.0.1:{}", port));
+
+    // Relay the aggregated radio event stream into plugin panels (holding
+    // `chat:read`) as `grove:radio` events. No-op on the wire until a panel
+    // subscribes; safe to start unconditionally.
+    crate::plugins::radio_bridge::spawn();
+
     // Auto-correct agent defaults based on what's actually installed on PATH.
     // Runs every server start because the user's environment can change between
     // sessions (e.g. they install a new CLI).
@@ -1512,4 +1682,22 @@ pub async fn start_server(
         })
         .await
         .map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_control_for_sw_js_is_no_cache() {
+        assert_eq!(cache_control_for("sw.js"), Some("no-cache"));
+    }
+
+    #[test]
+    fn cache_control_for_other_paths_is_none() {
+        assert_eq!(cache_control_for("index.html"), None);
+        assert_eq!(cache_control_for("assets/main.js"), None);
+        assert_eq!(cache_control_for("manifest.json"), None);
+        assert_eq!(cache_control_for("icon-512.png"), None);
+    }
 }

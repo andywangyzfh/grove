@@ -3,10 +3,13 @@ import { X, Send, MessageSquare, Trash2, Reply, CheckCircle, RotateCcw, Minus, P
 import type { ReviewCommentEntry } from '../../api/tasks';
 import type { CommentAnchor } from './DiffReviewPage';
 import { AgentAvatar } from './AgentAvatar';
-import { formatAgentDisplay } from './agentDisplay';
+import { AgentDisplay } from './agentDisplay';
 import { MarkdownRenderer, FileMentionDropdown } from '../ui';
 import { useFileMention } from '../../hooks';
 import type { MentionItem } from '../../utils/fileMention';
+import { useGlobalActiveChatId } from '../Tasks/TaskView/useActiveChatId';
+import { useBanner } from '../../context';
+
 
 /** Format ISO timestamp to human-readable local time, e.g. "2026-02-10 08:37:24" */
 function formatTime(ts: string): string {
@@ -44,6 +47,8 @@ export function CommentCard({ comment, onDelete, onReply, onResolve, onReopen, o
   const [editCommentText, setEditCommentText] = useState('');
   const [editingReplyId, setEditingReplyId] = useState<number | null>(null);
   const [editReplyText, setEditReplyText] = useState('');
+  const activeChatId = useGlobalActiveChatId();
+  const { showBanner } = useBanner();
 
   const editCommentTextareaRef = useRef<HTMLTextAreaElement>(null);
   const editReplyTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -97,8 +102,7 @@ export function CommentCard({ comment, onDelete, onReply, onResolve, onReopen, o
       {/* Header: avatar + author + time + line range + status badge + actions */}
       <div className="diff-comment-header">
         <AgentAvatar agent={comment.agent || '?'} size={24} className="diff-comment-avatar" />
-        <span className="diff-comment-author">{formatAgentDisplay(comment.agent, comment.role)}</span>
-        {comment.model && <span className="diff-comment-model" style={{ fontSize: 10, opacity: 0.5, fontFamily: 'monospace' }}>{comment.model}</span>}
+        <span className="diff-comment-author"><AgentDisplay agent={comment.agent} role={comment.role} model={comment.model} /></span>
         <span className="diff-comment-id">#{comment.id}</span>
         <span className="diff-comment-time">{formatTime(comment.timestamp)}</span>
         {lineRange && (
@@ -121,6 +125,18 @@ export function CommentCard({ comment, onDelete, onReply, onResolve, onReopen, o
               title="Resolve"
             >
               <CheckCircle style={{ width: 13, height: 13 }} />
+            </button>
+          )}
+          {activeChatId && (
+            <button
+              className="diff-comment-action-btn"
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent("grove-send-comment-to-chat", { detail: comment }));
+                showBanner("Comment sent to active Agent Chat Session", "success");
+              }}
+              title="Send to active Agent Chat Session"
+            >
+              <Send style={{ width: 13, height: 13 }} />
             </button>
           )}
           {onReopen && comment.status === 'resolved' && (
@@ -245,7 +261,7 @@ export function CommentCard({ comment, onDelete, onReply, onResolve, onReopen, o
             <div key={reply.id} className="diff-comment-reply">
               <div className="diff-comment-header">
                 <AgentAvatar agent={reply.agent} size={18} className="diff-comment-avatar small" />
-                <span className="diff-comment-author" style={{ fontSize: 11 }}>{formatAgentDisplay(reply.agent, reply.role)}</span>
+                <span className="diff-comment-author" style={{ fontSize: 11 }}><AgentDisplay agent={reply.agent} role={reply.role} model={reply.model} /></span>
                 <span className="diff-comment-time">{formatTime(reply.timestamp)}</span>
                 <span className="diff-comment-actions">
                   {onReply && (

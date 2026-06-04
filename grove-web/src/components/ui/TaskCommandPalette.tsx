@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Search, Code, Laptop, Zap } from "lucide-react";
 import type { Task } from "../../data/types";
+import { useCommand } from "../../keyboard";
 
 interface TaskCommandPaletteProps {
   isOpen: boolean;
@@ -23,6 +24,7 @@ export function TaskCommandPalette({ isOpen, onClose, tasks, selectedTask, onTas
   const [highlightedIndex, setHighlightedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const isKeyboardNav = useRef(false);
 
   // Exclude archived tasks, then apply search filter
   const activeTasks = useMemo(() => tasks.filter((t) => t.status !== "archived"), [tasks]);
@@ -54,6 +56,8 @@ export function TaskCommandPalette({ isOpen, onClose, tasks, selectedTask, onTas
   }, [searchQuery]);
 
   useEffect(() => {
+    if (!isKeyboardNav.current) return;
+    isKeyboardNav.current = false;
     if (!listRef.current) return;
     const items = listRef.current.querySelectorAll("[data-palette-item]");
     const item = items[highlightedIndex] as HTMLElement | undefined;
@@ -65,17 +69,32 @@ export function TaskCommandPalette({ isOpen, onClose, tasks, selectedTask, onTas
     onClose();
   }, [onTaskSelect, onClose]);
 
+  // Register the `palette.task.select` catalog command so it is
+  // discoverable / rebindable. Mirrors the local Enter key path; the
+  // local onKeyDown still handles Enter directly since this palette
+  // does not push its own keyboard scope.
+  useCommand(
+    "palette.task.select",
+    () => {
+      const task = filteredTasks[highlightedIndex];
+      if (task) handleSelect(task);
+    },
+    { enabled: () => isOpen && filteredTasks.length > 0 },
+  );
+
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault();
+        isKeyboardNav.current = true;
         setHighlightedIndex((prev) =>
           prev < filteredTasks.length - 1 ? prev + 1 : 0
         );
         break;
       case "ArrowUp":
         e.preventDefault();
+        isKeyboardNav.current = true;
         setHighlightedIndex((prev) =>
           prev > 0 ? prev - 1 : filteredTasks.length - 1
         );

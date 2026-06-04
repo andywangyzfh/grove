@@ -2,10 +2,13 @@ import { useState, useEffect, useRef } from 'react';
 import { X, CheckCircle, RotateCcw, Reply, Send, Trash2, Pencil } from 'lucide-react';
 import type { ReviewCommentEntry } from '../../api/tasks';
 import { AgentAvatar } from './AgentAvatar';
-import { formatAgentDisplay } from './agentDisplay';
+import { AgentDisplay } from './agentDisplay';
 import { MarkdownRenderer, FileMentionDropdown } from '../ui';
 import { useFileMention } from '../../hooks';
 import type { MentionItem } from '../../utils/fileMention';
+import { useDefineCommand, useKeyboardScope } from '../../keyboard';
+import { useGlobalActiveChatId } from '../Tasks/TaskView/useActiveChatId';
+import { useBanner } from '../../context';
 
 /** Format ISO timestamp to human-readable local time, e.g. "2026-02-10 08:37:24" */
 function formatTime(ts: string): string {
@@ -47,6 +50,8 @@ export function CommentDetailModal({
   const [replyText, setReplyText] = useState('');
   const [showReplyForm, setShowReplyForm] = useState(false);
   const [editingComment, setEditingComment] = useState(false);
+  const activeChatId = useGlobalActiveChatId();
+  const { showBanner } = useBanner();
   const [editCommentText, setEditCommentText] = useState('');
   const [editingReplyId, setEditingReplyId] = useState<number | null>(null);
   const [editReplyText, setEditReplyText] = useState('');
@@ -72,26 +77,50 @@ export function CommentDetailModal({
   const editCommentMention = useFileMention({ mentionItems: mentionItems ?? null, textareaRef: editCommentTextareaRef });
   const editReplyMention = useFileMention({ mentionItems: mentionItems ?? null, textareaRef: editReplyTextareaRef });
 
-  // Layered Escape: edit forms → reply form → modal, and always stop propagation
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
-        if (editingReplyIdRef.current !== null) {
-          setEditingReplyId(null);
-        } else if (editingCommentRef.current) {
-          setEditingComment(false);
-        } else if (showReplyFormRef.current) {
-          setShowReplyForm(false);
-          setReplyText('');
-        } else {
-          onClose();
-        }
+  // Layered Escape via Scoped Command Registry:
+  //   - "commentDetail" scope (always while mounted) closes the modal.
+  //   - "commentDetail.editing" scope sits on top whenever an inline edit
+  //     form / reply form is open; its Escape handler cascades through
+  //     edit-reply → edit-comment → reply-form, matching the original
+  //     ref-mirrored cascade. When no editing state is active the
+  //     inner scope is unmounted so Escape falls through to the base
+  //     "commentDetail.close" handler.
+  // Both commands need passThroughTextInput because focus typically lives
+  // inside the modal's textareas while Escape is pressed.
+  const editingActive = editingReplyId !== null || editingComment || showReplyForm;
+  useKeyboardScope('commentDetail');
+  useKeyboardScope('commentDetail.editing', editingActive);
+
+  useDefineCommand({
+    id: 'commentDetail.close',
+    name: 'Close Comment Detail',
+    category: 'Review',
+    description: 'Close the comment detail modal',
+    defaultBindings: [{ key: 'Escape' }],
+    scope: 'commentDetail',
+    passThroughTextInput: true,
+    handler: onClose,
+  });
+
+  useDefineCommand({
+    id: 'commentDetail.cancelEdit',
+    name: 'Cancel Comment Edit',
+    category: 'Review',
+    description: 'Cancel the inline edit / reply form inside the comment modal',
+    defaultBindings: [{ key: 'Escape' }],
+    scope: 'commentDetail.editing',
+    passThroughTextInput: true,
+    handler: () => {
+      if (editingReplyIdRef.current !== null) {
+        setEditingReplyId(null);
+      } else if (editingCommentRef.current) {
+        setEditingComment(false);
+      } else if (showReplyFormRef.current) {
+        setShowReplyForm(false);
+        setReplyText('');
       }
-    };
-    document.addEventListener('keydown', handleKeyDown, true); // capture phase
-    return () => document.removeEventListener('keydown', handleKeyDown, true);
-  }, [onClose]);
+    },
+  });
 
   const statusColor =
     comment.status === 'resolved'
@@ -205,8 +234,7 @@ export function CommentDetailModal({
             <AgentAvatar agent={comment.agent} size={24} />
             <div>
               <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--color-text)', display: 'flex', alignItems: 'center', gap: 8 }}>
-                {formatAgentDisplay(comment.agent, comment.role)}
-                {comment.model && <span style={{ fontSize: 11, fontFamily: 'monospace', opacity: 0.5 }}>{comment.model}</span>}
+                <AgentDisplay agent={comment.agent} role={comment.role} model={comment.model} />
                 <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--color-text-muted)' }}>#{comment.id}</span>
                 <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--color-text-muted)' }}>{formatTime(comment.timestamp)}</span>
               </div>
@@ -343,7 +371,7 @@ export function CommentDetailModal({
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
                     <AgentAvatar agent={reply.agent} size={18} />
                     <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text)' }}>
-                      {formatAgentDisplay(reply.agent, reply.role)}
+                      <AgentDisplay agent={reply.agent} role={reply.role} model={reply.model} />
                     </span>
                     <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>{formatTime(reply.timestamp)}</span>
                     <span style={{ flex: 1 }} />
@@ -548,6 +576,30 @@ export function CommentDetailModal({
             >
               <CheckCircle style={{ width: 14, height: 14 }} />
               Resolve
+            </button>
+          )}
+          {activeChatId && (
+            <button
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent("grove-send-comment-to-chat", { detail: comment }));
+                showBanner("Comment sent to active Agent Chat Session", "success");
+                onClose();
+              }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '6px 12px',
+                background: 'transparent',
+                border: '1px solid var(--color-border)',
+                borderRadius: 6,
+                color: 'var(--color-accent)',
+                cursor: 'pointer',
+                fontSize: 13,
+              }}
+            >
+              <Send style={{ width: 14, height: 14 }} />
+              Send to Chat
             </button>
           )}
           {onReopen && comment.status === 'resolved' && (

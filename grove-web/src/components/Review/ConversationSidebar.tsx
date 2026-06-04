@@ -2,11 +2,13 @@ import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { MessageSquare, CheckCircle, RotateCcw, Reply, Send, FileCode, ChevronDown, ChevronRight, Trash2, Maximize2 } from 'lucide-react';
 import type { ReviewCommentEntry } from '../../api/tasks';
 import { AgentAvatar } from './AgentAvatar';
-import { formatAgentDisplay } from './agentDisplay';
+import { AgentDisplay } from './agentDisplay';
 import { CommentDetailModal } from './CommentDetailModal';
 import { useFileMention } from '../../hooks';
 import { FileMentionDropdown } from '../ui';
 import type { MentionItem } from '../../utils/fileMention';
+import { useGlobalActiveChatId } from '../Tasks/TaskView/useActiveChatId';
+import { useBanner } from '../../context';
 
 type StatusFilter = 'all' | 'open' | 'resolved' | 'outdated';
 
@@ -396,6 +398,8 @@ function ConversationItem({
 }) {
   const [showReplyForm, setShowReplyForm] = useState(false);
   const [replyText, setReplyText] = useState('');
+  const activeChatId = useGlobalActiveChatId();
+  const { showBanner } = useBanner();
   const replyTextareaRef = useRef<HTMLTextAreaElement>(null);
   const replyMention = useFileMention({ mentionItems: mentionItems ?? null, textareaRef: replyTextareaRef });
 
@@ -460,8 +464,7 @@ function ConversationItem({
     <div className="conv-item" onClick={onClick}>
       <div className="conv-item-header">
         <AgentAvatar agent={comment.agent} size={18} className="conv-item-avatar" />
-        <span className="conv-item-author">{formatAgentDisplay(comment.agent, comment.role)}</span>
-        {comment.model && <span className="conv-item-meta" style={{ fontSize: 10, opacity: 0.5 }}>{comment.model}</span>}
+        <span className="conv-item-author"><AgentDisplay agent={comment.agent} role={comment.role} model={comment.model} /></span>
         <span className="conv-item-meta" style={{ opacity: 0.6 }}>#{comment.id}</span>
         {locationLabel && <span className="conv-item-meta">{locationLabel}</span>}
         <span
@@ -494,7 +497,7 @@ function ConversationItem({
             return (
               <div key={reply.id} className="conv-item-reply">
                 <AgentAvatar agent={reply.agent} size={14} />
-                <span className="conv-item-reply-author">{formatAgentDisplay(reply.agent, reply.role)}</span>
+                <span className="conv-item-reply-author"><AgentDisplay agent={reply.agent} role={reply.role} model={reply.model} /></span>
                 <span className="conv-item-reply-text">{truncatedReply}</span>
               </div>
             );
@@ -513,6 +516,19 @@ function ConversationItem({
             title="Expand"
           >
             <Maximize2 style={{ width: 12, height: 12 }} />
+          </button>
+        )}
+        {activeChatId && (
+          <button
+            className="conv-item-resolve-btn"
+            onClick={(e) => {
+              e.stopPropagation();
+              window.dispatchEvent(new CustomEvent("grove-send-comment-to-chat", { detail: comment }));
+              showBanner("Comment sent to active Agent Chat Session", "success");
+            }}
+            title="Send to active Agent Chat Session"
+          >
+            <Send style={{ width: 12, height: 12 }} />
           </button>
         )}
         {onReply && (

@@ -9,6 +9,7 @@ import { useTerminalTheme } from "../../../context";
 import { appendHmacToUrl } from "../../../api/client";
 import { openExternalUrl } from "../../../utils/openExternal";
 import { PreviewSearchBar } from "../../Review/PreviewSearchBar";
+import { useDefineCommand, useContextKey } from "../../../keyboard";
 import {
   getCached,
   setCached,
@@ -17,6 +18,59 @@ import {
   makeTerminalCacheKey,
   type CachedTerminal,
 } from "./terminalCache";
+
+/**
+ * Work around an xterm.js gap with the macOS Chinese (and similar) IME.
+ *
+ * Shift+punctuation (e.g. Shift+/ → "?", Shift+1 → "!") is emitted as a direct
+ * `insertText` with keyCode 229 but NO compositionstart/end events. xterm skips
+ * the keyCode-229 keydown (expecting a composition to follow) and its
+ * CompositionHelper never fires — so the character is silently dropped and
+ * never reaches the PTY. Chinese text is unaffected because it goes through a
+ * real composition that xterm finalizes on compositionend.
+ *
+ * Bridge the gap: when the last keydown was keyCode 229 and a non-composing
+ * `insertText` arrives, forward the data to the PTY ourselves and swallow the
+ * native input so xterm doesn't double-handle it. Real composition (Chinese
+ * text) uses insertCompositionText / isComposing=true and is left untouched;
+ * normal ASCII keydown carries a real keyCode, so `imeDirectKey` stays false.
+ *
+ * Idempotent: the helper-textarea persists across cache reattach, so a dataset
+ * flag prevents stacking duplicate listeners on the same element.
+ */
+function attachImeDirectInputFix(terminal: Terminal, container: HTMLElement): void {
+  const ta = container.querySelector(
+    ".xterm-helper-textarea",
+  ) as HTMLTextAreaElement | null;
+  if (!ta || ta.dataset.groveImeFix === "1") return;
+  ta.dataset.groveImeFix = "1";
+
+  let imeDirectKey = false;
+  ta.addEventListener(
+    "keydown",
+    (e) => {
+      imeDirectKey = e.keyCode === 229;
+    },
+    true,
+  );
+  ta.addEventListener(
+    "beforeinput",
+    (e) => {
+      const ie = e as InputEvent;
+      if (
+        imeDirectKey &&
+        ie.inputType === "insertText" &&
+        ie.data &&
+        !ie.isComposing
+      ) {
+        e.preventDefault();
+        terminal.input(ie.data);
+        imeDirectKey = false;
+      }
+    },
+    true,
+  );
+}
 
 interface XTerminalProps {
   /** Task terminal mode: provide projectId and taskId to connect to tmux session */
@@ -60,6 +114,29 @@ export function XTerminal({
   const [searchCurrent, setSearchCurrent] = useState(-1);
   const searchAddonRef = useRef<SearchAddon | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const [terminalFocused, setTerminalFocused] = useState(false);
+
+  // Mirror DOM focus on the panel into a context key the keyboard
+  // dispatcher can read. xterm's textarea owns focus while the terminal
+  // is active, so a panel-scoped focusin/focusout pair captures both the
+  // hidden textarea and any auxiliary UI (search bar input) inside the
+  // wrapper.
+  useEffect(() => {
+    const el = panelRef.current;
+    if (!el) return;
+    const onFocusIn = () => setTerminalFocused(true);
+    const onFocusOut = (e: FocusEvent) => {
+      const next = e.relatedTarget as Node | null;
+      if (next && el.contains(next)) return;
+      setTerminalFocused(false);
+    };
+    el.addEventListener("focusin", onFocusIn);
+    el.addEventListener("focusout", onFocusOut);
+    return () => {
+      el.removeEventListener("focusin", onFocusIn);
+      el.removeEventListener("focusout", onFocusOut);
+    };
+  }, []);
 
   // Store callbacks in refs to avoid re-render issues
   const onConnectedRef = useRef(onConnected);
@@ -105,12 +182,19 @@ export function XTerminal({
       getWs: () => WebSocket | null,
     ): ResizeObserver => {
       const observer = new ResizeObserver(() => {
+        // Fit locally immediately so the layout is snappy and correct
+        const { offsetWidth, offsetHeight } = mount;
+        if (offsetWidth === 0 || offsetHeight === 0) return;
+        try {
+          fitAddon.fit();
+        } catch (e) {
+          console.warn("xterm fit failed", e);
+        }
+        terminal.scrollToBottom();
+
+        // Debounce sending the resize event to the backend PTY
         if (resizeTimer) clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
-          const { offsetWidth, offsetHeight } = mount;
-          if (offsetWidth === 0 || offsetHeight === 0) return;
-          fitAddon.fit();
-          terminal.scrollToBottom();
           const ws = getWs();
           if (ws?.readyState === WebSocket.OPEN) {
             ws.send(
@@ -121,7 +205,7 @@ export function XTerminal({
               }),
             );
           }
-        }, 250);
+        }, 100); // Snappier 100ms debounce for PTY resize
       });
       observer.observe(mount);
       return observer;
@@ -191,6 +275,9 @@ export function XTerminal({
         return true;
       });
 
+      // Bridge macOS IME Shift+punctuation into the PTY (idempotent)
+      attachImeDirectInputFix(cached.terminal, cached.container);
+
       // Fit & notify after layout
       requestAnimationFrame(() => {
         if (cancelled) return;
@@ -249,7 +336,7 @@ export function XTerminal({
       cursorBlink: true,
       fontSize: 13,
       fontFamily:
-        '"SF Mono", "Monaco", "Inconsolata", "Fira Code", "Fira Mono", "Droid Sans Mono", "Source Code Pro", Consolas, "Liberation Mono", Menlo, Courier, monospace',
+        '"SF Mono", "Monaco", "Inconsolata", "Fira Code", "Fira Mono", "Droid Sans Mono", "Source Code Pro", Consolas, "Liberation Mono", Menlo, Courier, "PingFang SC", "Microsoft YaHei", monospace',
       theme: terminalThemeRef.current.colors,
       allowProposedApi: true,
     });
@@ -319,6 +406,9 @@ export function XTerminal({
       }
       return true;
     });
+
+    // Bridge macOS IME Shift+punctuation into the PTY (idempotent)
+    attachImeDirectInputFix(terminal, container);
 
     // Handle terminal input → WS
     const dataDisposable = terminal.onData((data) => {
@@ -458,24 +548,30 @@ export function XTerminal({
     }
   }, [terminalTheme]);
 
-  // Global keydown handler to open search
-  useEffect(() => {
-    const handleGlobalKeyDown = (e: KeyboardEvent) => {
-      const isMac = navigator.platform.toLowerCase().includes("mac");
-      const isModF = isMac ? (e.metaKey && e.key === "f") : (e.ctrlKey && e.key === "f");
-      if (isModF) {
-        if (panelRef.current?.contains(document.activeElement)) {
-          e.preventDefault();
-          e.stopPropagation();
-          setSearchOpen(true);
-        }
-      }
-    };
-    window.addEventListener("keydown", handleGlobalKeyDown, true);
-    return () => {
-      window.removeEventListener("keydown", handleGlobalKeyDown, true);
-    };
-  }, []);
+  // Cmd/Ctrl+F → toggle terminal search, via the Scoped Command Registry.
+  // The terminalPanelActive context key is true while the component is
+  // mounted; terminalFocus mirrors focus-within on the panel. `enabled`
+  // preserves the original "panel contains active element" gate.
+  // passThroughTextInput is required because xterm's textarea is a
+  // contenteditable-equivalent surface that the default suppression
+  // detector marks as "all" (the `.xterm` class is in the detector).
+  // xterm's own attachCustomKeyEventHandler intercept (above) prevents
+  // the same chord from being sent to the PTY; both handlers call
+  // setSearchOpen(true) → idempotent.
+  useContextKey("terminalPanelActive", true);
+  useContextKey("terminalFocus", terminalFocused);
+  useDefineCommand({
+    id: "terminal.search.toggle",
+    name: "Toggle Terminal Search",
+    category: "Terminal",
+    description: "Open or close the terminal search bar",
+    defaultBindings: [{ key: "Mod+f" }],
+    scope: "workspace",
+    defaultWhen: "terminalPanelActive",
+    passThroughTextInput: true,
+    handler: () => setSearchOpen(true),
+    enabled: () => !!panelRef.current?.contains(document.activeElement),
+  });
 
   // Mirror an empty/closed search by zeroing the counters before the
   // imperative effect runs — keeps setState out of the effect body. The

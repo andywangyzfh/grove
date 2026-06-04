@@ -269,6 +269,61 @@ async fn handle_mux_terminal(socket: WebSocket, params: MuxTerminalParams) {
     }
 }
 
+/// A stateful UTF-8 lossy decoder that buffers incomplete UTF-8 byte sequences
+/// at the end of input chunks. This prevents multibyte characters (like Chinese characters)
+/// from being garbled when split across streaming PTY read boundaries.
+pub(crate) struct Utf8LossyDecoder {
+    buffer: Vec<u8>,
+}
+
+impl Utf8LossyDecoder {
+    pub(crate) fn new() -> Self {
+        Self { buffer: Vec::new() }
+    }
+
+    pub(crate) fn feed(&mut self, input: &[u8]) -> String {
+        self.buffer.extend_from_slice(input);
+
+        let mut processed_len = 0;
+        let mut result = String::new();
+
+        loop {
+            let remaining = &self.buffer[processed_len..];
+            if remaining.is_empty() {
+                break;
+            }
+            match std::str::from_utf8(remaining) {
+                Ok(s) => {
+                    result.push_str(s);
+                    processed_len += remaining.len();
+                    break;
+                }
+                Err(err) => {
+                    let valid_up_to = err.valid_up_to();
+                    if valid_up_to > 0 {
+                        let valid_str = std::str::from_utf8(&remaining[..valid_up_to]).unwrap();
+                        result.push_str(valid_str);
+                        processed_len += valid_up_to;
+                    }
+
+                    if let Some(error_len) = err.error_len() {
+                        // Replace the invalid sequence with U+FFFD (replacement character)
+                        result.push('\u{FFFD}');
+                        processed_len += error_len;
+                    } else {
+                        // Incomplete UTF-8 sequence at the end of the buffer.
+                        // We stop processing and keep the remainder in the buffer.
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.buffer.drain(..processed_len);
+        result
+    }
+}
+
 /// Common PTY terminal handler
 pub(crate) async fn handle_pty_terminal(
     socket: WebSocket,
@@ -328,6 +383,7 @@ pub(crate) async fn handle_pty_terminal(
     let reader_clone = reader.clone();
     let mut pty_reader_task = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 4096];
+        let mut decoder = Utf8LossyDecoder::new();
         loop {
             let n = {
                 let mut reader = reader_clone.lock().expect("PTY reader mutex poisoned");
@@ -341,8 +397,8 @@ pub(crate) async fn handle_pty_terminal(
                 }
             };
 
-            let data = String::from_utf8_lossy(&buf[..n]).to_string();
-            if pty_tx.blocking_send(data).is_err() {
+            let data = decoder.feed(&buf[..n]);
+            if !data.is_empty() && pty_tx.blocking_send(data).is_err() {
                 break;
             }
         }
